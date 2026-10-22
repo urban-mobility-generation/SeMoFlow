@@ -1,0 +1,79 @@
+# Primary GraphSAGE v2 source encoder for leave-Dallas-out adaptation.
+#
+# The source graph contains Boston, Chicago, New York City, and Pittsburgh.
+# Dallas is excluded at preprocessing, so neither its graph edges nor its POI
+# identities can influence this checkpoint.
+
+experiment:
+  name: encoder_graphsage_v2_four_city_source_no_dallas
+  phase: encoder
+
+tokenizer_config:
+  preprocessing_dir: outputs/preprocessing/four_city_source_no_dallas
+  places_index_path: null
+  processed_visits_path: null
+  text_embeddings_path: outputs/encoder/four_city_source_no_dallas/text_address_free/text_embeddings.npy
+  graphsage_artifact_dir: outputs/encoder/four_city_source_no_dallas/graph_v2_address_free_no_users
+
+encoder_pipeline:
+  graph:
+    enabled: true
+    device: cuda:4
+
+    temperature: 0.07
+    max_negatives: 2048
+    max_queries: 262144
+
+    hidden_dim: 192
+    out_dim: 128
+    num_layers: 2
+    aggr: mean
+    layer_norm: true
+    residual: true
+    dropout: 0.1
+    id_embedding_dim: 64
+    # No user nodes or visit relations. Device keys are still used to derive
+    # the temporal POI transitions that provide the supervised graph signal.
+    id_embedding_node_types: [poi, category, cbg]
+    include_user_nodes: false
+    city_balanced_supervision: true
+
+    variance_weight: 1.0
+    covariance_weight: 0.04
+    variance_target: 1.0
+
+    epochs: 50
+    batch_size: 2097152
+    lr: 0.001
+    num_workers: 8
+    mixed_precision: bf16
+    num_neighbors:
+      default: [10, 10]
+
+    hash_train_fraction: 0.70
+    seed: 42
+    out_dir: outputs/encoder/four_city_source_no_dallas/graph_v2_address_free_no_users
+    resume_checkpoint: outputs/encoder/four_city_source_no_dallas/graph_v2_address_free_no_users/checkpoints/best.pt
+    cache_version: 1
+    cache_payload: graph_data.pt
+    cache_meta: meta.json
+    covisit_tc_hours: 6.0
+    covisit_edges: false
+
+  text:
+    # Enabled so `semoflow-train encoder` identity-validates the assembled cache
+    # before graph construction. The matrix is assembled from existing
+    # per-city address-free artifacts, so no Sentence-T5 inference is needed.
+    enabled: true
+    model: sentence-t5-xxl
+    device: "[2,4]"
+    batch_size: 256
+    precision: float32
+    backend: torch
+    include_address_in_template: false
+    include_name_in_template: true
+    out_path: outputs/encoder/four_city_source_no_dallas/text_address_free/text_embeddings.npy
+
+
+output:
+  output_dir: outputs/encoder/four_city_source_no_dallas/graph_v2_address_free_no_users

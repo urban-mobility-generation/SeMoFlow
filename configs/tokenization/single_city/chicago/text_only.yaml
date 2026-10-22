@@ -1,0 +1,36 @@
+# Chicago SID-graph ablation: remove the 128-D graph block from the
+# shaped_6cb_k48_t32_s2 baseline while holding the 32-D PCA text block and
+# every tokenizer optimization/capacity setting fixed.
+experiment:
+  name: chicago_v2_text_only_6cb_k48_t32_s2
+  phase: tokenizer
+
+tokenizer_config:
+  n_codebooks: 6
+  codebook_size: 48
+  latent_dim: 256
+  hidden_dim: 512
+  n_encoder_layers: 4
+  epochs: 50
+  batch_size: 1024
+  lr: 0.001
+  beta: 3.0
+  lambda_graph: 0.0
+  sk_epsilons: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
+  mixed_precision: bf16
+  num_workers: 4
+  input_embedding_source: pca_text
+  pca_text_dim: 32
+  text_graph_scale: 2.0
+  graphsage_artifact_dir: null
+  text_embeddings_path: outputs/encoder/chicago/text_address_free/text_embeddings.npy
+  preprocessing_dir: outputs/preprocessing/chicago
+  places_index_path: null
+  processed_visits_path: null
+  out_dir: outputs/tokenization/chicago_v2/text_only_6cb_k48_t32_s2
+  device: cuda:0
+  seed: 42
+  skip_artifact_export: false
+  skip_semantic_id_eval: true
+  eval_sample_size: 50000
+  eval_pair_sample_size: 2000000

@@ -1,0 +1,31 @@
+# Foursquare five-city check-in preprocessing configuration.
+#
+# Download and extract the global 415-city release from the source page into
+# data/foursquare_global_2015/, or override data.foursquare.archive_path with
+# an absolute path to the extracted directory.
+
+experiment:
+  name: preprocessing_foursquare_five_city
+  phase: preprocessing
+
+data:
+  dataset_name: foursquare
+  data_root: data
+  cities: [los_angeles, washington_dc, atlanta, san_francisco, milwaukee]
+  foursquare:
+    raw_dir: foursquare_global_2015
+    archive_path: null
+    global_checkins_filename: dataset_TIST2015_Checkins.txt
+    global_pois_filename: dataset_TIST2015_POIs.txt
+    global_cities_filename: dataset_TIST2015_Cities.txt
+    global_batch_size: 250000
+    # Keep the source event population by default. Spatial validity is strict.
+    min_quality_score: 0.0
+    drop_missing_coordinates: true
+
+preprocessing:
+  places_index:
+    path: null
+
+output:
+  output_dir: outputs/preprocessing/foursquare_five_city

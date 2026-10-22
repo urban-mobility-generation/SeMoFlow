@@ -1,0 +1,71 @@
+# GraphSAGE encoder with normalized InfoNCE, residual layers, and
+# variance/covariance regularization. Produces 128-dimensional POI embeddings.
+#
+#   uv run semoflow-train graph-encoder --config configs/encoder/graphsage_v2.yaml
+
+experiment:
+  name: encoder_graphsage_v2
+  phase: encoder
+
+tokenizer_config:
+  preprocessing_dir: outputs/preprocessing/chicago
+  places_index_path: null      # null => preprocessing_dir/places_index.parquet
+  processed_visits_path: null  # null => preprocessing_dir/processed_visits.parquet
+  text_embeddings_path: outputs/encoder/chicago/text/text_embeddings.npy
+  graphsage_artifact_dir: outputs/encoder/chicago/graph_v2
+
+encoder_pipeline:
+  graph:
+    enabled: true
+    device: "[9]"
+
+    # ── Objective ────────────────────────────────────────────────
+    temperature: 0.07
+    # Bound the contrastive logits matrix along both axes.
+    max_negatives: 2048
+    max_queries: 262144
+
+    # ── Architecture ─────────────────────────────────────────────
+    hidden_dim: 512
+    out_dim: 128
+    num_layers: 2
+    aggr: mean
+    layer_norm: true
+    residual: true
+    dropout: 0.1
+    id_embedding_dim: 64
+
+    # ── Redundancy regularization ────────────────────────────────
+    variance_weight: 1.0
+    covariance_weight: 0.04
+    variance_target: 1.0
+
+    # ── Optimization ─────────────────────────────────────────────
+    epochs: 50
+    batch_size: 4194304
+    lr: 0.001
+    num_workers: 8
+    mixed_precision: bf16
+    num_neighbors: [10, 10]
+
+    # ── Graph construction ───────────────────────────────────────
+    hash_train_fraction: 0.70
+    seed: 42
+    out_dir: outputs/encoder/chicago/graph_v2
+    resume_checkpoint: outputs/encoder/chicago/graph_v2/checkpoints/best.pt
+    cache_version: 1
+    cache_payload: graph_data.pt
+    cache_meta: meta.json
+    covisit_tc_hours: 6.0
+
+  text:
+    enabled: false
+    model: sentence-t5-xxl
+    device: "[8,9]"
+    batch_size: 256
+    precision: float32
+    backend: torch
+    out_path: outputs/encoder/chicago/text/text_embeddings.npy
+
+output:
+  output_dir: outputs/encoder/chicago/graph_v2
