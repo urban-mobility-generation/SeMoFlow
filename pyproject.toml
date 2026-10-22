@@ -36,14 +36,9 @@ lint = [
 typecheck = [
     "ty>=0.0.1a14",
 ]
-test = [
-    "pytest>=8",
-    "pytest-xdist>=3.5.0",
-]
 dev = [
     { include-group = "lint" },
     { include-group = "typecheck" },
-    { include-group = "test" },
     "jupyter>=1.1.1",
     "matplotlib>=3.10.9",
     "nbconvert>=7.17.1",
@@ -83,7 +78,7 @@ pyg-lib = [
 [tool.ruff]
 line-length = 79
 target-version = "py312"
-src = ["src", "tests"]
+src = ["src"]
 
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "RUF", "SIM", "UP", "W"]
@@ -105,12 +100,5 @@ replace-imports-with-any = [
     "torch.**",
 ]
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-addopts = "-n auto"
-filterwarnings = [
-    "ignore::DeprecationWarning:torch.jit._script",
-]
-
 [tool.ty.src]
-include = ["src", "tests"]
+include = ["src"]
