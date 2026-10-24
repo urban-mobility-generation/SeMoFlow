@@ -10,9 +10,9 @@ from semoflow.cli.common import (
     LogFileOpt,
     LogLevelOpt,
     SetArgsOpt,
+    cli_run,
     resolve_cli_config,
 )
-from semoflow.preprocess.pipeline import run_pipeline
 
 app = typer.Typer(
     help="Preprocess Foursquare check-ins into SeMoFlow artifacts.",
@@ -42,13 +42,23 @@ def preprocess_cmd(
     log_level: LogLevelOpt = "INFO",
     log_file: LogFileOpt = None,
 ) -> None:
+    from semoflow.config.artifacts import PreprocessingArtifacts
+    from semoflow.preprocess.foursquare import run_foursquare_pipeline
+
     overrides = list(set_args or [])
     if out_dir is not None:
         overrides.append(f"output.output_dir={out_dir}")
     cfg = resolve_cli_config(
         config, overrides, log_level=log_level, log_file=log_file
     )
-    run_pipeline(cfg)
+    with cli_run(
+        cfg,
+        phase="preprocessing",
+        output_dir=PreprocessingArtifacts.from_config(cfg).run_dir,
+        log_level=log_level,
+        log_file=log_file,
+    ):
+        run_foursquare_pipeline(cfg)
 
 
 def main() -> None:

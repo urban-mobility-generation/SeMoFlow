@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from semoflow.utils.serialization import write_json_atomic
+
 if TYPE_CHECKING:
-    from semoflow.config.schemas import (
-        ExperimentConfig,
-    )
+    from semoflow.config.schemas.experiment_config import ExperimentConfig
 
 
 @dataclass(frozen=True)
@@ -80,10 +79,7 @@ class TokenizerArtifacts:
                 name: str(self.export_paths()[name]) for name in required
             },
         }
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        tmp = self.completion_marker.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        os.replace(tmp, self.completion_marker)
+        write_json_atomic(self.completion_marker, payload)
 
     def export_paths(self) -> dict[str, Path]:
         return {
@@ -101,7 +97,6 @@ class PreprocessingArtifacts:
     processed_visits: Path
     places_index: Path
     quality_scores: Path
-    vocabs_dir: Path
 
     @classmethod
     def from_run_dir(cls, run_dir: Path) -> PreprocessingArtifacts:
@@ -110,7 +105,6 @@ class PreprocessingArtifacts:
             processed_visits=run_dir / "processed_visits.parquet",
             places_index=run_dir / "places_index.parquet",
             quality_scores=run_dir / "quality_scores.parquet",
-            vocabs_dir=run_dir / "vocabs",
         )
 
     @classmethod

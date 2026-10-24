@@ -19,15 +19,23 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from semoflow.logging.primitives import configure_logging
+from semoflow.config.schemas.planner_config import (
+    OccurrencePlannerArchitecture,
+    OccurrencePlannerTrainingOptions,
+    PlannerTrainingConfig,
+)
+from semoflow.logging.primitives import (
+    configure_logging,
+    get_configured_log_file,
+)
 from semoflow.logging.training import (
     log_epoch_summary,
     log_training_step,
 )
 from semoflow.planner.artifacts import (
     OccurrencePlannerDataConfig,
+    OccurrencePlannerDataset,
     OccurrencePlannerSplit,
-    OccurrencePlannerTrainingOptions,
     load_occurrence_planner_dataset,
     save_occurrence_planner_checkpoint,
 )
@@ -43,15 +51,9 @@ from semoflow.planner.warm_start import (
     PlannerWarmStart,
     apply_planner_warm_start,
 )
-from semoflow.training.utils.distributed import (
-    find_free_port,
-)
-from semoflow.training.utils.early_stopping import (
-    EarlyStopper,
-)
-from semoflow.training.utils.lr_schedule import (
-    build_lr_scheduler,
-)
+from semoflow.training.utils.distributed import find_free_port
+from semoflow.training.utils.early_stopping import EarlyStopper
+from semoflow.training.utils.lr_schedule import build_lr_scheduler
 from semoflow.training.utils.runtime import (
     parse_device_spec,
     set_seed_all,
@@ -86,12 +88,14 @@ def _resolve_distributed_context(
     if options.distributed:
         if world_size < 2:
             raise ValueError(
-                "--distributed requires torchrun with WORLD_SIZE >= 2"
+                "training.distributed requires torchrun with WORLD_SIZE >= 2"
             )
         if not torch.cuda.is_available():
             raise ValueError("distributed planner training requires CUDA")
         if primary_device.type != "cuda":
-            raise ValueError("--distributed requires --device cuda")
+            raise ValueError(
+                "training.distributed requires training.device cuda"
+            )
         if device_ids and world_size != len(device_ids):
             raise ValueError(
                 "the multi-GPU device list length must equal WORLD_SIZE"
@@ -108,8 +112,8 @@ def _resolve_distributed_context(
             if primary_device.index is not None:
                 raise ValueError(
                     "distributed planner training with torchrun requires "
-                    "--device cuda; use --device '[0,1,...]' without "
-                    "--distributed to select explicit GPUs"
+                    "training.device cuda; use training.device '[0,1,...]' "
+                    "without training.distributed to select explicit GPUs"
                 )
             device_index = local_rank
         if not 0 <= device_index < device_count:
@@ -139,7 +143,7 @@ def _resolve_distributed_context(
         )
     if world_size > 1:
         raise ValueError(
-            "torchrun WORLD_SIZE > 1 requires --distributed to avoid "
+            "torchrun WORLD_SIZE > 1 requires training.distributed to avoid "
             "duplicate independent training processes"
         )
     return _DistributedContext(
@@ -185,19 +189,6 @@ def _broadcast_metrics(
     if context.enabled:
         dist.broadcast(values, src=0)
     return _NLLMetrics(*[float(value) for value in values.cpu()])
-
-
-@dataclass(frozen=True, slots=True)
-class OccurrencePlannerArchitecture:
-    model_dim: int = 128
-    n_heads: int = 4
-    n_layers: int = 4
-    dropout: float = 0.1
-    prefix_decoder: str = "hierarchical"
-    mobility_router: str = "none"
-    mobility_gate_prior: str = "log_distinct"
-    use_tokenizer_latent: bool = False
-    use_distance_prior: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,7 +294,6 @@ def split_nll_metrics(
     legality: LegalPrefixIndex,
     batch_size: int,
     device: torch.device,
-    num_workers: int = 0,
 ) -> _NLLMetrics:
     loader = build_occurrence_tensor_dataloader(
         split_tensor_dataset(split),
@@ -311,7 +301,7 @@ def split_nll_metrics(
         legality=legality,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=0,
         pin_memory=device.type == "cuda",
     )
     return _loader_nll_metrics(model, loader, device=device)
@@ -514,65 +504,268 @@ def _primary_split_nll(
     return _broadcast_metrics(metrics, distributed)
 
 
-def train_occurrence_planner(
-    *,
-    dataset_path: Path,
-    output_dir: Path,
-    architecture: OccurrencePlannerArchitecture,
-    options: OccurrencePlannerTrainingOptions,
-    seed: int,
-    force: bool = False,
-    warm_start: PlannerWarmStart | None = None,
-) -> OccurrencePlannerTrainResult:
-    dataset = load_occurrence_planner_dataset(dataset_path)
-    if int(os.environ.get("RANK", "0")) == 0:
-        logger.info(
-            "loaded planner dataset  path=%s  train=%d  validation=%d  "
-            "codebook_size=%d  gap_vocab=%d  temporal_state=%s",
-            dataset_path,
-            dataset.train.size,
-            dataset.validation.size,
-            dataset.config.codebook_size,
-            dataset.config.gap_vocab,
-            dataset.config.temporal_state_enabled,
+_OUTPUT_NAMES = ("best.pt", "last.pt", "metrics.json", "warm_start.json")
+
+
+def _check_gpu_list(device_ids: list[int]) -> None:
+    if len(set(device_ids)) != len(device_ids) or any(
+        device_id < 0 for device_id in device_ids
+    ):
+        raise ValueError("device IDs must be unique non-negative integers")
+    if not torch.cuda.is_available():
+        raise ValueError("a GPU device list requires CUDA")
+    device_count = torch.cuda.device_count()
+    if any(device_id >= device_count for device_id in device_ids):
+        raise ValueError(
+            f"requested device IDs {device_ids} exceed the "
+            f"{device_count} visible CUDA devices"
         )
-    config = _planner_config(dataset.config, architecture)
+
+
+def check_planner_settings(
+    settings: PlannerTrainingConfig, *, force: bool = False
+) -> None:
+    """Fail fast on unusable GPUs or outputs that would be overwritten."""
+    _, device_ids = parse_device_spec(settings.training.device)
+    if device_ids:
+        _check_gpu_list(device_ids)
+    output_dir = Path(settings.output_dir)
+    if (
+        settings.initialize_from is not None
+        and Path(settings.initialize_from).resolve().parent
+        == output_dir.resolve()
+    ):
+        raise ValueError(
+            "the warm-start checkpoint must not live in the output directory"
+        )
+    existing = [
+        output_dir / name
+        for name in _OUTPUT_NAMES
+        if (output_dir / name).exists()
+    ]
+    if existing and not force:
+        raise FileExistsError(
+            "refusing to overwrite existing artifacts: "
+            f"{', '.join(str(p) for p in existing)}"
+        )
+
+
+def train_planner(
+    settings: PlannerTrainingConfig,
+    *,
+    force: bool = False,
+    log_level: str = "INFO",
+) -> OccurrencePlannerTrainResult:
+    """Train in this process, or spawn one DDP rank per listed GPU."""
+    _, device_ids = parse_device_spec(settings.training.device)
+    if len(device_ids) > 1 and not settings.training.distributed:
+        return train_occurrence_planner_on_devices(
+            settings, device_ids, force=force, log_level=log_level
+        )
+    return train_occurrence_planner(settings, force=force)
+
+
+def _check_dataset_supports(
+    config: OccurrencePlannerConfig,
+    options: OccurrencePlannerTrainingOptions,
+    dataset: OccurrencePlannerDataset,
+) -> None:
     if config.mobility_router != "none" and options.label_smoothing != 0.0:
         raise ValueError(
             "label_smoothing must be zero when mobility routing is enabled"
         )
     if config.use_tokenizer_latent and dataset.prefix_codebooks is None:
         raise ValueError(
-            "--tokenizer-latent requires a dataset built with --codebooks"
+            "architecture.use_tokenizer_latent requires a dataset built "
+            "with --codebooks"
         )
     if config.use_distance_prior and dataset.legal_prefix_centroids is None:
         raise ValueError(
-            "--distance-prior requires a dataset built with --places "
-            "coordinates"
+            "architecture.use_distance_prior requires a dataset built with "
+            "--places coordinates"
         )
 
-    output_dir = Path(output_dir)
-    best_path = output_dir / "best.pt"
-    last_path = output_dir / "last.pt"
-    metrics_path = output_dir / "metrics.json"
-    warm_start_path = output_dir / "warm_start.json"
-    if warm_start is not None and (
-        Path(warm_start.checkpoint).resolve().parent == output_dir.resolve()
-    ):
-        raise ValueError(
-            "the warm-start checkpoint must not live in the output directory"
+
+def _catalog_tensors(
+    config: OccurrencePlannerConfig,
+    dataset: OccurrencePlannerDataset,
+) -> dict[str, torch.Tensor | None]:
+    """Catalog tensors shared by the model and every checkpoint it writes."""
+    return {
+        "legal_prefixes": dataset.legal_prefixes,
+        "catalog_city_ids": dataset.catalog_city_ids,
+        "city_legal_prefix_mask": dataset.city_legal_prefix_mask,
+        "prefix_codebooks": (
+            dataset.prefix_codebooks if config.use_tokenizer_latent else None
+        ),
+        "legal_prefix_centroids": (
+            dataset.legal_prefix_centroids
+            if config.use_distance_prior
+            else None
+        ),
+        "legal_prefix_centroid_available": (
+            dataset.legal_prefix_centroid_available
+            if config.use_distance_prior
+            else None
+        ),
+    }
+
+
+def _log_training_start(
+    config: OccurrencePlannerConfig,
+    options: OccurrencePlannerTrainingOptions,
+    *,
+    device: torch.device,
+    seed: int,
+    distributed: _DistributedContext,
+) -> None:
+    logger.info(
+        "starting training  device=%s  seed=%d  epochs=%d  batch_size=%d  "
+        "learning_rate=%g  model_dim=%d  n_layers=%d  prefix_decoder=%s  "
+        "mobility_router=%s  lr_scheduler=%s  warmup_steps=%d  min_lr=%g  "
+        "num_workers=%d  distributed=%s world_size=%d compile=%s backend=%s mode=%s "
+        "fullgraph=%s float32_matmul_precision=%s",
+        device,
+        seed,
+        options.epochs,
+        options.batch_size,
+        options.learning_rate,
+        config.model_dim,
+        config.n_layers,
+        config.prefix_decoder,
+        config.mobility_router,
+        options.lr_scheduler,
+        options.warmup_steps,
+        options.min_lr,
+        options.num_workers,
+        distributed.enabled,
+        distributed.world_size,
+        options.compile_model,
+        options.compile_backend,
+        options.compile_mode,
+        options.compile_model,
+        torch.get_float32_matmul_precision(),
+    )
+
+
+def _build_loaders(
+    dataset: OccurrencePlannerDataset,
+    *,
+    config: OccurrencePlannerConfig,
+    legality: LegalPrefixIndex,
+    options: OccurrencePlannerTrainingOptions,
+    seed: int,
+    distributed: _DistributedContext,
+) -> tuple[DataLoader, DistributedSampler | None, DataLoader, DataLoader]:
+    """Shuffled train loader (and its DDP sampler), then ordered
+    validation and train evaluation loaders."""
+    build = partial(
+        build_occurrence_tensor_dataloader,
+        config=config,
+        legality=legality,
+        batch_size=options.batch_size,
+        num_workers=options.num_workers,
+        pin_memory=distributed.device.type == "cuda",
+    )
+    train_ds = split_tensor_dataset(dataset.train)
+    train_sampler = (
+        DistributedSampler(
+            train_ds,
+            num_replicas=distributed.world_size,
+            rank=distributed.rank,
+            shuffle=True,
+            seed=seed,
+            drop_last=False,
         )
-    if not force:
-        existing = [
-            p
-            for p in (best_path, last_path, metrics_path, warm_start_path)
-            if p.exists()
-        ]
-        if existing:
-            raise FileExistsError(
-                "refusing to overwrite existing artifacts: "
-                f"{', '.join(str(p) for p in existing)}"
-            )
+        if distributed.enabled
+        else None
+    )
+    train_loader = build(
+        train_ds,
+        shuffle=train_sampler is None,
+        seed=seed,
+        sampler=train_sampler,
+    )
+    val_loader, eval_train_loader = (
+        build(split_tensor_dataset(split), shuffle=False)
+        for split in (dataset.validation, dataset.train)
+    )
+    return train_loader, train_sampler, val_loader, eval_train_loader
+
+
+def _synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def _log_epoch(
+    row: dict[str, float],
+    *,
+    total_epochs: int,
+    improved: bool,
+    device: torch.device,
+) -> None:
+    cuda = device.type == "cuda"
+    log_epoch_summary(
+        logger,
+        epoch=int(row["epoch"]),
+        total_epochs=total_epochs,
+        epoch_elapsed_s=row["train_elapsed_s"],
+        samples_per_sec=row["train_samples_per_sec"],
+        gpu_allocated_gb=(
+            torch.cuda.memory_allocated(device) / 1e9 if cuda else 0.0
+        ),
+        gpu_peak_gb=(
+            torch.cuda.max_memory_allocated(device) / 1e9 if cuda else 0.0
+        ),
+    )
+    logger.info(
+        "epoch %d/%d  lr=%.6g  train_objective=%.4f  train_nll=%.4f  "
+        "validation_nll=%.4f  validation_time=%.2fs  "
+        "val[length=%.4f gap=%.4f duration=%.4f prefix=%.4f]%s",
+        row["epoch"],
+        total_epochs,
+        row["learning_rate"],
+        row["train_objective"],
+        row["train_nll"],
+        row["validation_nll"],
+        row["validation_elapsed_s"],
+        row["validation_length_nll"],
+        row["validation_gap_nll"],
+        row["validation_duration_nll"],
+        row["validation_prefix_nll"],
+        "  (best)" if improved else "",
+    )
+
+
+def train_occurrence_planner(
+    settings: PlannerTrainingConfig, *, force: bool = False
+) -> OccurrencePlannerTrainResult:
+    options, seed = settings.training, settings.seed
+    warm_start = (
+        None
+        if settings.initialize_from is None
+        else PlannerWarmStart(checkpoint=settings.initialize_from)
+    )
+    dataset = load_occurrence_planner_dataset(settings.dataset_path)
+    if int(os.environ.get("RANK", "0")) == 0:
+        logger.info(
+            "loaded planner dataset  path=%s  train=%d  validation=%d  "
+            "codebook_size=%d  gap_vocab=%d  temporal_state=%s",
+            settings.dataset_path,
+            dataset.train.size,
+            dataset.validation.size,
+            dataset.config.codebook_size,
+            dataset.config.gap_vocab,
+            dataset.config.temporal_state_enabled,
+        )
+    config = _planner_config(dataset.config, settings.architecture)
+    _check_dataset_supports(config, options, dataset)
+    check_planner_settings(settings, force=force)
+    output_dir = Path(settings.output_dir)
+    best_path, last_path, metrics_path, warm_start_path = (
+        output_dir / name for name in _OUTPUT_NAMES
+    )
 
     distributed = _resolve_distributed_context(options)
     device = distributed.device
@@ -584,26 +777,8 @@ def train_occurrence_planner(
         codebook_size=config.codebook_size,
         prefix_depth=config.prefix_depth,
     )
-    checkpoint_codebooks = (
-        dataset.prefix_codebooks if config.use_tokenizer_latent else None
-    )
-    checkpoint_centroids = (
-        dataset.legal_prefix_centroids if config.use_distance_prior else None
-    )
-    checkpoint_centroid_available = (
-        dataset.legal_prefix_centroid_available
-        if config.use_distance_prior
-        else None
-    )
-    model = OccurrenceARPlanner(
-        config,
-        dataset.legal_prefixes,
-        catalog_city_ids=dataset.catalog_city_ids,
-        city_legal_prefix_mask=dataset.city_legal_prefix_mask,
-        prefix_codebooks=checkpoint_codebooks,
-        legal_prefix_centroids=checkpoint_centroids,
-        legal_prefix_centroid_available=checkpoint_centroid_available,
-    ).to(device)
+    catalog = _catalog_tensors(config, dataset)
+    model = OccurrenceARPlanner(config, **catalog).to(device)
     warm_start_report = (
         None
         if warm_start is None
@@ -645,74 +820,21 @@ def train_occurrence_planner(
         lr=options.learning_rate,
         weight_decay=options.weight_decay,
     )
-
     if distributed.is_primary:
-        logger.info(
-            "starting training  device=%s  seed=%d  epochs=%d  batch_size=%d  "
-            "learning_rate=%g  model_dim=%d  n_layers=%d  prefix_decoder=%s  "
-            "mobility_router=%s  lr_scheduler=%s  warmup_steps=%d  min_lr=%g  "
-            "num_workers=%d  distributed=%s world_size=%d compile=%s backend=%s mode=%s "
-            "fullgraph=%s float32_matmul_precision=%s",
-            device,
-            seed,
-            options.epochs,
-            options.batch_size,
-            options.learning_rate,
-            config.model_dim,
-            config.n_layers,
-            config.prefix_decoder,
-            config.mobility_router,
-            options.lr_scheduler,
-            options.warmup_steps,
-            options.min_lr,
-            options.num_workers,
-            distributed.enabled,
-            distributed.world_size,
-            options.compile_model,
-            options.compile_backend,
-            options.compile_mode,
-            options.compile_model,
-            torch.get_float32_matmul_precision(),
+        _log_training_start(
+            config, options, device=device, seed=seed, distributed=distributed
         )
 
-    pin_memory = device.type == "cuda"
-    train_ds = split_tensor_dataset(dataset.train)
-    train_sampler = (
-        DistributedSampler(
-            train_ds,
-            num_replicas=distributed.world_size,
-            rank=distributed.rank,
-            shuffle=True,
-            seed=seed,
-            drop_last=False,
-        )
-        if distributed.enabled
-        else None
-    )
-    train_loader = build_occurrence_tensor_dataloader(
-        train_ds,
-        config=config,
-        legality=legality,
-        batch_size=options.batch_size,
-        shuffle=train_sampler is None,
-        num_workers=options.num_workers,
-        seed=seed,
-        pin_memory=pin_memory,
-        sampler=train_sampler,
-    )
-    val_loader, eval_train_loader = (
-        build_occurrence_tensor_dataloader(
-            split_tensor_dataset(split),
+    train_loader, train_sampler, val_loader, eval_train_loader = (
+        _build_loaders(
+            dataset,
             config=config,
             legality=legality,
-            batch_size=options.batch_size,
-            shuffle=False,
-            num_workers=options.num_workers,
-            pin_memory=pin_memory,
+            options=options,
+            seed=seed,
+            distributed=distributed,
         )
-        for split in (dataset.validation, dataset.train)
     )
-
     steps_per_epoch = len(train_loader)
     total_updates = steps_per_epoch * options.epochs
     scheduler = build_lr_scheduler(
@@ -733,21 +855,15 @@ def train_occurrence_planner(
     save_checkpoint = partial(
         save_occurrence_planner_checkpoint,
         config=config,
-        legal_prefixes=dataset.legal_prefixes,
-        catalog_city_ids=dataset.catalog_city_ids,
-        city_legal_prefix_mask=dataset.city_legal_prefix_mask,
-        prefix_codebooks=checkpoint_codebooks,
-        legal_prefix_centroids=checkpoint_centroids,
-        legal_prefix_centroid_available=checkpoint_centroid_available,
         seed=seed,
         options=options,
+        **catalog,
     )
 
     stopper = EarlyStopper(patience=options.early_stopping_patience or None)
     history: list[dict[str, float]] = []
     train_objective = float("nan")
     validation_metrics: _NLLMetrics | None = None
-
     for epoch in range(1, options.epochs + 1):
         if device.type == "cuda":
             torch.cuda.synchronize(device)
@@ -766,22 +882,17 @@ def train_occurrence_planner(
             step_logger=step_logger,
             epoch=epoch,
         )
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
+        _synchronize(device)
         train_elapsed = time.perf_counter() - epoch_start_time
-        train_sps = processed / max(train_elapsed, 1e-6)
 
         validation_start = time.perf_counter()
         validation_metrics = _primary_split_nll(
             model, val_loader, device=device, distributed=distributed
         )
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
+        _synchronize(device)
         validation_elapsed = time.perf_counter() - validation_start
-        current_lr = float(optimizer.param_groups[0]["lr"])
         decision = stopper.step(validation_metrics.total, epoch=epoch)
-        improved = decision.improved
-        if improved and distributed.is_primary:
+        if decision.improved and distributed.is_primary:
             save_checkpoint(
                 best_path,
                 model_state=model.state_dict(),
@@ -789,55 +900,26 @@ def train_occurrence_planner(
                 validation_metric=stopper.best_value,
                 force=True,
             )
-
         if distributed.is_primary:
             history.append(
                 {
                     "epoch": epoch,
-                    "learning_rate": current_lr,
+                    "learning_rate": float(optimizer.param_groups[0]["lr"]),
                     "train_objective": train_objective,
                     "train_elapsed_s": train_elapsed,
                     "validation_elapsed_s": validation_elapsed,
-                    "train_samples_per_sec": train_sps,
+                    "train_samples_per_sec": processed
+                    / max(train_elapsed, 1e-6),
                     **_prefixed_metrics("train", train_nll_metrics),
                     **_prefixed_metrics("validation", validation_metrics),
                 }
             )
-            log_epoch_summary(
-                logger,
-                epoch=epoch,
+            _log_epoch(
+                history[-1],
                 total_epochs=options.epochs,
-                epoch_elapsed_s=train_elapsed,
-                samples_per_sec=train_sps,
-                gpu_allocated_gb=(
-                    torch.cuda.memory_allocated(device) / 1e9
-                    if device.type == "cuda"
-                    else 0.0
-                ),
-                gpu_peak_gb=(
-                    torch.cuda.max_memory_allocated(device) / 1e9
-                    if device.type == "cuda"
-                    else 0.0
-                ),
+                improved=decision.improved,
+                device=device,
             )
-            logger.info(
-                "epoch %d/%d  lr=%.6g  train_objective=%.4f  train_nll=%.4f  "
-                "validation_nll=%.4f  validation_time=%.2fs  "
-                "val[length=%.4f gap=%.4f duration=%.4f prefix=%.4f]%s",
-                epoch,
-                options.epochs,
-                current_lr,
-                train_objective,
-                train_nll_metrics.total,
-                validation_metrics.total,
-                validation_elapsed,
-                validation_metrics.length,
-                validation_metrics.gap,
-                validation_metrics.duration,
-                validation_metrics.prefix,
-                "  (best)" if improved else "",
-            )
-
         if decision.should_stop:
             if distributed.is_primary:
                 logger.info(
@@ -913,14 +995,10 @@ def _train_occurrence_planner_spawn_worker(
     rank: int,
     device_ids: list[int],
     port: int,
-    dataset_path: Path,
-    output_dir: Path,
-    architecture: OccurrencePlannerArchitecture,
-    options: OccurrencePlannerTrainingOptions,
-    seed: int,
+    settings: PlannerTrainingConfig,
     log_level: str,
+    log_file: Path | None,
     force: bool,
-    warm_start: PlannerWarmStart | None,
 ) -> None:
     warnings.filterwarnings(
         "ignore",
@@ -933,7 +1011,7 @@ def _train_occurrence_planner_spawn_worker(
     )
     if rank == 0:
         logging.disable(logging.NOTSET)
-        configure_logging(level=log_level)
+        configure_logging(level=log_level, log_file=log_file)
     else:
         logging.disable(logging.CRITICAL)
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -942,49 +1020,22 @@ def _train_occurrence_planner_spawn_worker(
     os.environ["WORLD_SIZE"] = str(len(device_ids))
     os.environ["LOCAL_RANK"] = str(rank)
     device_spec = f"[{','.join(str(device_id) for device_id in device_ids)}]"
-    train_occurrence_planner(
-        dataset_path=dataset_path,
-        output_dir=output_dir,
-        architecture=architecture,
-        options=replace(
-            options,
-            device=device_spec,
-            distributed=True,
-        ),
-        seed=seed,
-        force=force,
-        warm_start=warm_start,
-    )
+    training = replace(settings.training, device=device_spec, distributed=True)
+    train_occurrence_planner(replace(settings, training=training), force=force)
 
 
 def train_occurrence_planner_on_devices(
-    *,
-    dataset_path: Path,
-    output_dir: Path,
-    architecture: OccurrencePlannerArchitecture,
-    options: OccurrencePlannerTrainingOptions,
-    seed: int,
+    settings: PlannerTrainingConfig,
     device_ids: list[int],
-    log_level: str = "INFO",
+    *,
     force: bool = False,
-    warm_start: PlannerWarmStart | None = None,
+    log_level: str = "INFO",
 ) -> OccurrencePlannerTrainResult:
     if len(device_ids) < 2:
         raise ValueError(
             "multi-GPU planner training requires at least two GPUs"
         )
-    if len(set(device_ids)) != len(device_ids) or any(
-        device_id < 0 for device_id in device_ids
-    ):
-        raise ValueError("device IDs must be unique non-negative integers")
-    if not torch.cuda.is_available():
-        raise ValueError("multi-GPU planner training requires CUDA")
-    device_count = torch.cuda.device_count()
-    if any(device_id >= device_count for device_id in device_ids):
-        raise ValueError(
-            f"requested device IDs {device_ids} exceed the "
-            f"{device_count} visible CUDA devices"
-        )
+    _check_gpu_list(device_ids)
 
     port = find_free_port()
     mp.spawn(
@@ -992,25 +1043,22 @@ def train_occurrence_planner_on_devices(
         args=(
             device_ids,
             port,
-            Path(dataset_path),
-            Path(output_dir),
-            architecture,
-            options,
-            seed,
+            settings,
             log_level,
+            get_configured_log_file(),
             force,
-            warm_start,
         ),
         nprocs=len(device_ids),
         join=True,
     )
 
-    metrics_path = Path(output_dir) / "metrics.json"
+    output_dir = Path(settings.output_dir)
+    metrics_path = output_dir / "metrics.json"
     metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
     return OccurrencePlannerTrainResult(
-        output_dir=Path(output_dir),
-        best_checkpoint=Path(output_dir) / "best.pt",
-        last_checkpoint=Path(output_dir) / "last.pt",
+        output_dir=output_dir,
+        best_checkpoint=output_dir / "best.pt",
+        last_checkpoint=output_dir / "last.pt",
         metrics_path=metrics_path,
         best_epoch=int(metrics["best_epoch"]),
         best_validation_nll=float(metrics["best_validation_nll"]),
@@ -1046,8 +1094,9 @@ def _write_metrics_json(
 
 
 __all__ = [
-    "OccurrencePlannerArchitecture",
     "OccurrencePlannerTrainResult",
+    "check_planner_settings",
     "train_occurrence_planner",
     "train_occurrence_planner_on_devices",
+    "train_planner",
 ]

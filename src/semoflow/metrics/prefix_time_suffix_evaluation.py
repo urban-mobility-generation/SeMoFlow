@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import itertools
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -55,40 +55,26 @@ def load_lookup(path: Path) -> np.ndarray:
 
 def load_places(
     path: Path,
-    *,
-    coordinate_quarantine_ids: Iterable[int] = (),
 ) -> tuple[dict[int, tuple[float, float]], dict[int, str], int]:
+    """In-range POI coordinates, geohashes and the placekey vocab size."""
     frame = pl.read_parquet(
-        path,
-        columns=["placekey_id", "latitude", "longitude", "geohash_5"],
+        path, columns=["placekey_id", "latitude", "longitude", "geohash_5"]
     )
-    coordinates: dict[int, tuple[float, float]] = {}
-    geohashes: dict[int, str] = {}
-    quarantined = {int(value) for value in coordinate_quarantine_ids}
-    max_id = 0
-    for placekey_id, latitude, longitude, geohash in frame.iter_rows():
-        placekey_id = int(placekey_id)
-        max_id = max(max_id, placekey_id)
-        if (
-            placekey_id not in quarantined
-            and latitude is not None
-            and longitude is not None
-        ):
-            latitude_value = float(latitude)
-            longitude_value = float(longitude)
-            if (
-                np.isfinite(latitude_value)
-                and np.isfinite(longitude_value)
-                and -90.0 <= latitude_value <= 90.0
-                and -180.0 <= longitude_value <= 180.0
-            ):
-                coordinates[placekey_id] = (
-                    latitude_value,
-                    longitude_value,
-                )
-        if placekey_id not in quarantined and geohash is not None:
-            geohashes[placekey_id] = str(geohash)
-    return coordinates, geohashes, max_id + 1
+    located = frame.filter(
+        pl.col("latitude").is_between(-90.0, 90.0)
+        & pl.col("longitude").is_between(-180.0, 180.0)
+    )
+    coordinates = {
+        int(placekey_id): (float(latitude), float(longitude))
+        for placekey_id, latitude, longitude, _ in located.iter_rows()
+    }
+    geohashes = {
+        int(placekey_id): str(geohash)
+        for placekey_id, *_, geohash in frame.iter_rows()
+        if geohash is not None
+    }
+    vocab_size = int(frame["placekey_id"].to_numpy().max(initial=0)) + 1
+    return coordinates, geohashes, vocab_size
 
 
 def coordinate_less_selection_metrics(
@@ -129,51 +115,23 @@ def load_reference(
     *,
     max_samples: int,
     split: str = "val",
-    row_indices: Sequence[int] | None = None,
     payload: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.BoolTensor, torch.Tensor]:
+    """The leading ``max_samples`` bank rows of a split, with their POIs."""
     if payload is None:
         payload = load_bank_payload(bank_path)
     if split not in {"val", "test"}:
         raise ValueError("reference split must be 'val' or 'test'")
     offset, count = resolve_bank_split_window(payload, split, path=bank_path)
-    declared_count = int(count)
     if max_samples < 1:
         raise ValueError("max_samples must be positive")
-    if row_indices is None:
-        selected_indices = list(range(min(declared_count, max_samples)))
-    else:
-        selected_indices = [int(index) for index in row_indices[:max_samples]]
-        if any(
-            index < 0 or index >= declared_count for index in selected_indices
-        ):
-            raise ValueError(
-                f"reference row_indices must fall within the {split} split"
-            )
-        if len(set(selected_indices)) != len(selected_indices):
-            raise ValueError("reference row_indices must be unique")
-    selected_count = len(selected_indices)
+    selected_count = min(int(count), max_samples)
     if selected_count == 0:
         raise ValueError("reference selection is empty")
-    if row_indices is None:
-        sid_codes = payload["sid_codes"][
-            offset : offset + selected_count
-        ].long()
-        time_tokens = payload["time_tokens"][
-            offset : offset + selected_count
-        ].long()
-        valid_mask = payload["valid_mask"][
-            offset : offset + selected_count
-        ].bool()
-    else:
-        bank_indices = torch.tensor(
-            [offset + index for index in selected_indices], dtype=torch.long
-        )
-        sid_codes = payload["sid_codes"].index_select(0, bank_indices).long()
-        time_tokens = (
-            payload["time_tokens"].index_select(0, bank_indices).long()
-        )
-        valid_mask = payload["valid_mask"].index_select(0, bank_indices).bool()
+    rows = slice(offset, offset + selected_count)
+    sid_codes = payload["sid_codes"][rows].long()
+    time_tokens = payload["time_tokens"][rows].long()
+    valid_mask = payload["valid_mask"][rows].bool()
 
     source = payload.get("source")
     if not isinstance(source, dict):
@@ -199,17 +157,9 @@ def load_reference(
         .filter(
             pl.col("placekey_id").list.len().is_between(min_length, max_events)
         )
+        .head(selected_count)
         .collect()
     )
-    if row_indices is None:
-        frame = frame.head(selected_count)
-    elif frame.height <= max(selected_indices):
-        raise ValueError(
-            f"reference segment metadata has {frame.height} rows; cannot "
-            f"select {split} row {max(selected_indices)}"
-        )
-    else:
-        frame = frame[selected_indices]
     if frame.height != selected_count:
         raise ValueError(
             f"reference segment metadata has {frame.height} rows; "
@@ -224,10 +174,7 @@ def load_reference(
                 "reference segment and bank valid lengths do not align at "
                 f"row {row_index}: {len(ids)} != {length}"
             )
-        placekey_ids[row_index, :length] = torch.tensor(
-            ids,
-            dtype=torch.long,
-        )
+        placekey_ids[row_index, :length] = torch.tensor(ids, dtype=torch.long)
     return sid_codes, time_tokens, valid_mask, placekey_ids
 
 
@@ -553,33 +500,26 @@ def metric_block(
             real_tokens,
             generated_tokens,
             field_vocab,
-            placekey_latlon=None,
-            geohash_lookup=None,
             motif_day_keys_real=motif_day_keys_real,
             motif_day_keys_gen=motif_day_keys_generated,
             compute_device=compute_device,
         )
     )
     grounded = compute_decoded_sid_poi_metrics(
-        real_tokens,
-        generated_tokens,
-        grounding,
+        real_poi,
+        generated_poi,
+        real_stats=real_stats,
+        gen_stats=generated_stats,
         placekey_latlon=coordinates,
         geohash_lookup=geohashes,
         placekey_vocab_size=placekey_vocab_size,
         category_vocab_size=len(category_string_vocab) + 1,
-        real_poi=real_poi,
-        gen_poi=generated_poi,
-        real_stats=real_stats,
-        gen_stats=generated_stats,
         cluster_ids=cluster_ids,
         motif_day_keys_real=motif_day_keys_real,
         motif_day_keys_gen=motif_day_keys_generated,
         compute_device=compute_device,
         brief_metrics=brief_metrics,
     )
-    if grounded is None:
-        raise RuntimeError("SID grounding did not recognize the code fields")
     result: dict[str, Any] = {"decoded_poi_metrics": grounded}
     if sid_metrics is not None:
         result.update(

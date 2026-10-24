@@ -7,16 +7,15 @@ import numpy as np
 import polars as pl
 import torch
 
-from semoflow.preprocess.weekly_segments import (
-    SEGMENT_CITY_COLUMN,
+from semoflow.config.schemas.realizer_config import (
+    PrefixTimeSuffixLatentFlowRealizerConfig,
 )
+from semoflow.preprocess.weekly_segments import SEGMENT_CITY_COLUMN
 from semoflow.realizer.time_tokens import (
     N_TIME_TOKENS,
     time_tokens_from_timestamps,
 )
-from semoflow.tokenization.token_space import (
-    sid_code_columns,
-)
+from semoflow.tokenization.token_space import sid_code_columns
 
 
 def _load_lookup(path: Path) -> dict[int, np.ndarray]:
@@ -108,10 +107,10 @@ def build_bank(
     segments_path: Path,
     output_path: Path,
     max_events: int,
-    min_length: int,
-    max_train_segments: int,
-    max_val_segments: int,
-    max_test_segments: int,
+    min_length: int = 5,
+    max_train_segments: int = 0,
+    max_val_segments: int = 0,
+    max_test_segments: int = 0,
     allow_empty_splits: bool = False,
 ) -> dict[str, object]:
     if max_events < 1 or min_length < 1 or min_length > max_events:
@@ -319,10 +318,29 @@ def bank_split_city_ids(
     )
 
 
+def build_realizer_data(
+    settings: PrefixTimeSuffixLatentFlowRealizerConfig,
+) -> dict[str, object]:
+    """Build the bank ``settings`` trains on, keyed by its catalog lookup."""
+    data, lookup = settings.data, settings.catalog_path
+    if data is None or lookup is None:
+        raise ValueError(
+            "building the realizer bank needs realizer.data and "
+            "realizer.catalog_path"
+        )
+    return build_bank(
+        lookup_path=lookup,
+        segments_path=data.segments_path,
+        output_path=settings.bank_path,
+        max_events=data.max_events,
+    )
+
+
 __all__ = [
     "BANK_SPLITS",
     "bank_split_city_ids",
     "build_bank",
+    "build_realizer_data",
     "load_bank_payload",
     "resolve_bank_split_window",
 ]

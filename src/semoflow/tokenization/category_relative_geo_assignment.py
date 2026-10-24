@@ -247,15 +247,9 @@ def write_category_relative_geo_tokenizer_dir(
     seed: int,
     branching: int | None = None,
 ) -> CategoryRelativeGeoResult:
-    from semoflow.tokenization.control_dir import (
-        write_control_tokenizer_dir,
-    )
-    from semoflow.tokenization.frozen_encode import (
-        load_frozen_features,
-    )
-    from semoflow.tokenization.token_space import (
-        sid_code_columns,
-    )
+    from semoflow.tokenization.control_dir import write_control_tokenizer_dir
+    from semoflow.tokenization.frozen_encode import load_frozen_features
+    from semoflow.tokenization.token_space import sid_code_columns
 
     source_lookup = pl.read_parquet(source_dir / "placekey_lookup.parquet")
     n_levels = len(sid_code_columns(source_lookup.columns))

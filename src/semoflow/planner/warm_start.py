@@ -1,13 +1,12 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
-from semoflow.planner.artifacts import (
-    load_occurrence_planner_checkpoint,
-)
+from semoflow.planner.artifacts import load_occurrence_planner_checkpoint
 from semoflow.planner.model import OccurrenceARPlanner
 
 
@@ -36,18 +35,7 @@ class PlannerWarmStartReport:
     catalog_changed: bool
 
     def to_dict(self) -> dict[str, object]:
-        return {
-            "checkpoint": self.checkpoint,
-            "source_epoch": self.source_epoch,
-            "source_validation_metric": self.source_validation_metric,
-            "source_city_ids": list(self.source_city_ids),
-            "target_city_ids": list(self.target_city_ids),
-            "inherited_city_ids": list(self.inherited_city_ids),
-            "zero_initialized_city_ids": list(self.zero_initialized_city_ids),
-            "source_legal_prefix_count": self.source_legal_prefix_count,
-            "target_legal_prefix_count": self.target_legal_prefix_count,
-            "catalog_changed": self.catalog_changed,
-        }
+        return dataclasses.asdict(self)
 
 
 def _city_embedding_for_target(
@@ -111,9 +99,7 @@ def apply_planner_warm_start(
         or source_metadata["city_legality_fingerprint"]
         != target_metadata["city_legality_fingerprint"]
     )
-    model.load_neural_state_dict(
-        state, allow_catalog_mismatch=True, strict=True
-    )
+    model.load_neural_state_dict(state, allow_catalog_mismatch=True)
     return PlannerWarmStartReport(
         checkpoint=str(checkpoint_path),
         source_epoch=source.epoch,

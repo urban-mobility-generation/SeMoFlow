@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any, cast
 
 import polars as pl
 import torch
+
+from semoflow.utils.serialization import write_json
 
 
 def derive_target_city_tokenizer(
@@ -100,10 +101,7 @@ def derive_target_city_tokenizer(
         "output_tokenizer": str(output_tokenizer),
         "output_places_index": str(output_places_index),
     }
-    output_tokenizer.with_suffix(".manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_json(output_tokenizer.with_suffix(".manifest.json"), manifest)
     return manifest
 
 

@@ -7,9 +7,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from semoflow.tokenization.token_space import (
-    sid_code_names,
-)
+from semoflow.tokenization.token_space import sid_code_names
 
 if TYPE_CHECKING:
     from semoflow.tokenization.rqvae import RQVAE
@@ -38,9 +36,8 @@ class SIDCodebookBundle:
         tokenizer: RQVAE,
         *,
         code_fields: Sequence[str] | None = None,
-        device: str | torch.device = "cpu",
     ) -> SIDCodebookBundle:
-        codebooks = tokenizer.get_codebooks().detach().to(device).float()
+        codebooks = tokenizer.get_codebooks().detach().cpu().float()
         fields = (
             tuple(code_fields)
             if code_fields is not None
@@ -150,7 +147,6 @@ def codes_to_embeddings_from_codebooks(
 def extract_codebook_bundle(
     artifact_path: str | Path,
     *,
-    code_fields: Sequence[str] | None = None,
     max_artifact_bytes: int | None = None,
 ) -> SIDCodebookBundle:
     path = Path(artifact_path)
@@ -166,9 +162,9 @@ def extract_codebook_bundle(
             )
     payload = torch.load(path, map_location="cpu", weights_only=False)
 
+    code_fields: Sequence[str] | None = None
     if isinstance(payload, SIDCodebookBundle):
-        if code_fields is None:
-            code_fields = payload.code_fields
+        code_fields = payload.code_fields
         codebooks = payload.codebooks
 
     elif isinstance(payload, torch.Tensor):
@@ -179,8 +175,7 @@ def extract_codebook_bundle(
             raw = payload.get("codebook_bundle")
         if isinstance(raw, SIDCodebookBundle):
             codebooks = raw.codebooks.detach().cpu().float()
-            if code_fields is None:
-                code_fields = raw.code_fields
+            code_fields = raw.code_fields
         elif isinstance(raw, torch.Tensor):
             codebooks = raw.detach().cpu().float()
         else:

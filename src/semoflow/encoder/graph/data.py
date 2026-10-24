@@ -17,22 +17,18 @@ from semoflow.encoder.graph.covisit import (
 logger = logging.getLogger(__name__)
 
 
-def _build_index(series: pl.Series, name: str = "key") -> pl.DataFrame:
+def build_key_index(series: pl.Series, name: str = "key") -> pl.DataFrame:
     uniq = series.unique().sort()
     return pl.DataFrame(
         {name: uniq, "idx": pl.arange(0, uniq.len(), eager=True)}
     ).cast({"idx": pl.Int32})
 
 
-def _join_idx(
-    df: pl.DataFrame,
-    col: str,
-    lookup: pl.DataFrame,
-    key: str = "key",
-) -> pl.Series:
-    return df.select(pl.col(col).alias(key)).join(lookup, on=key, how="left")[
-        "idx"
-    ]
+def _join_idx(df: pl.DataFrame, col: str, lookup: pl.DataFrame) -> pl.Series:
+    """Row index of each ``df[col]`` value in a ``(key, idx)`` lookup."""
+    return df.select(pl.col(col).alias("key")).join(
+        lookup, on="key", how="left", maintain_order="left"
+    )["idx"]
 
 
 def _poi_key_column(
@@ -130,6 +126,185 @@ def _build_cbg_demographic_features(
     return True
 
 
+_UNKNOWN_LOOKUP = pl.DataFrame({"key": ["Unknown"], "idx": [0]}).cast(
+    {"idx": pl.Int32}
+)
+# Rows per index_add_ call when averaging POI features into user nodes.
+_AGGREGATION_CHUNK = 500_000
+_TIME_OF_DAY_RELATIONS = (
+    "next_weekend",
+    "next_morning",
+    "next_afternoon",
+    "next_evening",
+)
+
+
+def _attribute_lookup(
+    places_index_df: pl.DataFrame, column: str | None
+) -> pl.DataFrame:
+    if column is None:
+        return _UNKNOWN_LOOKUP
+    return build_key_index(places_index_df[column].drop_nulls(), "key")
+
+
+def _add_edges(
+    data: HeteroData,
+    relation: tuple[str, str, str],
+    reverse: str,
+    edge_index: torch.Tensor,
+) -> None:
+    source, name, target = relation
+    data[source, name, target].edge_index = edge_index
+    data[target, reverse, source].edge_index = edge_index.flip(0)
+
+
+def _mean_features(
+    num_nodes: int,
+    node_index: np.ndarray,
+    feature_rows: np.ndarray,
+    features: torch.Tensor,
+) -> torch.Tensor:
+    """Average ``features[feature_rows]`` into ``node_index`` buckets."""
+    total = torch.zeros(num_nodes, features.shape[1])
+    count = torch.zeros(num_nodes, 1)
+    for start in range(0, len(node_index), _AGGREGATION_CHUNK):
+        stop = min(start + _AGGREGATION_CHUNK, len(node_index))
+        nodes = torch.as_tensor(node_index[start:stop])
+        total.index_add_(0, nodes, features[feature_rows[start:stop]])
+        count.index_add_(0, nodes, torch.ones(stop - start, 1))
+    return total / count.clamp(min=1)
+
+
+def _membership_edges(
+    places_index_df: pl.DataFrame,
+    poi_col: str,
+    poi_lookup: pl.DataFrame,
+    column: str | None,
+    lookup: pl.DataFrame,
+) -> torch.Tensor:
+    """POI -> attribute-node edges for every POI with a known attribute."""
+    if column is None:
+        return torch.empty((2, 0), dtype=torch.long)
+    pairs = places_index_df.select([poi_col, column]).drop_nulls()
+    poi = _join_idx(pairs, poi_col, poi_lookup).fill_null(-1).to_numpy()
+    node = _join_idx(pairs, column, lookup).fill_null(-1).to_numpy()
+    known = (poi != -1) & (node != -1)
+    return torch.tensor(np.stack([poi[known], node[known]]), dtype=torch.long)
+
+
+def _transition_edges(
+    stays_valid: pl.DataFrame,
+    *,
+    poi_col: str,
+    ts_col: str,
+    poi_lookup: pl.DataFrame,
+    train_fraction: float | None,
+    seed: int,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor | None, int]:
+    """Consecutive-visit POI edges keyed by the arrival's time of day.
+
+    With ``train_fraction``, a seeded share of the transitions is held out
+    and returned as validation edges instead.
+    """
+    seq = (
+        stays_valid.select(["device_key", poi_col, ts_col])
+        .drop_nulls()
+        .sort(["device_key", ts_col])
+        .with_columns(
+            pl.col(poi_col).shift(-1).over("device_key").alias("dst_pk"),
+            pl.col(ts_col).shift(-1).over("device_key").alias("dst_ts"),
+        )
+        .drop_nulls("dst_pk")
+        .filter(pl.col(poi_col) != pl.col("dst_pk"))
+    )
+    if seq.is_empty():
+        return {}, None, 0
+    arrival = pl.col("dst_ts").cast(pl.Datetime)
+    seq = seq.with_columns(
+        arrival.dt.hour().alias("dst_hour"),
+        arrival.dt.weekday().alias("dst_weekday"),
+    )
+    src = _join_idx(seq, poi_col, poi_lookup).to_numpy()
+    dst = _join_idx(seq, "dst_pk", poi_lookup).to_numpy()
+    hour = seq["dst_hour"].to_numpy()
+    weekday = seq["dst_weekday"].to_numpy()
+
+    val_edge_index = None
+    if train_fraction is not None:
+        n = len(src)
+        generator = torch.Generator().manual_seed(seed)
+        perm = torch.randperm(n, generator=generator).numpy()
+        train_rows = np.zeros(n, dtype=bool)
+        train_rows[perm[: int(n * train_fraction)]] = True
+        val_rows = ~train_rows
+        val_edge_index = torch.tensor(
+            np.stack([src[val_rows], dst[val_rows]]), dtype=torch.long
+        )
+        logger.info(
+            "  temporal edge split  train=%d  val=%d  fraction=%.2f  seed=%d",
+            train_rows.sum(),
+            val_rows.sum(),
+            train_fraction,
+            seed,
+        )
+        src, dst = src[train_rows], dst[train_rows]
+        hour, weekday = hour[train_rows], weekday[train_rows]
+
+    weekend = weekday >= 6
+    masks = (
+        weekend,
+        ~weekend & (hour >= 5) & (hour < 12),
+        ~weekend & (hour >= 12) & (hour < 17),
+        ~weekend & ((hour >= 17) | (hour < 5)),
+    )
+    edges = {
+        relation: torch.tensor(
+            np.stack([src[mask], dst[mask]]), dtype=torch.long
+        )
+        for relation, mask in zip(_TIME_OF_DAY_RELATIONS, masks, strict=True)
+        if mask.any()
+    }
+    return edges, val_edge_index, seq.height
+
+
+def _add_covisit_edges(
+    data: HeteroData,
+    stays_df: pl.DataFrame,
+    poi_lookup: pl.DataFrame,
+    *,
+    tc_hours: float,
+    ts_intermediate: int,
+    min_shift: int,
+    min_covisits: int,
+    top_k: int,
+) -> None:
+    start = time.perf_counter()
+    adjacency = covisit_adjacency(
+        stays_df,
+        poi_lookup["key"].to_list(),
+        tc_hours=tc_hours,
+        ts_intermediate=ts_intermediate,
+        min_covisits=min_covisits,
+        min_shift=min_shift,
+    )
+    src, dst = top_k_per_row(adjacency, top_k)
+    if src.size:
+        _add_edges(
+            data,
+            ("poi", "covisits", "poi"),
+            "rev_covisits",
+            torch.tensor(np.stack([src, dst]), dtype=torch.long),
+        )
+    logger.info(
+        "  co-visitation edges: %d  (tc=%.1fh min_shift=%d top_k=%d)  %.1fs",
+        int(src.size),
+        tc_hours,
+        min_shift,
+        top_k,
+        time.perf_counter() - start,
+    )
+
+
 def build_hetero_data(
     stays_df: pl.DataFrame,
     places_index_df: pl.DataFrame,
@@ -146,67 +321,45 @@ def build_hetero_data(
     covisit_top_k: int = 50,
     include_user_nodes: bool = True,
 ) -> tuple[HeteroData, torch.Tensor | None]:
+    """POI graph with user, category and CBG nodes plus transition edges.
+
+    Returns the graph and, when ``train_fraction`` is set, the held-out
+    transition edges for link-prediction validation.
+    """
     t0 = time.perf_counter()
     logger.info(
         "Building HeteroData graph  stays=%d  pois=%d",
         stays_df.height,
         places_index_df.height,
     )
-
-    ts_col = (
-        "local_ts"
-        if "local_ts" in stays_df.columns
-        else ("timestamp" if "timestamp" in stays_df.columns else None)
+    ts_col = next(
+        (c for c in ("local_ts", "timestamp") if c in stays_df.columns), None
     )
-    if not ts_col:
+    if ts_col is None:
         raise ValueError("stays_df must have a local_ts or timestamp column")
 
     poi_col = _poi_key_column(stays_df, places_index_df)
-    poi_lookup = _build_index(places_index_df[poi_col], "key")
-    num_pois = poi_lookup.height
-
-    if include_user_nodes:
-        user_lookup = _build_index(stays_df["device_key"], "key")
-        num_users = user_lookup.height
-    else:
-        user_lookup = None
-        num_users = 0
-
-    cat_col = (
-        "top_category" if "top_category" in places_index_df.columns else None
-    )
-    if cat_col:
-        cat_lookup = _build_index(places_index_df[cat_col].drop_nulls(), "key")
-    else:
-        cat_lookup = pl.DataFrame({"key": ["Unknown"], "idx": [0]}).cast(
-            {"idx": pl.Int32}
-        )
-    num_cats = cat_lookup.height
-
-    cbg_col = (
-        "census_block_group"
-        if "census_block_group" in places_index_df.columns
+    poi_lookup = build_key_index(places_index_df[poi_col], "key")
+    user_lookup = (
+        build_key_index(stays_df["device_key"], "key")
+        if include_user_nodes
         else None
     )
-    if cbg_col:
-        cbg_lookup = _build_index(places_index_df[cbg_col].drop_nulls(), "key")
-    else:
-        cbg_lookup = pl.DataFrame({"key": ["Unknown"], "idx": [0]}).cast(
-            {"idx": pl.Int32}
-        )
-    num_cbgs = cbg_lookup.height
-
+    columns = places_index_df.columns
+    cat_col = "top_category" if "top_category" in columns else None
+    cbg_col = "census_block_group" if "census_block_group" in columns else None
+    cat_lookup = _attribute_lookup(places_index_df, cat_col)
+    cbg_lookup = _attribute_lookup(places_index_df, cbg_col)
     logger.info(
         "  nodes  pois=%d  users=%d  cats=%d  cbgs=%d",
-        num_pois,
-        num_users,
-        num_cats,
-        num_cbgs,
+        poi_lookup.height,
+        0 if user_lookup is None else user_lookup.height,
+        cat_lookup.height,
+        cbg_lookup.height,
     )
 
     data = HeteroData()
-
-    if "city_id" in places_index_df.columns:
+    if "city_id" in columns:
         poi_city = (
             poi_lookup.rename({"key": poi_col})
             .join(
@@ -223,240 +376,99 @@ def build_hetero_data(
         )
 
     if text_embeddings_path and Path(text_embeddings_path).exists():
-        from semoflow.encoder.artifacts import (
-            load_poi_embedding_artifact,
-        )
+        from semoflow.encoder.artifacts import load_poi_embedding_artifact
 
         poi_emb = (
-            load_poi_embedding_artifact(
-                text_embeddings_path,
-                kind="text",
-            )
+            load_poi_embedding_artifact(text_embeddings_path, kind="text")
             .align_to(places_index_df)
             .numpy()
         )
-        data["poi"].x = torch.from_numpy(
-            poi_emb.astype(np.float32, copy=False)
-        )
-        poi_dim = poi_emb.shape[1]
+        poi_x = torch.from_numpy(poi_emb.astype(np.float32, copy=False))
     else:
         logger.warning("Text embeddings not found, using random features.")
-        poi_dim = hidden_dim
-        data["poi"].x = torch.randn(num_pois, poi_dim)
-
-    poi_x = data["poi"].x
+        poi_x = torch.randn(poi_lookup.height, hidden_dim)
+    data["poi"].x = poi_x
 
     poi_keys = poi_lookup.select(pl.col("key").alias(poi_col))
-    stays_valid = stays_df.join(poi_keys, on=poi_col, how="semi")
+    stays_valid = stays_df.join(
+        poi_keys, on=poi_col, how="semi", maintain_order="left"
+    )
     logger.info(
         "  stays after POI filter: %d / %d",
         stays_valid.height,
         stays_df.height,
     )
-
-    if include_user_nodes:
-        assert user_lookup is not None
-        u_idx = _join_idx(stays_valid, "device_key", user_lookup)
-        p_idx = _join_idx(stays_valid, poi_col, poi_lookup)
-
-        visits = torch.tensor(
-            np.stack(
-                [u_idx.to_numpy(), p_idx.to_numpy()],
-            ),
-            dtype=torch.long,
-        )
-        data["user", "visits", "poi"].edge_index = visits
-        data["poi", "rev_visits", "user"].edge_index = visits.flip(0)
+    if user_lookup is not None:
+        users = _join_idx(stays_valid, "device_key", user_lookup).to_numpy()
+        pois = _join_idx(stays_valid, poi_col, poi_lookup).to_numpy()
+        visits = torch.tensor(np.stack([users, pois]), dtype=torch.long)
+        _add_edges(data, ("user", "visits", "poi"), "rev_visits", visits)
         logger.info("  visit edges: %d", visits.shape[1])
+        data["user"].x = _mean_features(user_lookup.height, users, pois, poi_x)
 
-        user_agg = torch.zeros(num_users, poi_dim)
-        user_cnt = torch.zeros(num_users, 1)
-        u_np = np.array(u_idx.to_numpy())
-        p_np = np.array(p_idx.to_numpy())
-        _CHUNK = 500_000
-        for _s in range(0, len(u_np), _CHUNK):
-            _e = min(_s + _CHUNK, len(u_np))
-            u_chunk = torch.from_numpy(u_np[_s:_e])
-            user_agg.index_add_(0, u_chunk, poi_x[p_np[_s:_e]])
-            user_cnt.index_add_(0, u_chunk, torch.ones(_e - _s, 1))
-        data["user"].x = user_agg / user_cnt.clamp(min=1)
-
-    if cat_col:
-        poi_cat = places_index_df.select([poi_col, cat_col]).drop_nulls()
-        pc_p_np = (
-            _join_idx(poi_cat, poi_col, poi_lookup).fill_null(-1).to_numpy()
+    poi_cat_edges = _membership_edges(
+        places_index_df, poi_col, poi_lookup, cat_col, cat_lookup
+    )
+    _add_edges(
+        data,
+        ("poi", "has_category", "category"),
+        "rev_category",
+        poi_cat_edges,
+    )
+    data["category"].x = _mean_features(
+        cat_lookup.height,
+        poi_cat_edges[1].numpy(),
+        poi_cat_edges[0].numpy(),
+        poi_x,
+    )
+    poi_cbg_edges = _membership_edges(
+        places_index_df, poi_col, poi_lookup, cbg_col, cbg_lookup
+    )
+    _add_edges(data, ("poi", "located_in", "cbg"), "contains", poi_cbg_edges)
+    if not (
+        cbg_attributes_df is not None
+        and cbg_col is not None
+        and _build_cbg_demographic_features(
+            data, cbg_attributes_df, cbg_lookup, places_index_df, cbg_col
         )
-        pc_c_np = (
-            _join_idx(poi_cat, cat_col, cat_lookup).fill_null(-1).to_numpy()
+    ):
+        data["cbg"].x = _mean_features(
+            cbg_lookup.height,
+            poi_cbg_edges[1].numpy(),
+            poi_cbg_edges[0].numpy(),
+            poi_x,
         )
-        m = (pc_p_np != -1) & (pc_c_np != -1)
-        poi_cat_edges = torch.tensor(
-            np.stack([pc_p_np[m], pc_c_np[m]]), dtype=torch.long
-        )
-    else:
-        poi_cat_edges = torch.empty((2, 0), dtype=torch.long)
-
-    data["poi", "has_category", "category"].edge_index = poi_cat_edges
-    data["category", "rev_category", "poi"].edge_index = poi_cat_edges.flip(0)
-
-    cat_agg = torch.zeros(num_cats, poi_dim)
-    cat_cnt = torch.zeros(num_cats, 1)
-    if poi_cat_edges.numel() > 0:
-        cat_agg.index_add_(0, poi_cat_edges[1], poi_x[poi_cat_edges[0]])
-        cat_cnt.index_add_(
-            0,
-            poi_cat_edges[1],
-            torch.ones(poi_cat_edges.shape[1], 1),
-        )
-    data["category"].x = cat_agg / cat_cnt.clamp(min=1)
-
-    if cbg_col:
-        poi_cbg = places_index_df.select([poi_col, cbg_col]).drop_nulls()
-        pcbg_p = _join_idx(poi_cbg, poi_col, poi_lookup)
-        pcbg_c = _join_idx(poi_cbg, cbg_col, cbg_lookup)
-        pcbg_p_np = pcbg_p.fill_null(-1).to_numpy()
-        pcbg_c_np = pcbg_c.fill_null(-1).to_numpy()
-        m = (pcbg_p_np != -1) & (pcbg_c_np != -1)
-        poi_cbg_edges = torch.tensor(
-            np.stack([pcbg_p_np[m], pcbg_c_np[m]]), dtype=torch.long
-        )
-    else:
-        poi_cbg_edges = torch.empty((2, 0), dtype=torch.long)
-
-    data["poi", "located_in", "cbg"].edge_index = poi_cbg_edges
-    data["cbg", "contains", "poi"].edge_index = poi_cbg_edges.flip(0)
-
-    cbg_features_set = False
-    if cbg_attributes_df is not None and cbg_col:
-        cbg_features_set = _build_cbg_demographic_features(
-            data,
-            cbg_attributes_df,
-            cbg_lookup,
-            places_index_df,
-            cbg_col,
-        )
-    if not cbg_features_set:
-        cbg_agg = torch.zeros(num_cbgs, poi_dim)
-        cbg_cnt = torch.zeros(num_cbgs, 1)
-        if poi_cbg_edges.numel() > 0:
-            cbg_agg.index_add_(0, poi_cbg_edges[1], poi_x[poi_cbg_edges[0]])
-            cbg_cnt.index_add_(
-                0,
-                poi_cbg_edges[1],
-                torch.ones(poi_cbg_edges.shape[1], 1),
-            )
-        data["cbg"].x = cbg_agg / cbg_cnt.clamp(min=1)
 
     logger.info("  building temporal transition edges...")
     t_trans = time.perf_counter()
-    val_edge_index = None
-
-    seq = (
-        stays_valid.select(["device_key", poi_col, ts_col])
-        .drop_nulls()
-        .sort(["device_key", ts_col])
-        .with_columns(
-            pl.col(poi_col).shift(-1).over("device_key").alias("dst_pk"),
-            pl.col(ts_col).shift(-1).over("device_key").alias("dst_ts"),
-        )
-        .drop_nulls("dst_pk")
-        .filter(pl.col(poi_col) != pl.col("dst_pk"))
+    transitions, val_edge_index, transition_count = _transition_edges(
+        stays_valid,
+        poi_col=poi_col,
+        ts_col=ts_col,
+        poi_lookup=poi_lookup,
+        train_fraction=train_fraction,
+        seed=seed,
     )
-
-    if not seq.is_empty():
-        seq = seq.with_columns(
-            pl.col("dst_ts").cast(pl.Datetime).dt.hour().alias("dst_hour"),
-            pl.col("dst_ts")
-            .cast(pl.Datetime)
-            .dt.weekday()
-            .alias("dst_weekday"),
+    for relation, edge_index in transitions.items():
+        _add_edges(
+            data, ("poi", relation, "poi"), f"rev_{relation}", edge_index
         )
-
-        src_np = _join_idx(seq, poi_col, poi_lookup).to_numpy()
-        dst_np = _join_idx(seq, "dst_pk", poi_lookup).to_numpy()
-        hour_np = seq["dst_hour"].to_numpy()
-        wd_np = seq["dst_weekday"].to_numpy()
-        if train_fraction is not None:
-            n = len(src_np)
-            gen = torch.Generator().manual_seed(seed)
-            perm = torch.randperm(n, generator=gen).numpy()
-            n_train = int(n * train_fraction)
-            train_rows = np.zeros(n, dtype=bool)
-            train_rows[perm[:n_train]] = True
-            val_rows = ~train_rows
-
-            val_edge_index = torch.tensor(
-                np.stack([src_np[val_rows], dst_np[val_rows]]),
-                dtype=torch.long,
-            )
-            logger.info(
-                "  temporal edge split  train=%d  val=%d  "
-                "fraction=%.2f  seed=%d",
-                train_rows.sum(),
-                val_rows.sum(),
-                train_fraction,
-                seed,
-            )
-
-            src_np = src_np[train_rows]
-            dst_np = dst_np[train_rows]
-            hour_np = hour_np[train_rows]
-            wd_np = wd_np[train_rows]
-
-        weekend = wd_np >= 6
-        morning = ~weekend & (hour_np >= 5) & (hour_np < 12)
-        afternoon = ~weekend & (hour_np >= 12) & (hour_np < 17)
-        evening = ~weekend & ((hour_np >= 17) | (hour_np < 5))
-        for label, mask in [
-            ("next_weekend", weekend),
-            ("next_morning", morning),
-            ("next_afternoon", afternoon),
-            ("next_evening", evening),
-        ]:
-            if mask.any():
-                edge_idx = torch.tensor(
-                    np.stack([src_np[mask], dst_np[mask]]),
-                    dtype=torch.long,
-                )
-                data["poi", label, "poi"].edge_index = edge_idx
-                data["poi", f"rev_{label}", "poi"].edge_index = edge_idx.flip(
-                    0
-                )
-
     logger.info(
         "  temporal edges: %d transitions  %.1fs",
-        seq.height,
+        transition_count,
         time.perf_counter() - t_trans,
     )
-
     if covisit_edges:
-        t_cov = time.perf_counter()
-        poi_ids = poi_lookup["key"].to_list()
-        adjacency = covisit_adjacency(
+        _add_covisit_edges(
+            data,
             stays_df,
-            poi_ids,
+            poi_lookup,
             tc_hours=covisit_tc_hours,
             ts_intermediate=covisit_ts_intermediate,
-            min_covisits=covisit_min_covisits,
             min_shift=covisit_min_shift,
+            min_covisits=covisit_min_covisits,
+            top_k=covisit_top_k,
         )
-        src_cov, dst_cov = top_k_per_row(adjacency, covisit_top_k)
-        if src_cov.size:
-            cov_idx = torch.tensor(
-                np.stack([src_cov, dst_cov]), dtype=torch.long
-            )
-            data["poi", "covisits", "poi"].edge_index = cov_idx
-            data["poi", "rev_covisits", "poi"].edge_index = cov_idx.flip(0)
-        logger.info(
-            "  co-visitation edges: %d  (tc=%.1fh min_shift=%d top_k=%d)  "
-            "%.1fs",
-            int(src_cov.size),
-            covisit_tc_hours,
-            covisit_min_shift,
-            covisit_top_k,
-            time.perf_counter() - t_cov,
-        )
-
     logger.info(
         "HeteroData complete  %.1fs  metadata=%s",
         time.perf_counter() - t0,

@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 import torch
 
+from semoflow.config.artifacts import TokenizerArtifacts
+from semoflow.config.schemas.planner_config import (
+    OccurrencePlannerDataOptions,
+)
 from semoflow.planner.artifacts import (
     DATASET_ARTIFACT_TYPE,
     save_torch_atomic,
@@ -26,9 +32,9 @@ from semoflow.planner.gap_codec import (
     PLANNER_GAP_REPRESENTATIVES_MINUTES,
     gap_tokens_from_event_time_minutes,
 )
-from semoflow.tokenization.token_space import (
-    sid_code_columns,
-)
+from semoflow.preprocess.weekly_segments import build_weekly_segment_cache
+from semoflow.tokenization.decoding.codebooks import extract_codebook_bundle
+from semoflow.tokenization.token_space import sid_code_columns
 
 OBSERVATION_WINDOW_MINUTES = 7.0 * 24.0 * 60.0
 
@@ -52,23 +58,7 @@ class OccurrencePlannerDatasetBuildResult:
     centroid_coverage: float
 
     def to_dict(self) -> dict[str, object]:
-        return {
-            "output_path": str(self.output_path),
-            "train_rows": self.train_rows,
-            "validation_rows": self.validation_rows,
-            "legal_prefixes": self.legal_prefixes,
-            "overflow_policy": self.overflow_policy,
-            "source_rows": self.source_rows,
-            "eligible_rows": self.eligible_rows,
-            "overflow_rows": self.overflow_rows,
-            "truncated_rows": self.truncated_rows,
-            "dropped_overflow_rows": self.dropped_overflow_rows,
-            "overflow_fraction": self.overflow_fraction,
-            "raw_mean_length": self.raw_mean_length,
-            "effective_mean_length": self.effective_mean_length,
-            "tokenizer_latent_dim": self.tokenizer_latent_dim,
-            "centroid_coverage": self.centroid_coverage,
-        }
+        return dataclasses.asdict(self)
 
 
 def _require_datetime(value: object) -> datetime:
@@ -159,7 +149,7 @@ def _load_prefix_centroids(
     )
     grouped = (
         pl.read_parquet(lookup_path, columns=["placekey", *selected])
-        .join(places, on="placekey", how="inner")
+        .join(places, on="placekey", how="inner", maintain_order="left")
         .drop_nulls(["latitude", "longitude"])
         .group_by(selected)
         .agg(
@@ -411,34 +401,7 @@ def _materialize_split(
     }
 
 
-def build_occurrence_planner_dataset(
-    *,
-    segments_path: Path,
-    lookup_path: Path,
-    places_paths: Sequence[Path] | None = None,
-    output_path: Path,
-    codebook_size: int,
-    prefix_depth: int = 3,
-    min_occurrences: int = 1,
-    max_occurrences: int = 30,
-    overflow_policy: str = "truncate",
-    context_mode: str = "none",
-    codebooks_path: Path | None = None,
-    force: bool = False,
-) -> OccurrencePlannerDatasetBuildResult:
-    if codebook_size < 1 or prefix_depth < 1:
-        raise ValueError("codebook_size and prefix_depth must be positive")
-    if min_occurrences < 1 or max_occurrences < min_occurrences:
-        raise ValueError("occurrence bounds are invalid")
-    if overflow_policy not in {"truncate", "drop", "error"}:
-        raise ValueError(
-            "overflow_policy must be 'truncate', 'drop', or 'error'"
-        )
-    if context_mode not in SUPPORTED_CONTEXT_MODES:
-        raise ValueError(
-            "context_mode must be 'none', 'city', or 'city_calendar_origin'"
-        )
-    context_schema = context_schema_for_mode(context_mode)
+def _load_segments(segments_path: Path) -> pl.DataFrame:
     schema = pl.read_parquet_schema(segments_path)
     required = {"_split", "placekey_id", "_timestamps"}
     missing = sorted(required.difference(schema.keys()))
@@ -446,31 +409,6 @@ def build_occurrence_planner_dataset(
         raise ValueError(
             "segments are missing required columns: " + ", ".join(missing)
         )
-    (
-        lookup,
-        legal_prefixes,
-        catalog_city_ids,
-        city_legal_prefix_mask,
-    ) = _load_prefix_lookup(
-        lookup_path,
-        places_paths=places_paths,
-        prefix_depth=prefix_depth,
-        codebook_size=codebook_size,
-        context_mode=context_mode,
-    )
-    prefix_codebooks = _load_prefix_codebooks(
-        codebooks_path,
-        prefix_depth=prefix_depth,
-        codebook_size=codebook_size,
-    )
-    legal_prefix_centroids, legal_prefix_centroid_available = (
-        _load_prefix_centroids(
-            lookup_path,
-            places_paths=places_paths,
-            legal_prefixes=legal_prefixes,
-            prefix_depth=prefix_depth,
-        )
-    )
     segment_columns = ["_split", "placekey_id", "_timestamps"]
     if "city_id" in schema:
         segment_columns.append("city_id")
@@ -484,6 +422,17 @@ def build_occurrence_planner_dataset(
         raise TypeError(
             "collecting planner segments did not return a DataFrame"
         )
+    return frame
+
+
+def _bound_occurrences(
+    frame: pl.DataFrame,
+    *,
+    min_occurrences: int,
+    max_occurrences: int,
+    overflow_policy: str,
+) -> tuple[pl.DataFrame, dict[str, Any]]:
+    """Apply occurrence bounds; return the frame and its length stats."""
     place_lengths = pl.col("placekey_id").list.len()
     timestamp_lengths = pl.col("_timestamps").list.len()
     source_rows = frame.height
@@ -514,69 +463,144 @@ def build_occurrence_planner_dataset(
             truncated_rows = overflow_rows
     if frame.height < 1:
         raise ValueError("overflow policy removed all eligible segments")
-    effective_lengths = pl.col("placekey_id").list.len()
-    effective_mean_length = float(
-        frame.select(effective_lengths.mean()).item()
+    return frame, {
+        "source_rows": source_rows,
+        "eligible_rows": eligible_rows,
+        "overflow_rows": overflow_rows,
+        "truncated_rows": truncated_rows,
+        "dropped_overflow_rows": dropped_overflow_rows,
+        "overflow_fraction": overflow_rows / eligible_rows,
+        "raw_mean_length": raw_mean_length,
+        "effective_mean_length": float(
+            frame.select(place_lengths.mean()).item()
+        ),
+    }
+
+
+def _data_config(
+    *,
+    codebook_size: int,
+    prefix_depth: int,
+    max_occurrences: int,
+    context_mode: str,
+) -> dict[str, object]:
+    context_schema = context_schema_for_mode(context_mode)
+    return {
+        "codebook_size": codebook_size,
+        "gap_vocab": len(PLANNER_GAP_REPRESENTATIVES_MINUTES),
+        "prefix_depth": prefix_depth,
+        "max_occurrences": max_occurrences,
+        "context_dim": len(context_schema),
+        "context_schema": context_schema,
+        "city_conditioning": city_conditioning_for_mode(context_mode),
+        "gap_codec_version": PLANNER_GAP_CODEC_VERSION,
+        "gap_bucket_edges_minutes": PLANNER_GAP_BUCKET_EDGES_MINUTES,
+        "gap_duration_minutes": PLANNER_GAP_REPRESENTATIVES_MINUTES,
+        "observation_window_minutes": OBSERVATION_WINDOW_MINUTES,
+    }
+
+
+def build_occurrence_planner_dataset(
+    *,
+    segments_path: Path,
+    lookup_path: Path,
+    places_paths: Sequence[Path] | None = None,
+    output_path: Path,
+    codebook_size: int,
+    prefix_depth: int = 3,
+    min_occurrences: int = 1,
+    max_occurrences: int = 30,
+    overflow_policy: str = "truncate",
+    context_mode: str = "none",
+    codebooks_path: Path | None = None,
+    force: bool = False,
+) -> OccurrencePlannerDatasetBuildResult:
+    if codebook_size < 1 or prefix_depth < 1:
+        raise ValueError("codebook_size and prefix_depth must be positive")
+    if min_occurrences < 1 or max_occurrences < min_occurrences:
+        raise ValueError("occurrence bounds are invalid")
+    if overflow_policy not in {"truncate", "drop", "error"}:
+        raise ValueError(
+            "overflow_policy must be 'truncate', 'drop', or 'error'"
+        )
+    if context_mode not in SUPPORTED_CONTEXT_MODES:
+        raise ValueError(
+            "context_mode must be 'none', 'city', or 'city_calendar_origin'"
+        )
+    segments = _load_segments(segments_path)
+    (
+        lookup,
+        legal_prefixes,
+        catalog_city_ids,
+        city_legal_prefix_mask,
+    ) = _load_prefix_lookup(
+        lookup_path,
+        places_paths=places_paths,
+        prefix_depth=prefix_depth,
+        codebook_size=codebook_size,
+        context_mode=context_mode,
     )
-    overflow_fraction = overflow_rows / eligible_rows
-    train = frame.filter(pl.col("_split") == "train").drop("_split")
-    validation = frame.filter(pl.col("_split") == "val").drop("_split")
-    if train.height < 1 or validation.height < 1:
+    prefix_codebooks = _load_prefix_codebooks(
+        codebooks_path,
+        prefix_depth=prefix_depth,
+        codebook_size=codebook_size,
+    )
+    legal_prefix_centroids, legal_prefix_centroid_available = (
+        _load_prefix_centroids(
+            lookup_path,
+            places_paths=places_paths,
+            legal_prefixes=legal_prefixes,
+            prefix_depth=prefix_depth,
+        )
+    )
+    frame, stats = _bound_occurrences(
+        segments,
+        min_occurrences=min_occurrences,
+        max_occurrences=max_occurrences,
+        overflow_policy=overflow_policy,
+    )
+    splits = {
+        name: frame.filter(pl.col("_split") == split).drop("_split")
+        for name, split in (("train", "train"), ("validation", "val"))
+    }
+    if any(split.height < 1 for split in splits.values()):
         raise ValueError(
             "overflow and occurrence filters must retain both train and "
             "validation rows"
         )
     payload = {
         "artifact_type": DATASET_ARTIFACT_TYPE,
-        "data_config": {
-            "codebook_size": codebook_size,
-            "gap_vocab": len(PLANNER_GAP_REPRESENTATIVES_MINUTES),
-            "prefix_depth": prefix_depth,
-            "max_occurrences": max_occurrences,
-            "context_dim": len(context_schema),
-            "context_schema": context_schema,
-            "city_conditioning": city_conditioning_for_mode(context_mode),
-            "gap_codec_version": PLANNER_GAP_CODEC_VERSION,
-            "gap_bucket_edges_minutes": PLANNER_GAP_BUCKET_EDGES_MINUTES,
-            "gap_duration_minutes": PLANNER_GAP_REPRESENTATIVES_MINUTES,
-            "observation_window_minutes": OBSERVATION_WINDOW_MINUTES,
-        },
+        "data_config": _data_config(
+            codebook_size=codebook_size,
+            prefix_depth=prefix_depth,
+            max_occurrences=max_occurrences,
+            context_mode=context_mode,
+        ),
         "legal_prefixes": legal_prefixes,
         "prefix_codebooks": prefix_codebooks,
         "legal_prefix_centroids": legal_prefix_centroids,
         "legal_prefix_centroid_available": legal_prefix_centroid_available,
         "catalog_city_ids": catalog_city_ids,
         "city_legal_prefix_mask": city_legal_prefix_mask,
-        "train": _materialize_split(
-            train,
-            lookup=lookup,
-            prefix_depth=prefix_depth,
-            max_occurrences=max_occurrences,
-            context_mode=context_mode,
-        ),
-        "validation": _materialize_split(
-            validation,
-            lookup=lookup,
-            prefix_depth=prefix_depth,
-            max_occurrences=max_occurrences,
-            context_mode=context_mode,
-        ),
+        **{
+            name: _materialize_split(
+                split,
+                lookup=lookup,
+                prefix_depth=prefix_depth,
+                max_occurrences=max_occurrences,
+                context_mode=context_mode,
+            )
+            for name, split in splits.items()
+        },
     }
     save_torch_atomic(output_path, payload, force=force)
     return OccurrencePlannerDatasetBuildResult(
         output_path=Path(output_path),
-        train_rows=train.height,
-        validation_rows=validation.height,
+        train_rows=splits["train"].height,
+        validation_rows=splits["validation"].height,
         legal_prefixes=int(legal_prefixes.shape[0]),
         overflow_policy=overflow_policy,
-        source_rows=source_rows,
-        eligible_rows=eligible_rows,
-        overflow_rows=overflow_rows,
-        truncated_rows=truncated_rows,
-        dropped_overflow_rows=dropped_overflow_rows,
-        overflow_fraction=overflow_fraction,
-        raw_mean_length=raw_mean_length,
-        effective_mean_length=effective_mean_length,
+        **stats,
         tokenizer_latent_dim=(
             0 if prefix_codebooks is None else int(prefix_codebooks.shape[-1])
         ),
@@ -588,8 +612,40 @@ def build_occurrence_planner_dataset(
     )
 
 
+def build_planner_data(
+    data: OccurrencePlannerDataOptions,
+    *,
+    dataset_path: Path,
+    force: bool = False,
+) -> dict[str, object]:
+    """Build the weekly segments, then the planner dataset from them."""
+    tokenizer = TokenizerArtifacts.from_run_dir(data.tokenization_dir)
+    segments = build_weekly_segment_cache(
+        stays_path=tokenizer.augmented_processed_visits,
+        output=data.segments_path,
+        min_active_days=data.min_active_days,
+        force=force,
+    )
+    dataset = build_occurrence_planner_dataset(
+        segments_path=data.segments_path,
+        lookup_path=tokenizer.placekey_lookup,
+        places_paths=(
+            None if data.places_path is None else [data.places_path]
+        ),
+        output_path=dataset_path,
+        codebook_size=extract_codebook_bundle(
+            tokenizer.tokenizer_codebooks
+        ).codebook_size,
+        max_occurrences=data.max_occurrences,
+        context_mode=data.context_mode,
+        force=force,
+    )
+    return {"segments": segments, "dataset": dataset.to_dict()}
+
+
 __all__ = [
     "OBSERVATION_WINDOW_MINUTES",
     "OccurrencePlannerDatasetBuildResult",
     "build_occurrence_planner_dataset",
+    "build_planner_data",
 ]

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import functools
-import json
 import logging
 from collections.abc import Callable
 from contextlib import AbstractContextManager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +14,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, Sampler
 
+from semoflow.config.schemas.realizer_config import (
+    PrefixTimeSuffixLatentFlowRealizerConfig,
+)
 from semoflow.realizer.bank import (
     bank_split_city_ids,
     load_bank_payload,
@@ -47,6 +49,7 @@ from semoflow.realizer.spatial import (
 )
 from semoflow.tokenization.decoding.codebooks import (
     MAX_STANDALONE_CODEBOOK_ARTIFACT_BYTES,
+    SIDCodebookBundle,
     codebook_bundle_metadata,
     extract_codebook_bundle,
 )
@@ -56,226 +59,13 @@ from semoflow.training.utils.checkpoint import (
     save_checkpoint,
 )
 from semoflow.training.utils.distributed import unwrap_ddp
-from semoflow.training.utils.early_stopping import (
-    EarlyStopper,
-)
-from semoflow.training.utils.lr_schedule import (
-    build_lr_scheduler,
-)
-from semoflow.training.utils.mixed_precision import (
-    build_amp_context,
-)
+from semoflow.training.utils.early_stopping import EarlyStopper
+from semoflow.training.utils.lr_schedule import build_lr_scheduler
+from semoflow.training.utils.mixed_precision import build_amp_context
 from semoflow.training.utils.runtime import set_seed_all
+from semoflow.utils.serialization import write_json
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True, slots=True)
-class PrefixTimeSuffixLatentFlowRealizerConfig:
-    bank_path: Path
-    codebooks_path: Path
-    output_dir: Path
-    initialize_from: Path | None = None
-    prefix_depth: int = 3
-    codebook_size: int = 64
-    time_vocab: int = 42
-    latent_dim: int | None = None
-    model_dim: int = 256
-    condition_depth: int = 4
-    depth: int = 6
-    num_heads: int = 8
-    mlp_ratio: float = 4.0
-    dropout: float = 0.1
-    batch_size: int = 256
-    epochs: int = 30
-    learning_rate: float = 2e-4
-    lr_scheduler: str = "constant"
-    warmup_steps: int = 0
-    min_lr: float = 0.0
-    early_stopping_patience: int | None = None
-    early_stopping_min_delta: float = 0.0
-    weight_decay: float = 1e-2
-    max_grad_norm: float = 1.0
-    train_max_samples: int | None = None
-    val_max_samples: int | None = None
-    num_workers: int = 0
-    prefetch_factor: int = 2
-    cpu_threads: int = 4
-    device: str = "cuda:0"
-    seed: int = 7
-    compile: bool = False
-    mixed_precision: str = "none"
-    tf32: bool = False
-    fused_optimizer: bool = False
-    val_every: int = 1
-    lognormal_t: bool = True
-    city_vocab: int = 0
-    spatial_conditioning: bool = False
-    spatial_num_basis: int = 8
-    spatial_max_km: float = 50.0
-    places_path: Path | None = None
-    prefix_embedding_mode: str = "learned"
-    tail_representation: str = "summed"
-    latent_target_scope: str = "suffix"
-    proposal_corruption_rate: float = 0.0
-    tail_normalization: str = "diagonal"
-    tail_whitening_shrinkage: float = 0.05
-    tail_whitening_chunk_size: int = 262144
-    catalog_decoder_mode: str = "nearest"
-    factorized_sum_consistency_weight: float = 0.0
-    catalog_path: Path | None = None
-    catalog_loss_weight: float = 0.0
-    catalog_negative_count: int = 8
-    catalog_temperature: float = 1.0
-    catalog_candidate_count: int = 64
-    endpoint_loss_weight: float = 0.0
-    population_loss_weight: float = 0.0
-    catalog_prior_weight: float = 0.25
-
-    def validate(self) -> None:
-        if (
-            self.initialize_from is not None
-            and self.output_dir.resolve()
-            == self.initialize_from.resolve().parent
-        ):
-            raise ValueError(
-                "output_dir must differ from the warm-start checkpoint "
-                "directory; adaptation would overwrite the parent artifacts"
-            )
-        if self.epochs <= 0 or self.batch_size <= 0:
-            raise ValueError("epochs and batch_size must be positive")
-        if self.val_every <= 0:
-            raise ValueError("val_every must be positive")
-        if (
-            self.num_workers < 0
-            or self.prefetch_factor <= 0
-            or self.cpu_threads <= 0
-        ):
-            raise ValueError("data-loader worker settings are invalid")
-        if self.mixed_precision not in {"none", "bf16", "fp16"}:
-            raise ValueError(
-                "mixed_precision must be 'none', 'bf16', or 'fp16'"
-            )
-        if self.learning_rate <= 0.0 or self.weight_decay < 0.0:
-            raise ValueError("optimizer hyperparameters are invalid")
-        if self.lr_scheduler not in {"constant", "cosine"}:
-            raise ValueError("lr_scheduler must be 'constant' or 'cosine'")
-        if self.warmup_steps < 0:
-            raise ValueError("warmup_steps must be non-negative")
-        if not 0.0 <= self.min_lr <= self.learning_rate:
-            raise ValueError("min_lr must be between zero and learning_rate")
-        if self.lr_scheduler == "constant" and self.min_lr != 0.0:
-            raise ValueError("min_lr requires the cosine LR scheduler")
-        if (
-            self.early_stopping_patience is not None
-            and self.early_stopping_patience < 1
-        ):
-            raise ValueError(
-                "early_stopping_patience must be positive or None"
-            )
-        if self.early_stopping_min_delta < 0.0:
-            raise ValueError("early_stopping_min_delta must be non-negative")
-        if self.prefix_embedding_mode not in {
-            "learned",
-            "hybrid_frozen_codebook",
-        }:
-            raise ValueError("prefix_embedding_mode is invalid")
-        if self.tail_representation not in {"summed", "factorized"}:
-            raise ValueError("tail_representation is invalid")
-        if self.latent_target_scope not in {"suffix", "full_sid"}:
-            raise ValueError("latent_target_scope is invalid")
-        if (
-            self.latent_target_scope == "full_sid"
-            and self.tail_representation != "summed"
-        ):
-            raise ValueError("full-SID targets require summed representation")
-        if not 0.0 <= self.proposal_corruption_rate <= 1.0:
-            raise ValueError("proposal_corruption_rate must be in [0, 1]")
-        if (
-            self.latent_target_scope == "suffix"
-            and self.proposal_corruption_rate > 0.0
-        ):
-            raise ValueError(
-                "proposal corruption is valid only for full-SID latent targets"
-            )
-        if self.tail_normalization not in {"diagonal", "whitened"}:
-            raise ValueError("tail_normalization is invalid")
-        if (
-            self.tail_normalization == "whitened"
-            and self.tail_representation != "summed"
-        ):
-            raise ValueError(
-                "whitened tail normalization requires summed tails"
-            )
-        if not 0.0 <= self.tail_whitening_shrinkage <= 1.0:
-            raise ValueError("tail_whitening_shrinkage must be in [0, 1]")
-        if self.tail_whitening_chunk_size <= 0:
-            raise ValueError("tail_whitening_chunk_size must be positive")
-        if self.catalog_decoder_mode not in {"nearest", "calibrated"}:
-            raise ValueError("catalog_decoder_mode is invalid")
-        if (
-            self.catalog_decoder_mode == "calibrated"
-            and self.tail_representation == "factorized"
-        ):
-            raise ValueError(
-                "factorized tails are incompatible with calibrated catalog "
-                "decoding"
-            )
-        if self.factorized_sum_consistency_weight < 0.0:
-            raise ValueError(
-                "factorized_sum_consistency_weight must be non-negative"
-            )
-        if self.catalog_loss_weight < 0.0:
-            raise ValueError("catalog_loss_weight must be non-negative")
-        if (
-            self.catalog_decoder_mode == "calibrated"
-            and self.catalog_loss_weight <= 0.0
-        ):
-            raise ValueError(
-                "catalog_loss_weight must be positive for calibrated catalog "
-                "decoding"
-            )
-        if self.catalog_loss_weight > 0.0 and self.catalog_path is None:
-            raise ValueError(
-                "catalog_path is required when catalog loss is enabled"
-            )
-        if self.proposal_corruption_rate > 0.0 and self.catalog_path is None:
-            raise ValueError(
-                "catalog_path is required when proposal corruption is enabled"
-            )
-        if (
-            self.catalog_decoder_mode == "calibrated"
-            and self.catalog_path is None
-        ):
-            raise ValueError(
-                "catalog_path is required for calibrated decoding"
-            )
-        if self.spatial_conditioning and self.places_path is None:
-            raise ValueError(
-                "places_path is required when spatial_conditioning is enabled"
-            )
-        if self.spatial_conditioning and self.catalog_path is None:
-            raise ValueError(
-                "catalog_path is required when spatial_conditioning is enabled "
-                "(prefix-bucket centroids are built from the catalog)"
-            )
-        if self.spatial_conditioning and self.spatial_num_basis < 1:
-            raise ValueError("spatial_num_basis must be positive")
-        if self.spatial_conditioning and self.spatial_max_km <= 0.0:
-            raise ValueError("spatial_max_km must be positive")
-        if self.catalog_negative_count <= 0 or self.catalog_temperature <= 0.0:
-            raise ValueError(
-                "catalog ranking hyperparameters must be positive"
-            )
-        if self.catalog_candidate_count <= 0:
-            raise ValueError("catalog_candidate_count must be positive")
-        if (
-            self.endpoint_loss_weight < 0.0
-            or self.population_loss_weight < 0.0
-        ):
-            raise ValueError("auxiliary loss weights must be non-negative")
-        if self.catalog_prior_weight < 0.0:
-            raise ValueError("catalog_prior_weight must be non-negative")
 
 
 def _split_tensors(
@@ -657,7 +447,7 @@ def _run_epoch(
 
 
 @dataclass(frozen=True, slots=True)
-class _BankSplit:
+class BankSplit:
     codes: torch.Tensor
     times: torch.Tensor
     valid: torch.Tensor
@@ -681,9 +471,11 @@ class _BankSplit:
         )
 
 
-def _load_bank_splits(
+def load_bank_splits(
     config: PrefixTimeSuffixLatentFlowRealizerConfig,
-) -> tuple[_BankSplit, _BankSplit]:
+    *,
+    codebook_size: int,
+) -> tuple[BankSplit, BankSplit]:
     payload = load_bank_payload(config.bank_path)
     limits = {"train": config.train_max_samples, "val": config.val_max_samples}
     raw = {
@@ -692,8 +484,8 @@ def _load_bank_splits(
     }
     for split, (codes, times, valid) in raw.items():
         try:
-            _BankSplit(codes, times, valid).check_ranges(
-                codebook_size=config.codebook_size,
+            BankSplit(codes, times, valid).check_ranges(
+                codebook_size=codebook_size,
                 time_vocab=config.time_vocab,
             )
         except ValueError as error:
@@ -726,7 +518,7 @@ def _load_bank_splits(
             if centroids is not None
             else None
         )
-        splits.append(_BankSplit(codes, times, valid, city, hop))
+        splits.append(BankSplit(codes, times, valid, city, hop))
     return splits[0], splits[1]
 
 
@@ -794,7 +586,7 @@ class _TailStats:
 def _tail_stats(
     config: PrefixTimeSuffixLatentFlowRealizerConfig,
     initialization: dict[str, Any] | None,
-    train: _BankSplit,
+    train: BankSplit,
     codebooks: torch.Tensor,
     *,
     target_level_start: int,
@@ -838,8 +630,8 @@ def _tail_stats(
 
 def _build_loaders(
     config: PrefixTimeSuffixLatentFlowRealizerConfig,
-    train: _BankSplit,
-    val: _BankSplit,
+    train: BankSplit,
+    val: BankSplit,
     *,
     device: torch.device,
     distributed: bool,
@@ -891,7 +683,7 @@ def _build_loaders(
 
 def _catalog_objectives(
     config: PrefixTimeSuffixLatentFlowRealizerConfig,
-    train: _BankSplit,
+    train: BankSplit,
     codebooks: torch.Tensor,
     *,
     target_level_start: int,
@@ -908,7 +700,7 @@ def _catalog_objectives(
     )
     corruption_index = (
         build_proposal_corruption_index(
-            catalog_codes, codebook_size=config.codebook_size
+            catalog_codes, codebook_size=int(codebooks.shape[1])
         ).to(device)
         if config.proposal_corruption_rate > 0.0
         else None
@@ -937,10 +729,236 @@ def _catalog_objectives(
     return catalog_candidates, candidate_bank, corruption_index
 
 
+def _load_codebooks(
+    config: PrefixTimeSuffixLatentFlowRealizerConfig,
+) -> SIDCodebookBundle:
+    bundle = extract_codebook_bundle(
+        config.codebooks_path,
+        max_artifact_bytes=MAX_STANDALONE_CODEBOOK_ARTIFACT_BYTES,
+    )
+    if (
+        config.codebook_size is not None
+        and bundle.codebook_size != config.codebook_size
+    ):
+        raise ValueError(
+            "codebook artifact size does not match config: "
+            f"{bundle.codebook_size} != {config.codebook_size}"
+        )
+    if (
+        config.latent_dim is not None
+        and config.latent_dim != bundle.embedding_dim
+    ):
+        raise ValueError(
+            "latent_dim does not match the codebook embedding dim"
+        )
+    return bundle
+
+
+def _build_model(
+    config: PrefixTimeSuffixLatentFlowRealizerConfig,
+    codebooks: torch.Tensor,
+    *,
+    max_seq_len: int,
+) -> PrefixTimeSuffixLatentFlowRealizer:
+    return PrefixTimeSuffixLatentFlowRealizer(
+        max_seq_len=max_seq_len,
+        prefix_depth=config.prefix_depth,
+        num_codebooks=int(codebooks.shape[0]),
+        codebook_size=int(codebooks.shape[1]),
+        time_vocab=config.time_vocab,
+        latent_dim=int(codebooks.shape[-1]),
+        model_dim=config.model_dim,
+        condition_depth=config.condition_depth,
+        depth=config.depth,
+        num_heads=config.num_heads,
+        mlp_ratio=config.mlp_ratio,
+        dropout=config.dropout,
+        prefix_embedding_mode=config.prefix_embedding_mode,
+        prefix_plan_codebooks=(
+            codebooks[: config.prefix_depth]
+            if config.prefix_embedding_mode == "hybrid_frozen_codebook"
+            else None
+        ),
+        tail_representation=config.tail_representation,
+        latent_target_scope=config.latent_target_scope,
+        catalog_decoder_mode=config.catalog_decoder_mode,
+        city_vocab=config.city_vocab,
+        spatial_conditioning=config.spatial_conditioning,
+        spatial_num_basis=config.spatial_num_basis,
+        spatial_max_km=config.spatial_max_km,
+    )
+
+
+def _log_runtime(
+    config: PrefixTimeSuffixLatentFlowRealizerConfig,
+    *,
+    world_size: int,
+    gradient_scaler: bool,
+    fused_optimizer: bool,
+    total_updates: int,
+) -> None:
+    logger.info(
+        "runtime world_size=%d per_rank_batch=%d global_batch=%d "
+        "mixed_precision=%s grad_scaler=%s tf32=%s fused_optimizer=%s "
+        "val_every=%d workers=%d prefetch_factor=%d cpu_threads=%d",
+        world_size,
+        config.batch_size,
+        config.batch_size * world_size,
+        config.mixed_precision,
+        gradient_scaler,
+        config.tf32,
+        fused_optimizer,
+        config.val_every,
+        config.num_workers,
+        config.prefetch_factor,
+        config.cpu_threads,
+    )
+    logger.info(
+        "optimizer lr=%.6g scheduler=%s warmup_steps=%d "
+        "total_updates=%d min_lr=%.6g early_stopping_patience=%s "
+        "early_stopping_min_delta=%.6g",
+        config.learning_rate,
+        config.lr_scheduler,
+        config.warmup_steps,
+        total_updates,
+        config.min_lr,
+        config.early_stopping_patience,
+        config.early_stopping_min_delta,
+    )
+
+
+def _optional_str(value: Path | None) -> str | None:
+    return None if value is None else str(value)
+
+
+def _tail_stats_record(
+    config: PrefixTimeSuffixLatentFlowRealizerConfig,
+    tail: dict[str, torch.Tensor | None],
+    codebook_record: dict[str, Any],
+    *,
+    latent_dim: int,
+    warm_started: bool,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "prefix_depth": config.prefix_depth,
+        "latent_dim": latent_dim,
+        **tail,
+        "normalization": config.tail_normalization,
+        **codebook_record,
+        "tail_representation": config.tail_representation,
+        "latent_target_scope": config.latent_target_scope,
+        "source": (
+            str(config.initialize_from) if warm_started else "train_split_only"
+        ),
+        "statistics_source": (
+            "initialization_checkpoint"
+            if warm_started
+            else "adaptation_train_split"
+        ),
+    }
+
+
+def _checkpoint_extra(
+    config: PrefixTimeSuffixLatentFlowRealizerConfig,
+    tail: dict[str, torch.Tensor | None],
+    codebook_record: dict[str, Any],
+    *,
+    num_codebooks: int,
+    latent_dim: int,
+) -> dict[str, Any]:
+    """Everything a checkpoint needs besides weights to rebuild the model."""
+    return {
+        "model_type": model_type(config.latent_target_scope),
+        "prefix_depth": config.prefix_depth,
+        "num_codebooks": num_codebooks,
+        "codebook_size": config.codebook_size,
+        "time_vocab": config.time_vocab,
+        "latent_dim": latent_dim,
+        "tail_mean": tail["mean"],
+        "tail_std": tail["std"],
+        "tail_normalization": config.tail_normalization,
+        "tail_whitener": tail["whitener"],
+        "tail_dewhitener": tail["dewhitener"],
+        **codebook_record,
+        "prefix_embedding_mode": config.prefix_embedding_mode,
+        "tail_representation": config.tail_representation,
+        "latent_target_scope": config.latent_target_scope,
+        "proposal_corruption_rate": config.proposal_corruption_rate,
+        "catalog_decoder_mode": config.catalog_decoder_mode,
+        "catalog_candidate_count": config.catalog_candidate_count,
+        "endpoint_loss_weight": config.endpoint_loss_weight,
+        "population_loss_weight": config.population_loss_weight,
+        "catalog_prior_weight": config.catalog_prior_weight,
+        "config": _jsonable(asdict(config)),
+        "initialize_from": _optional_str(config.initialize_from),
+        "optimizer_state_reused": False,
+    }
+
+
+def _log_epoch(
+    epoch: int,
+    *,
+    train_loss: float,
+    val_loss: float | None,
+    learning_rate: float,
+    stale_validations: int,
+) -> None:
+    if val_loss is None:
+        logger.info(
+            "latent suffix-flow epoch=%d train_loss=%.6f "
+            "val_loss=skipped lr=%.6g",
+            epoch,
+            train_loss,
+            learning_rate,
+        )
+    else:
+        logger.info(
+            "latent suffix-flow epoch=%d train_loss=%.6f "
+            "val_loss=%.6f lr=%.6g stale_validations=%d",
+            epoch,
+            train_loss,
+            val_loss,
+            learning_rate,
+            stale_validations,
+        )
+
+
+# Config settings copied verbatim into the training report.
+_REPORTED_SETTINGS = (
+    "codebook_size",
+    "prefix_depth",
+    "prefix_embedding_mode",
+    "tail_representation",
+    "latent_target_scope",
+    "proposal_corruption_rate",
+    "catalog_decoder_mode",
+    "tail_normalization",
+    "factorized_sum_consistency_weight",
+    "catalog_loss_weight",
+    "catalog_negative_count",
+    "catalog_temperature",
+    "catalog_candidate_count",
+    "endpoint_loss_weight",
+    "population_loss_weight",
+    "catalog_prior_weight",
+    "compile",
+    "mixed_precision",
+    "tf32",
+    "lr_scheduler",
+    "warmup_steps",
+    "min_lr",
+    "early_stopping_patience",
+    "early_stopping_min_delta",
+    "val_every",
+    "num_workers",
+    "prefetch_factor",
+)
+
+
 def train_prefix_time_suffix_latent_flow_realizer(
     config: PrefixTimeSuffixLatentFlowRealizerConfig,
 ) -> dict[str, Any]:
-    config.validate()
     set_seed_all(config.seed)
     torch.set_num_threads(config.cpu_threads)
     device = _resolve_device(config.device)
@@ -950,27 +968,13 @@ def train_prefix_time_suffix_latent_flow_realizer(
         raise ValueError("distributed latent realizer training requires CUDA")
     _configure_cuda_math(device=device, tf32=config.tf32)
 
-    train, val = _load_bank_splits(config)
-    bundle = extract_codebook_bundle(
-        config.codebooks_path,
-        max_artifact_bytes=MAX_STANDALONE_CODEBOOK_ARTIFACT_BYTES,
-    )
-    codebooks = bundle.codebooks.float()
+    bundle = _load_codebooks(config)
+    config = replace(config, codebook_size=bundle.codebook_size)
+    train, val = load_bank_splits(config, codebook_size=bundle.codebook_size)
     num_codebooks = int(train.codes.shape[-1])
-    if codebooks.shape[0] != num_codebooks:
+    if bundle.n_codebooks != num_codebooks:
         raise ValueError("codebooks and bank have different SID widths")
-    if int(codebooks.shape[1]) != config.codebook_size:
-        raise ValueError(
-            "codebook artifact size does not match config: "
-            f"{int(codebooks.shape[1])} != {config.codebook_size}"
-        )
-    if (
-        config.latent_dim is not None
-        and config.latent_dim != codebooks.shape[-1]
-    ):
-        raise ValueError(
-            "latent_dim does not match the codebook embedding dim"
-        )
+    codebooks = bundle.codebooks.float()
     latent_dim = int(codebooks.shape[-1])
     codebook_metadata = codebook_bundle_metadata(bundle)
     initialization = _load_initialization(config, codebooks)
@@ -1002,32 +1006,8 @@ def train_prefix_time_suffix_latent_flow_realizer(
         target_level_start=target_level_start,
         device=device,
     )
-    model: torch.nn.Module = PrefixTimeSuffixLatentFlowRealizer(
-        max_seq_len=int(train.codes.shape[1]),
-        prefix_depth=config.prefix_depth,
-        num_codebooks=num_codebooks,
-        codebook_size=config.codebook_size,
-        time_vocab=config.time_vocab,
-        latent_dim=latent_dim,
-        model_dim=config.model_dim,
-        condition_depth=config.condition_depth,
-        depth=config.depth,
-        num_heads=config.num_heads,
-        mlp_ratio=config.mlp_ratio,
-        dropout=config.dropout,
-        prefix_embedding_mode=config.prefix_embedding_mode,
-        prefix_plan_codebooks=(
-            codebooks[: config.prefix_depth]
-            if config.prefix_embedding_mode == "hybrid_frozen_codebook"
-            else None
-        ),
-        tail_representation=config.tail_representation,
-        latent_target_scope=config.latent_target_scope,
-        catalog_decoder_mode=config.catalog_decoder_mode,
-        city_vocab=config.city_vocab,
-        spatial_conditioning=config.spatial_conditioning,
-        spatial_num_basis=config.spatial_num_basis,
-        spatial_max_km=config.spatial_max_km,
+    model: torch.nn.Module = _build_model(
+        config, codebooks, max_seq_len=int(train.codes.shape[1])
     ).to(device)
     if initialization is not None:
         model.load_state_dict(initialization["model_state_dict"], strict=True)
@@ -1066,33 +1046,12 @@ def train_prefix_time_suffix_latent_flow_realizer(
     )
     autocast, scaler = build_amp_context(config.mixed_precision, device)
     if is_main:
-        logger.info(
-            "runtime world_size=%d per_rank_batch=%d global_batch=%d "
-            "mixed_precision=%s grad_scaler=%s tf32=%s fused_optimizer=%s "
-            "val_every=%d workers=%d prefetch_factor=%d cpu_threads=%d",
-            world_size,
-            config.batch_size,
-            config.batch_size * world_size,
-            config.mixed_precision,
-            scaler is not None,
-            config.tf32,
-            fused_optimizer,
-            config.val_every,
-            config.num_workers,
-            config.prefetch_factor,
-            config.cpu_threads,
-        )
-        logger.info(
-            "optimizer lr=%.6g scheduler=%s warmup_steps=%d "
-            "total_updates=%d min_lr=%.6g early_stopping_patience=%s "
-            "early_stopping_min_delta=%.6g",
-            config.learning_rate,
-            config.lr_scheduler,
-            config.warmup_steps,
-            total_updates,
-            config.min_lr,
-            config.early_stopping_patience,
-            config.early_stopping_min_delta,
+        _log_runtime(
+            config,
+            world_size=world_size,
+            gradient_scaler=scaler is not None,
+            fused_optimizer=fused_optimizer,
+            total_updates=total_updates,
         )
 
     tail_payload = tail.cpu_payload()
@@ -1101,61 +1060,26 @@ def train_prefix_time_suffix_latent_flow_realizer(
         "codebook_fields": list(bundle.code_fields),
         "codebook_metadata": codebook_metadata,
     }
+    tail_stats_path = config.output_dir / "tail_stats.pt"
     config.output_dir.mkdir(parents=True, exist_ok=True)
     if is_main:
         torch.save(
-            {
-                "schema_version": 1,
-                "prefix_depth": config.prefix_depth,
-                "latent_dim": latent_dim,
-                **tail_payload,
-                "normalization": config.tail_normalization,
-                **codebook_record,
-                "tail_representation": config.tail_representation,
-                "latent_target_scope": config.latent_target_scope,
-                "source": (
-                    str(config.initialize_from)
-                    if initialization is not None
-                    else "train_split_only"
-                ),
-                "statistics_source": (
-                    "initialization_checkpoint"
-                    if initialization is not None
-                    else "adaptation_train_split"
-                ),
-            },
-            config.output_dir / "tail_stats.pt",
+            _tail_stats_record(
+                config,
+                tail_payload,
+                codebook_record,
+                latent_dim=latent_dim,
+                warm_started=initialization is not None,
+            ),
+            tail_stats_path,
         )
-    checkpoint_extra = {
-        "model_type": model_type(config.latent_target_scope),
-        "prefix_depth": config.prefix_depth,
-        "num_codebooks": num_codebooks,
-        "codebook_size": config.codebook_size,
-        "time_vocab": config.time_vocab,
-        "latent_dim": latent_dim,
-        "tail_mean": tail_payload["mean"],
-        "tail_std": tail_payload["std"],
-        "tail_normalization": config.tail_normalization,
-        "tail_whitener": tail_payload["whitener"],
-        "tail_dewhitener": tail_payload["dewhitener"],
-        **codebook_record,
-        "prefix_embedding_mode": config.prefix_embedding_mode,
-        "tail_representation": config.tail_representation,
-        "latent_target_scope": config.latent_target_scope,
-        "proposal_corruption_rate": config.proposal_corruption_rate,
-        "catalog_decoder_mode": config.catalog_decoder_mode,
-        "catalog_candidate_count": config.catalog_candidate_count,
-        "endpoint_loss_weight": config.endpoint_loss_weight,
-        "population_loss_weight": config.population_loss_weight,
-        "catalog_prior_weight": config.catalog_prior_weight,
-        "config": _jsonable(asdict(config)),
-        "initialize_from": (
-            str(config.initialize_from)
-            if config.initialize_from is not None
-            else None
-        ),
-        "optimizer_state_reused": False,
-    }
+    checkpoint_extra = _checkpoint_extra(
+        config,
+        tail_payload,
+        codebook_record,
+        num_codebooks=num_codebooks,
+        latent_dim=latent_dim,
+    )
 
     objective = functools.partial(
         prefix_time_suffix_latent_flow_loss,
@@ -1221,50 +1145,31 @@ def train_prefix_time_suffix_latent_flow_realizer(
                 "learning_rate": learning_rate,
             }
         )
-        stop_training = False
-        improved = False
+        improved = stop_training = False
         if val_loss is not None:
             decision = early_stopper.step(val_loss, epoch=epoch)
-            improved = decision.improved
-            stop_training = decision.should_stop
+            improved, stop_training = decision.improved, decision.should_stop
             best_val = early_stopper.best_value
         if is_main:
-            if val_loss is None:
-                logger.info(
-                    "latent suffix-flow epoch=%d train_loss=%.6f "
-                    "val_loss=skipped lr=%.6g",
-                    epoch,
-                    train_loss,
-                    learning_rate,
-                )
-            else:
-                logger.info(
-                    "latent suffix-flow epoch=%d train_loss=%.6f "
-                    "val_loss=%.6f lr=%.6g stale_validations=%d",
-                    epoch,
-                    train_loss,
-                    val_loss,
-                    learning_rate,
-                    early_stopper.epochs_without_improvement,
-                )
-            checkpoint_val = val_loss if val_loss is not None else best_val
-            save_checkpoint(
-                last_path,
-                model,
-                optimizer,
+            _log_epoch(
                 epoch,
-                checkpoint_val,
+                train_loss=train_loss,
+                val_loss=val_loss,
+                learning_rate=learning_rate,
+                stale_validations=early_stopper.epochs_without_improvement,
+            )
+            save = functools.partial(
+                save_checkpoint,
+                model=model,
+                optimizer=optimizer,
+                epoch=epoch,
                 extra=checkpoint_extra,
             )
+            save(
+                last_path, val_loss=best_val if val_loss is None else val_loss
+            )
             if val_loss is not None and improved:
-                save_checkpoint(
-                    best_path,
-                    model,
-                    optimizer,
-                    epoch,
-                    val_loss,
-                    extra=checkpoint_extra,
-                )
+                save(best_path, val_loss=val_loss)
         if distributed:
             best_tensor = torch.tensor(best_val, device=device)
             dist.broadcast(best_tensor, src=0)
@@ -1287,77 +1192,37 @@ def train_prefix_time_suffix_latent_flow_realizer(
     if is_main:
         load_checkpoint(best_path, model, device=device)
     result: dict[str, Any] = {
+        **{name: getattr(config, name) for name in _REPORTED_SETTINGS},
         "model_type": model_type(config.latent_target_scope),
         "device": str(device),
         "train_rows": int(train.codes.size(0)),
         "val_rows": int(val.codes.size(0)),
         "num_codebooks": num_codebooks,
-        "codebook_size": config.codebook_size,
         "codebook_metadata": codebook_metadata,
         "latent_dim": latent_dim,
-        "prefix_depth": config.prefix_depth,
-        "prefix_embedding_mode": config.prefix_embedding_mode,
-        "tail_representation": config.tail_representation,
-        "latent_target_scope": config.latent_target_scope,
-        "proposal_corruption_rate": config.proposal_corruption_rate,
-        "catalog_decoder_mode": config.catalog_decoder_mode,
-        "tail_normalization": config.tail_normalization,
-        "factorized_sum_consistency_weight": (
-            config.factorized_sum_consistency_weight
-        ),
-        "catalog_path": (
-            str(config.catalog_path)
-            if config.catalog_path is not None
-            else None
-        ),
-        "catalog_loss_weight": config.catalog_loss_weight,
-        "catalog_negative_count": config.catalog_negative_count,
-        "catalog_temperature": config.catalog_temperature,
-        "catalog_candidate_count": config.catalog_candidate_count,
-        "endpoint_loss_weight": config.endpoint_loss_weight,
-        "population_loss_weight": config.population_loss_weight,
-        "catalog_prior_weight": config.catalog_prior_weight,
+        "catalog_path": _optional_str(config.catalog_path),
         "parameter_count": unwrap_ddp(model).count_parameters(),
         "world_size": world_size,
         "per_rank_batch_size": config.batch_size,
         "global_batch_size": config.batch_size * world_size,
-        "compile": config.compile,
-        "mixed_precision": config.mixed_precision,
         "gradient_scaler": scaler is not None,
-        "tf32": config.tf32,
         "fused_optimizer": fused_optimizer,
-        "lr_scheduler": config.lr_scheduler,
-        "warmup_steps": config.warmup_steps,
-        "min_lr": config.min_lr,
-        "early_stopping_patience": config.early_stopping_patience,
-        "early_stopping_min_delta": config.early_stopping_min_delta,
         "stopped_early": stopped_early,
         "epochs_completed": len(history),
-        "val_every": config.val_every,
-        "num_workers": config.num_workers,
-        "prefetch_factor": config.prefetch_factor,
         "best_val_loss": best_val,
         "history": history,
         "bank_path": str(config.bank_path),
         "codebooks_path": str(config.codebooks_path),
-        "tail_stats_path": str(config.output_dir / "tail_stats.pt"),
-        "initialize_from": (
-            str(config.initialize_from)
-            if config.initialize_from is not None
-            else None
-        ),
+        "tail_stats_path": str(tail_stats_path),
+        "initialize_from": _optional_str(config.initialize_from),
     }
     if is_main:
-        (config.output_dir / "metrics.json").write_text(
-            json.dumps(result, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        write_json(config.output_dir / "metrics.json", result)
     return result
 
 
 __all__ = [
-    "PrefixTimeSuffixLatentFlowRealizerConfig",
-    "_DistributedLengthBucketBatchSampler",
-    "_should_validate",
+    "BankSplit",
+    "load_bank_splits",
     "train_prefix_time_suffix_latent_flow_realizer",
 ]

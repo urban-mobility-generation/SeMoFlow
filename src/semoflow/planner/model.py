@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Mapping
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, cast
 
 import torch
@@ -21,6 +21,7 @@ from semoflow.planner.geography import PrefixDistancePrior
 from semoflow.planner.legality import LegalPrefixIndex
 from semoflow.planner.mobility_router import (
     ExploreRetrieveRouter,
+    ExploreRetrieveRoutingOutput,
     explore_retrieve_target_log_probability,
     prefix_target_log_probability,
     retrieval_target_log_probability,
@@ -70,6 +71,88 @@ def _city_legality_fingerprint(
     return digest.hexdigest()
 
 
+def _city_catalog(
+    catalog_city_ids: torch.Tensor | None,
+    city_legal_prefix_mask: torch.Tensor | None,
+    *,
+    vocabulary: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if (catalog_city_ids is None) != (city_legal_prefix_mask is None):
+        raise ValueError(
+            "catalog_city_ids and city_legal_prefix_mask must be set together"
+        )
+    if catalog_city_ids is None:
+        catalog_city_ids = torch.tensor([0], dtype=torch.long)
+        city_legal_prefix_mask = torch.ones((1, vocabulary), dtype=torch.bool)
+    catalog_city_ids = torch.as_tensor(catalog_city_ids, dtype=torch.long)
+    city_legal_prefix_mask = torch.as_tensor(
+        city_legal_prefix_mask, dtype=torch.bool
+    )
+    if catalog_city_ids.ndim != 1 or catalog_city_ids.numel() < 1:
+        raise ValueError("catalog_city_ids must be a non-empty vector")
+    if not torch.equal(catalog_city_ids, torch.sort(catalog_city_ids).values):
+        raise ValueError("catalog_city_ids must be sorted")
+    if torch.unique(catalog_city_ids).numel() != catalog_city_ids.numel():
+        raise ValueError("catalog_city_ids must be unique")
+    if city_legal_prefix_mask.shape != (catalog_city_ids.numel(), vocabulary):
+        raise ValueError(
+            "city_legal_prefix_mask must have shape [cities, vocabulary]"
+        )
+    if not bool(city_legal_prefix_mask.any(dim=-1).all()):
+        raise ValueError("each city must permit at least one prefix")
+    if catalog_city_ids.numel() == 1 and not bool(
+        city_legal_prefix_mask.all()
+    ):
+        raise ValueError(
+            "a single-city catalog must contain the global vocabulary"
+        )
+    return catalog_city_ids, city_legal_prefix_mask
+
+
+def _tokenizer_codebooks(
+    config: OccurrencePlannerConfig, prefix_codebooks: torch.Tensor | None
+) -> torch.Tensor | None:
+    if not config.use_tokenizer_latent:
+        if prefix_codebooks is not None:
+            raise ValueError(
+                "prefix_codebooks supplied without use_tokenizer_latent"
+            )
+        return None
+    if prefix_codebooks is None:
+        raise ValueError("use_tokenizer_latent requires prefix_codebooks")
+    codebooks = torch.as_tensor(prefix_codebooks, dtype=torch.float32)
+    if codebooks.ndim != 3 or codebooks.shape[:2] != (
+        config.prefix_depth,
+        config.codebook_size,
+    ):
+        raise ValueError(
+            "prefix_codebooks must have shape [prefix_depth, K, D]"
+        )
+    if not bool(torch.isfinite(codebooks).all()):
+        raise ValueError("prefix_codebooks must be finite")
+    return codebooks.detach().clone()
+
+
+def _gap_duration_buffers(
+    config: OccurrencePlannerConfig,
+) -> dict[str, torch.Tensor]:
+    """Per-gap-token duration bounds and representatives, in minutes."""
+    assert config.gap_duration_minutes is not None
+    assert config.gap_bucket_edges_minutes is not None
+    assert config.observation_window_minutes is not None
+    edges = torch.tensor(config.gap_bucket_edges_minutes, dtype=torch.float32)
+    window = torch.tensor(
+        [config.observation_window_minutes], dtype=torch.float32
+    )
+    return {
+        "gap_duration_lower_minutes": torch.cat((torch.zeros(1), edges)),
+        "gap_duration_upper_minutes": torch.cat((edges, window)),
+        "gap_representative_minutes": torch.tensor(
+            config.gap_duration_minutes, dtype=torch.float32
+        ),
+    }
+
+
 class OccurrenceARPlanner(nn.Module):
     def __init__(
         self,
@@ -84,42 +167,11 @@ class OccurrenceARPlanner(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        if (catalog_city_ids is None) != (city_legal_prefix_mask is None):
-            raise ValueError(
-                "catalog_city_ids and city_legal_prefix_mask must be set together"
-            )
-        if catalog_city_ids is None:
-            catalog_city_ids = torch.tensor([0], dtype=torch.long)
-            city_legal_prefix_mask = torch.ones(
-                (1, legal_prefixes.shape[0]), dtype=torch.bool
-            )
-        catalog_city_ids = torch.as_tensor(catalog_city_ids, dtype=torch.long)
-        city_legal_prefix_mask = torch.as_tensor(
-            city_legal_prefix_mask, dtype=torch.bool
+        catalog_city_ids, city_legal_prefix_mask = _city_catalog(
+            catalog_city_ids,
+            city_legal_prefix_mask,
+            vocabulary=legal_prefixes.shape[0],
         )
-        if catalog_city_ids.ndim != 1 or catalog_city_ids.numel() < 1:
-            raise ValueError("catalog_city_ids must be a non-empty vector")
-        if not torch.equal(
-            catalog_city_ids, torch.sort(catalog_city_ids).values
-        ):
-            raise ValueError("catalog_city_ids must be sorted")
-        if torch.unique(catalog_city_ids).numel() != catalog_city_ids.numel():
-            raise ValueError("catalog_city_ids must be unique")
-        if city_legal_prefix_mask.shape != (
-            catalog_city_ids.numel(),
-            legal_prefixes.shape[0],
-        ):
-            raise ValueError(
-                "city_legal_prefix_mask must have shape [cities, vocabulary]"
-            )
-        if not bool(city_legal_prefix_mask.any(dim=-1).all()):
-            raise ValueError("each city must permit at least one prefix")
-        if catalog_city_ids.numel() == 1 and not bool(
-            city_legal_prefix_mask.all()
-        ):
-            raise ValueError(
-                "a single-city catalog must contain the global vocabulary"
-            )
         self.legality = LegalPrefixIndex(
             legal_prefixes,
             codebook_size=config.codebook_size,
@@ -137,37 +189,17 @@ class OccurrenceARPlanner(nn.Module):
             persistent=False,
         )
 
-        if config.use_tokenizer_latent:
-            if prefix_codebooks is None:
-                raise ValueError(
-                    "use_tokenizer_latent requires prefix_codebooks"
-                )
-            codebooks = torch.as_tensor(
-                prefix_codebooks, dtype=torch.float32
-            ).detach()
-            if codebooks.ndim != 3 or codebooks.shape[:2] != (
-                config.prefix_depth,
-                config.codebook_size,
-            ):
-                raise ValueError(
-                    "prefix_codebooks must have shape [prefix_depth, K, D]"
-                )
-            if not bool(torch.isfinite(codebooks).all()):
-                raise ValueError("prefix_codebooks must be finite")
-            self.register_buffer(
-                "prefix_codebooks", codebooks.clone(), persistent=False
-            )
-            self.tokenizer_latent_projection = nn.Linear(
+        codebooks = _tokenizer_codebooks(config, prefix_codebooks)
+        self.register_buffer("prefix_codebooks", codebooks, persistent=False)
+        self.tokenizer_latent_projection = (
+            None
+            if codebooks is None
+            else nn.Linear(
                 int(codebooks.shape[-1]), config.model_dim, bias=False
             )
+        )
+        if self.tokenizer_latent_projection is not None:
             nn.init.zeros_(self.tokenizer_latent_projection.weight)
-        else:
-            if prefix_codebooks is not None:
-                raise ValueError(
-                    "prefix_codebooks supplied without use_tokenizer_latent"
-                )
-            self.register_buffer("prefix_codebooks", None, persistent=False)
-            self.tokenizer_latent_projection = None
 
         self.distance_prior: PrefixDistancePrior | None = None
         if config.use_distance_prior:
@@ -239,33 +271,8 @@ class OccurrenceARPlanner(nn.Module):
             else None
         )
         if config.temporal_state_enabled:
-            assert config.gap_duration_minutes is not None
-            assert config.gap_bucket_edges_minutes is not None
-            assert config.observation_window_minutes is not None
-            edges = torch.tensor(
-                config.gap_bucket_edges_minutes, dtype=torch.float32
-            )
-            lower = torch.cat((torch.zeros(1), edges))
-            upper = torch.cat(
-                (
-                    edges,
-                    torch.tensor(
-                        [config.observation_window_minutes],
-                        dtype=torch.float32,
-                    ),
-                )
-            )
-            self.register_buffer(
-                "gap_duration_lower_minutes", lower, persistent=False
-            )
-            self.register_buffer(
-                "gap_duration_upper_minutes", upper, persistent=False
-            )
-            self.register_buffer(
-                "gap_representative_minutes",
-                torch.tensor(config.gap_duration_minutes, dtype=torch.float32),
-                persistent=False,
-            )
+            for name, buffer in _gap_duration_buffers(config).items():
+                self.register_buffer(name, buffer, persistent=False)
         self.relation_bias = SpatioTemporalRelationBias(
             n_heads=config.n_heads,
             prefix_depth=config.prefix_depth,
@@ -411,16 +418,12 @@ class OccurrenceARPlanner(nn.Module):
         state_dict: Mapping[str, Any],
         *,
         allow_catalog_mismatch: bool = False,
-        strict: bool = True,
-        assign: bool = False,
     ):
         self._validate_checkpoint_metadata(
             state_dict.get("_extra_state"),
             allow_catalog_mismatch=allow_catalog_mismatch,
         )
-        return nn.Module.load_state_dict(
-            self, state_dict, strict=strict, assign=assign
-        )
+        return nn.Module.load_state_dict(self, state_dict)
 
     def _catalog_rows_for_city_ids(
         self,
@@ -460,10 +463,8 @@ class OccurrenceARPlanner(nn.Module):
             raise ValueError(f"unknown planner city_ids: {unknown}")
         return safe
 
-    def _validate_batch(
-        self, batch: OccurrenceBatch, *, validate_targets: bool = True
-    ) -> None:
-        batch.validate(self.config, validate_temporal_targets=validate_targets)
+    def _validate_batch(self, batch: OccurrenceBatch) -> None:
+        batch.validate(self.config)
         if batch.lengths.device != self.length_query.device:
             raise ValueError(
                 "occurrence batch and planner must share one device"
@@ -472,18 +473,17 @@ class OccurrenceARPlanner(nn.Module):
             batch.city_ids,
             batch_size=batch.lengths.shape[0],
         )
-        if validate_targets:
-            valid_targets = batch.target_prefix_codes[batch.valid_mask]
-            if not bool(self.legality.contains(valid_targets).all()):
-                raise ValueError("prefix targets contain an illegal tuple")
-            target_token_ids = self.legality.token_ids(valid_targets)
-            target_batch_rows = batch.valid_mask.nonzero(as_tuple=True)[0]
-            if not bool(
-                self.city_legal_prefix_mask[
-                    catalog_rows[target_batch_rows], target_token_ids
-                ].all()
-            ):
-                raise ValueError("prefix target is illegal for its city")
+        valid_targets = batch.target_prefix_codes[batch.valid_mask]
+        if not bool(self.legality.contains(valid_targets).all()):
+            raise ValueError("prefix targets contain an illegal tuple")
+        target_token_ids = self.legality.token_ids(valid_targets)
+        target_batch_rows = batch.valid_mask.nonzero(as_tuple=True)[0]
+        if not bool(
+            self.city_legal_prefix_mask[
+                catalog_rows[target_batch_rows], target_token_ids
+            ].all()
+        ):
+            raise ValueError("prefix target is illegal for its city")
         history_mask = batch.valid_mask & (
             batch.previous_prefix_codes >= 0
         ).all(dim=-1)
@@ -963,6 +963,120 @@ class OccurrenceARPlanner(nn.Module):
             dim=-1,
         )
 
+    def _sample_routed_prefix(
+        self,
+        conditioned: torch.Tensor,
+        *,
+        memory_prefix_codes: torch.Tensor,
+        memory_gap_tokens: torch.Tensor,
+        memory_event_time_minutes: torch.Tensor | None,
+        catalog_rows: torch.Tensor | None,
+        distance: PrefixDistanceContext | None,
+        prefix_temperature: float,
+        route_temperature: float,
+        generator: torch.Generator | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample a prefix by exploring the decoder or retrieving memory.
+
+        Returns the prefix with its model (temperature 1) and sampling-policy
+        log probabilities, both marginalized over the two mechanisms.
+        """
+        assert self.mobility_router is not None
+        memory_states = self._embed_retrieval_memory(
+            memory_prefix_codes,
+            memory_gap_tokens,
+            memory_event_time_minutes,
+        )
+        routing = self.mobility_router.forward_step(
+            conditioned,
+            memory_states,
+            memory_prefix_codes,
+        )
+        explore_prefix, _, _ = self.prefix_decoder.sample(
+            conditioned,
+            temperature=prefix_temperature,
+            generator=generator,
+            catalog_rows=catalog_rows,
+            distance=distance,
+        )
+
+        history_available = routing.history_mask.any(dim=-1)
+        safe_retrieval_logits = (
+            routing.retrieval_log_probability.float().clone()
+        )
+        if bool((~history_available).any()):
+            safe_retrieval_logits[~history_available] = float("-inf")
+            safe_retrieval_logits[~history_available, 0] = 0.0
+        retrieval_sample = sample_categorical_logits(
+            safe_retrieval_logits,
+            temperature=prefix_temperature,
+            generator=generator,
+        )
+        row = torch.arange(
+            conditioned.shape[0], device=memory_prefix_codes.device
+        )
+        retrieved_prefix = memory_prefix_codes[row, retrieval_sample.choices]
+
+        route_probability_policy = torch.sigmoid(
+            routing.retrieve_logit / route_temperature
+        ).masked_fill(~history_available, 0.0)
+        route_draw = torch.rand(
+            route_probability_policy.shape,
+            device=conditioned.device,
+            generator=generator,
+        )
+        use_retrieve = (
+            route_draw < route_probability_policy
+        ) & history_available
+        prefix = torch.where(
+            use_retrieve[:, None],
+            retrieved_prefix,
+            explore_prefix,
+        )
+
+        def log_probability(
+            explore_temperature: float,
+            mixture: ExploreRetrieveRoutingOutput,
+            retrieval_distribution: torch.Tensor,
+        ) -> torch.Tensor:
+            return explore_retrieve_target_log_probability(
+                explore_target_log_probability=(
+                    self._step_explore_log_probability(
+                        conditioned,
+                        prefix,
+                        temperature=explore_temperature,
+                        catalog_rows=catalog_rows,
+                        distance=distance,
+                    )
+                ),
+                routing=mixture,
+                retrieval_target_log_probability=(
+                    self._step_retrieval_target_log_probability(
+                        retrieval_distribution,
+                        routing.history_mask,
+                        memory_prefix_codes,
+                        prefix,
+                    )
+                ),
+            )
+
+        policy_routing = replace(
+            routing,
+            retrieve_logit=routing.retrieve_logit / route_temperature,
+            retrieve_probability=route_probability_policy,
+        )
+        return (
+            prefix,
+            log_probability(1.0, routing, routing.retrieval_log_probability),
+            log_probability(
+                prefix_temperature,
+                policy_routing,
+                F.log_softmax(
+                    safe_retrieval_logits / prefix_temperature, dim=-1
+                ),
+            ),
+        )
+
     def _sample_from_hidden(
         self,
         hidden: torch.Tensor,
@@ -1032,130 +1146,20 @@ class OccurrenceARPlanner(nn.Module):
                 raise ValueError(
                     "mobility routing requires visible prefix and gap memory"
                 )
-            memory_states = self._embed_retrieval_memory(
-                memory_prefix_codes,
-                memory_gap_tokens,
-                memory_event_time_minutes,
-            )
-            routing = self.mobility_router.forward_step(
-                conditioned,
-                memory_states,
-                memory_prefix_codes,
-            )
-
             (
-                explore_prefix,
-                _,
-                _,
-            ) = self.prefix_decoder.sample(
-                conditioned,
-                temperature=prefix_temperature,
-                generator=generator,
-                catalog_rows=catalog_rows,
-                distance=distance,
-            )
-
-            history_available = routing.history_mask.any(dim=-1)
-            safe_retrieval_logits = (
-                routing.retrieval_log_probability.float().clone()
-            )
-            if bool((~history_available).any()):
-                safe_retrieval_logits[~history_available] = float("-inf")
-                safe_retrieval_logits[~history_available, 0] = 0.0
-            retrieval_sample = sample_categorical_logits(
-                safe_retrieval_logits,
-                temperature=prefix_temperature,
-                generator=generator,
-            )
-            row = torch.arange(
-                hidden.shape[0], device=memory_prefix_codes.device
-            )
-            retrieved_prefix = memory_prefix_codes[
-                row, retrieval_sample.choices
-            ]
-
-            route_probability_policy = torch.sigmoid(
-                routing.retrieve_logit / route_temperature
-            ).masked_fill(~history_available, 0.0)
-            route_draw = torch.rand(
-                route_probability_policy.shape,
-                device=hidden.device,
-                generator=generator,
-            )
-            use_retrieve = (
-                route_draw < route_probability_policy
-            ) & history_available
-            prefix = torch.where(
-                use_retrieve[:, None],
-                retrieved_prefix,
-                explore_prefix,
-            )
-
-            explore_model_log_probability = self._step_explore_log_probability(
-                conditioned,
                 prefix,
-                temperature=1.0,
+                prefix_model_log_probability,
+                prefix_sampling_log_probability,
+            ) = self._sample_routed_prefix(
+                conditioned,
+                memory_prefix_codes=memory_prefix_codes,
+                memory_gap_tokens=memory_gap_tokens,
+                memory_event_time_minutes=memory_event_time_minutes,
                 catalog_rows=catalog_rows,
                 distance=distance,
-            )
-            explore_policy_log_probability = (
-                self._step_explore_log_probability(
-                    conditioned,
-                    prefix,
-                    temperature=prefix_temperature,
-                    catalog_rows=catalog_rows,
-                    distance=distance,
-                )
-            )
-            retrieval_model_log_probability = (
-                self._step_retrieval_target_log_probability(
-                    routing.retrieval_log_probability,
-                    routing.history_mask,
-                    memory_prefix_codes,
-                    prefix,
-                )
-            )
-            retrieval_policy_distribution = F.log_softmax(
-                safe_retrieval_logits / prefix_temperature,
-                dim=-1,
-            )
-            retrieval_policy_log_probability = (
-                self._step_retrieval_target_log_probability(
-                    retrieval_policy_distribution,
-                    routing.history_mask,
-                    memory_prefix_codes,
-                    prefix,
-                )
-            )
-            prefix_model_log_probability = (
-                explore_retrieve_target_log_probability(
-                    explore_target_log_probability=(
-                        explore_model_log_probability
-                    ),
-                    routing=routing,
-                    retrieval_target_log_probability=(
-                        retrieval_model_log_probability
-                    ),
-                )
-            )
-            policy_routing = routing.__class__(
-                retrieve_logit=routing.retrieve_logit / route_temperature,
-                retrieve_probability=route_probability_policy,
-                mechanism_weights=routing.mechanism_weights,
-                retrieval_log_probability=routing.retrieval_log_probability,
-                history_mask=routing.history_mask,
-                distinct_prefix_count=routing.distinct_prefix_count,
-            )
-            prefix_sampling_log_probability = (
-                explore_retrieve_target_log_probability(
-                    explore_target_log_probability=(
-                        explore_policy_log_probability
-                    ),
-                    routing=policy_routing,
-                    retrieval_target_log_probability=(
-                        retrieval_policy_log_probability
-                    ),
-                )
+                prefix_temperature=prefix_temperature,
+                route_temperature=route_temperature,
+                generator=generator,
             )
 
         return OccurrenceStepSample(

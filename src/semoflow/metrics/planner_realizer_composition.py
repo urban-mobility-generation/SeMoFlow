@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import tempfile
 import time
@@ -9,6 +8,8 @@ from pathlib import Path
 from typing import Any, cast
 
 import torch
+
+from semoflow.utils.serialization import normalize_mapping, write_json
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ def _require_tensor(
     return value.detach().cpu()
 
 
-def _realizer_contract(checkpoint: Path) -> dict[str, int]:
+def realizer_contract(checkpoint: Path) -> dict[str, int]:
     logger.info("loading realizer contract checkpoint=%s", checkpoint)
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
@@ -238,7 +239,7 @@ def _prepare_sampled_plan(
     )
     if not isinstance(payload, dict):
         raise ValueError("planner samples artifact must be a dictionary")
-    contract = _realizer_contract(realizer_checkpoint)
+    contract = realizer_contract(realizer_checkpoint)
     artifact_type = payload.get("artifact_type")
     logger.info(
         "preparing planner input path=%s artifact_type=%s max_samples=%d",
@@ -365,7 +366,7 @@ def _six_key_summary(metrics: Mapping[str, object]) -> dict[str, object]:
     }
 
 
-def _brief_summary(metrics: Mapping[str, object]) -> dict[str, object]:
+def brief_summary(metrics: Mapping[str, object]) -> dict[str, object]:
     summary = _six_key_summary(metrics)
     decoded = metrics.get("decoded_poi_metrics")
     decoded_map = (
@@ -404,13 +405,13 @@ def evaluate_planner_realizer(
     num_steps: int,
     solver: str,
     candidate_selection: str,
-    candidate_prior: Path | None,
-    catalog_temperature: float | None,
-    catalog_prior_source: str,
+    candidate_prior: Path | None = None,
+    catalog_temperature: float | None = None,
+    catalog_prior_source: str = "target_train",
     reference_split: str = "val",
     generation_catalog_scope: str = "full_city",
-    flow_trace_rows: int,
-    flow_path_output: Path | None,
+    flow_trace_rows: int = 0,
+    flow_path_output: Path | None = None,
     brief_metrics: bool = False,
 ) -> dict[str, Any]:
     started = time.perf_counter()
@@ -472,9 +473,7 @@ def evaluate_planner_realizer(
         max_samples=max_samples,
     )
     try:
-        from semoflow.realizer.evaluation import (
-            evaluate,
-        )
+        from semoflow.realizer.evaluation import evaluate
 
         logger.info("starting latent-flow gold-prefix and sampled-plan arms")
         result = evaluate(
@@ -539,18 +538,15 @@ def evaluate_planner_realizer(
     }
     result["summary"] = {
         arm: (
-            _brief_summary(metrics)
+            brief_summary(metrics)
             if brief_metrics
             else _six_key_summary(metrics)
         )
         for arm, metrics in result.get("evaluations", {}).items()
         if isinstance(metrics, dict)
     }
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(
-        json.dumps(result, indent=2, sort_keys=True, default=str) + "\n",
-        encoding="utf-8",
-    )
+    result = normalize_mapping(result)
+    write_json(output, result)
     logger.info(
         "planner+realizer evaluation complete output=%s elapsed_seconds=%.1f",
         output,
@@ -559,4 +555,8 @@ def evaluate_planner_realizer(
     return result
 
 
-__all__ = ["evaluate_planner_realizer"]
+__all__ = [
+    "brief_summary",
+    "evaluate_planner_realizer",
+    "realizer_contract",
+]

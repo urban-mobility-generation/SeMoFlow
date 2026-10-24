@@ -8,9 +8,7 @@ from typing import Any
 import numpy as np
 
 from semoflow.config.constants import PAD_ID
-from semoflow.metrics.divergence import (
-    jensen_shannon_divergence,
-)
+from semoflow.metrics.divergence import jensen_shannon_divergence
 
 type MotifSignature = tuple[int, tuple[tuple[int, int], ...]]
 

@@ -1,0 +1,42 @@
+# Per-city sampling and evaluation for the Foursquare five-city models. For
+# each city, `evaluate` samples one plan per test week from the planner,
+# composes the plans into POI trajectories with the realizer, and scores them
+# against the city's test weeks. Each city's outputs, including
+# composition.json, go to output_dir/<city name>.
+#
+#   uv run semoflow-eval evaluate --config configs/foursquare/evaluation.yaml
+
+experiment:
+  name: foursquare_evaluation
+  phase: evaluation
+
+evaluation:
+  planner_checkpoint: outputs/planner/best.pt
+  realizer_checkpoint: outputs/realizer/best.pt
+  tokenization_dir: outputs/tokenization
+  segments_path: outputs/segments.parquet
+  places_path: outputs/preprocessing/places_index.parquet
+  output_dir: outputs/evaluation
+  reference_split: test
+  device: cuda:0
+  seed: 0
+
+  # City name -> city_id
+  cities:
+    los_angeles: 7
+    washington_dc: 8
+    atlanta: 9
+    san_francisco: 10
+    milwaukee: 11
+
+  sampling:
+    batch_size: 512
+    route_temperature: 1.7
+
+  composition:
+    batch_size: 128
+    solver: euler
+    num_steps: 20
+    catalog_temperature: 0.4
+    candidate_selection: train_prior_sample
+    brief_metrics: true

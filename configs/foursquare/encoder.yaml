@@ -1,23 +1,24 @@
-# GraphSAGE encoder with normalized InfoNCE, residual layers, and
-# variance/covariance regularization. Produces 128-dimensional POI embeddings.
+# Text and GraphSAGE encoders for the Foursquare five-city catalog. Produces
+# the address-free text embeddings and 128-dimensional graph embeddings that
+# configs/foursquare/tokenizer.yaml reads.
 #
-#   uv run semoflow-train graph-encoder --config configs/encoder/graphsage_v2.yaml
+#   uv run semoflow-train encoder --config configs/foursquare/encoder.yaml
 
 experiment:
-  name: encoder_graphsage_v2
+  name: foursquare_encoder
   phase: encoder
 
 tokenizer_config:
-  preprocessing_dir: outputs/preprocessing/chicago
+  preprocessing_dir: outputs/preprocessing
   places_index_path: null      # null => preprocessing_dir/places_index.parquet
   processed_visits_path: null  # null => preprocessing_dir/processed_visits.parquet
-  text_embeddings_path: outputs/encoder/chicago/text/text_embeddings.npy
-  graphsage_artifact_dir: outputs/encoder/chicago/graph_v2
+  text_embeddings_path: outputs/encoder/text/text_embeddings.npy
+  graphsage_artifact_dir: outputs/encoder/graph
 
 encoder_pipeline:
   graph:
     enabled: true
-    device: "[9]"
+    device: cuda:0
 
     # ── Objective ────────────────────────────────────────────────
     temperature: 0.07
@@ -34,6 +35,7 @@ encoder_pipeline:
     residual: true
     dropout: 0.1
     id_embedding_dim: 64
+    id_embedding_node_types: [poi, category, cbg]
 
     # ── Redundancy regularization ────────────────────────────────
     variance_weight: 1.0
@@ -41,7 +43,7 @@ encoder_pipeline:
     variance_target: 1.0
 
     # ── Optimization ─────────────────────────────────────────────
-    epochs: 50
+    epochs: 600
     batch_size: 4194304
     lr: 0.001
     num_workers: 8
@@ -51,21 +53,23 @@ encoder_pipeline:
     # ── Graph construction ───────────────────────────────────────
     hash_train_fraction: 0.70
     seed: 42
-    out_dir: outputs/encoder/chicago/graph_v2
-    resume_checkpoint: outputs/encoder/chicago/graph_v2/checkpoints/best.pt
+    out_dir: outputs/encoder/graph
+    resume_checkpoint: outputs/encoder/graph/checkpoints/best.pt
     cache_version: 1
     cache_payload: graph_data.pt
     cache_meta: meta.json
     covisit_tc_hours: 6.0
 
   text:
-    enabled: false
+    enabled: true
     model: sentence-t5-xxl
-    device: "[8,9]"
+    device: cuda:0
     batch_size: 256
     precision: float32
     backend: torch
-    out_path: outputs/encoder/chicago/text/text_embeddings.npy
+    include_address_in_template: false
+    include_name_in_template: true
+    out_path: outputs/encoder/text/text_embeddings.npy
 
 output:
-  output_dir: outputs/encoder/chicago/graph_v2
+  output_dir: outputs/encoder/graph

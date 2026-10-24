@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import functools
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import numpy as np
@@ -14,6 +15,7 @@ from semoflow.metrics.trajectory.identity_dynamics import (
 )
 
 _EARTH_RADIUS_KM = 6371.0
+_DISTANCE_BINS = 50
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -28,45 +30,28 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 _CACHE_CAPACITY = 16
-_latlon_cache: list[
-    tuple[
-        dict[int, tuple[float, float]],
-        tuple[torch.Tensor, torch.Tensor, int],
-    ]
-] = []
-_geohash_cache: list[
-    tuple[
-        dict[int, str],
-        tuple[torch.Tensor, torch.Tensor, int, dict[str, int]],
-    ]
-] = []
+_table_caches: dict[Callable[..., Any], list[tuple[Any, Any]]] = {}
 
 
-def _lookup_cache(cache: list[tuple[Any, Any]], key: Any) -> Any | None:
-    for idx, (stored_key, value) in enumerate(cache):
-        if stored_key is key:
-            if idx != len(cache) - 1:
-                cache.append(cache.pop(idx))
-            return value
-    return None
-
-
-def _store_cache(cache: list[tuple[Any, Any]], key: Any, value: Any) -> None:
+def _cached_table[K, V](build: Callable[[K], V], lookup: K) -> V:
+    """``build(lookup)``, memoized on the lookup's identity (LRU of 16)."""
+    cache = _table_caches.setdefault(build, [])
+    for index, (stored, table) in enumerate(cache):
+        if stored is lookup:
+            cache.append(cache.pop(index))
+            return table
+    table = build(lookup)
     if len(cache) >= _CACHE_CAPACITY:
         cache.pop(0)
-    cache.append((key, value))
+    cache.append((lookup, table))
+    return table
 
 
-def _build_latlon_table(
+def _latlon_table(
     placekey_latlon: dict[int, tuple[float, float]],
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    cached = _lookup_cache(_latlon_cache, placekey_latlon)
-    if cached is not None:
-        return cached
     if not placekey_latlon:
-        result = (torch.zeros(0, 2), torch.zeros(0, dtype=torch.bool), -1)
-        _store_cache(_latlon_cache, placekey_latlon, result)
-        return result
+        return torch.zeros(0, 2), torch.zeros(0, dtype=torch.bool), -1
     keys = np.fromiter(
         placekey_latlon.keys(), dtype=np.int64, count=len(placekey_latlon)
     )
@@ -77,27 +62,19 @@ def _build_latlon_table(
     coords[keys, 0] = torch.from_numpy(values[:, 0])
     coords[keys, 1] = torch.from_numpy(values[:, 1])
     valid[keys] = True
-    result = (coords, valid, max_id)
-    _store_cache(_latlon_cache, placekey_latlon, result)
-    return result
+    return coords, valid, max_id
 
 
-def _build_geohash_table(
+def _geohash_table(
     geohash_lookup: dict[int, str],
 ) -> tuple[torch.Tensor, torch.Tensor, int, dict[str, int]]:
-    cached = _lookup_cache(_geohash_cache, geohash_lookup)
-    if cached is not None:
-        return cached
     if not geohash_lookup:
-        empty: dict[str, int] = {}
-        result = (
+        return (
             torch.zeros(0, dtype=torch.long),
             torch.zeros(0, dtype=torch.bool),
             -1,
-            empty,
+            {},
         )
-        _store_cache(_geohash_cache, geohash_lookup, result)
-        return result
     all_geohashes = sorted(set(geohash_lookup.values()))
     gh_index = {gh: i for i, gh in enumerate(all_geohashes)}
     keys = np.fromiter(
@@ -111,27 +88,43 @@ def _build_geohash_table(
     valid = torch.zeros(max_id + 1, dtype=torch.bool)
     table[keys] = torch.from_numpy(values)
     valid[keys] = True
-    result = (table, valid, max_id, gh_index)
-    _store_cache(_geohash_cache, geohash_lookup, result)
-    return result
+    return table, valid, max_id, gh_index
 
 
-def _gather_coords(
+def _table_rows(
     tokens: torch.Tensor,
-    coords: torch.Tensor,
     lookup_valid: torch.Tensor,
     max_id: int,
     pad_id: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if coords.device != tokens.device:
-        coords = coords.to(tokens.device)
-        lookup_valid = lookup_valid.to(tokens.device)
-    tokens_long = tokens.long()
-    in_range = (tokens_long >= 0) & (tokens_long <= max_id)
-    safe_idx = tokens_long.clamp(0, max_id)
-    gathered = coords[safe_idx]
-    valid = in_range & (tokens_long != pad_id) & lookup_valid[safe_idx]
-    return gathered, valid
+    """Clamped lookup-table row per token and whether the token has one."""
+    values = tokens.long()
+    rows = values.clamp(0, max_id)
+    keep = (
+        (values >= 0)
+        & (values <= max_id)
+        & (values != pad_id)
+        & lookup_valid[rows]
+    )
+    return rows, keep
+
+
+def _lookup_coordinates(
+    tokens: torch.Tensor,
+    placekey_latlon: dict[int, tuple[float, float]],
+    pad_id: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """(lat, lon) per token and whether it is a located POI; ``None`` for
+    an empty lookup."""
+    coords, lookup_valid, max_id = _cached_table(
+        _latlon_table, placekey_latlon
+    )
+    if max_id < 0:
+        return None
+    rows, valid = _table_rows(
+        tokens, lookup_valid.to(tokens.device), max_id, pad_id
+    )
+    return coords.to(tokens.device)[rows], valid
 
 
 def _pairwise_haversine_km(
@@ -159,16 +152,11 @@ def centroid_geo_error(
     *,
     pad_id: int = PAD_ID,
 ) -> float:
-    coords_tbl, valid_tbl, max_id = _build_latlon_table(centroids)
-    if max_id < 0:
-        return 0.0
-
     def _mean_centroid(tokens: torch.Tensor) -> tuple[float, float] | None:
-        gathered, valid = _gather_coords(
-            tokens, coords_tbl, valid_tbl, max_id, pad_id
-        )
-        if not valid.any():
+        located = _lookup_coordinates(tokens, centroids, pad_id)
+        if located is None or not located[1].any():
             return None
+        gathered, valid = located
         gathered = gathered.to(dtype=torch.float64)
         mask_f = valid.to(dtype=torch.float64).unsqueeze(-1)
         totals = (gathered * mask_f).sum(dim=(0, 1))
@@ -189,12 +177,10 @@ def per_sequence_travel_distance(
     *,
     pad_id: int = PAD_ID,
 ) -> torch.Tensor:
-    coords_tbl, valid_tbl, max_id = _build_latlon_table(placekey_latlon)
-    if max_id < 0:
+    located = _lookup_coordinates(tokens, placekey_latlon, pad_id)
+    if located is None:
         return torch.zeros(tokens.size(0))
-    gathered, valid = _gather_coords(
-        tokens, coords_tbl, valid_tbl, max_id, pad_id
-    )
+    gathered, valid = located
     n, t = valid.shape
     if t < 2:
         return torch.zeros(n, dtype=gathered.dtype, device=gathered.device)
@@ -219,13 +205,41 @@ def per_sequence_travel_distance(
     return dists.sum(dim=1)
 
 
+def _distance_bins(
+    real: torch.Tensor, generated: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Equal-width bin index of every value over the pooled [0, max] range."""
+    max_value = float(torch.maximum(real.max(), generated.max()).item())
+
+    def _bins(values: torch.Tensor) -> torch.Tensor:
+        if max_value == 0.0:
+            return torch.zeros_like(values, dtype=torch.long)
+        return (
+            (values / max_value * _DISTANCE_BINS)
+            .long()
+            .clamp_(0, _DISTANCE_BINS - 1)
+        )
+
+    return _bins(real), _bins(generated)
+
+
+def _binned_jsd(real: torch.Tensor, generated: torch.Tensor) -> float:
+    """JSD of two non-negative samples over shared distance bins."""
+
+    def _hist(bins: torch.Tensor) -> torch.Tensor:
+        counts = torch.bincount(bins, minlength=_DISTANCE_BINS).float()
+        return counts / counts.sum()
+
+    real_bins, generated_bins = _distance_bins(real, generated)
+    return jsd(_hist(real_bins), _hist(generated_bins))
+
+
 def travel_distance_jsd(
     tokens_real: torch.Tensor,
     tokens_gen: torch.Tensor,
     placekey_latlon: dict[int, tuple[float, float]],
     *,
     pad_id: int = PAD_ID,
-    n_bins: int = 50,
 ) -> float:
     d_real = per_sequence_travel_distance(
         tokens_real, placekey_latlon, pad_id=pad_id
@@ -235,17 +249,7 @@ def travel_distance_jsd(
     )
     if d_real.numel() == 0 or d_gen.numel() == 0:
         return float("nan")
-    max_dist = float(torch.maximum(d_real.max(), d_gen.max()).item())
-    if max_dist == 0.0:
-        return 0.0
-
-    def _hist(dists: torch.Tensor) -> torch.Tensor:
-        idx = (dists / max_dist * n_bins).long().clamp_(0, n_bins - 1)
-        counts = torch.bincount(idx, minlength=n_bins).float()
-        total = counts.sum()
-        return counts / total if total > 0 else counts
-
-    return jsd(_hist(d_real), _hist(d_gen))
+    return _binned_jsd(d_real, d_gen)
 
 
 def radius_of_gyration_jsd(
@@ -254,7 +258,6 @@ def radius_of_gyration_jsd(
     placekey_latlon: dict[int, tuple[float, float]],
     *,
     pad_id: int = PAD_ID,
-    n_bins: int = 50,
 ) -> float | None:
     if not placekey_latlon:
         return None
@@ -266,17 +269,7 @@ def radius_of_gyration_jsd(
     )
     if r.numel() == 0 or g.numel() == 0:
         return None
-    max_val = float(torch.maximum(r.max(), g.max()).item())
-    if max_val == 0.0:
-        return 0.0
-
-    def _hist(vals: torch.Tensor) -> torch.Tensor:
-        idx = (vals / max_val * n_bins).long().clamp_(0, n_bins - 1)
-        counts = torch.bincount(idx, minlength=n_bins).float()
-        total = counts.sum()
-        return counts / total if total > 0 else counts
-
-    return jsd(_hist(r), _hist(g))
+    return _binned_jsd(r, g)
 
 
 def per_sequence_radius_of_gyration(
@@ -285,12 +278,10 @@ def per_sequence_radius_of_gyration(
     *,
     pad_id: int = PAD_ID,
 ) -> torch.Tensor:
-    coords_tbl, valid_tbl, max_id = _build_latlon_table(placekey_latlon)
-    if max_id < 0:
+    located = _lookup_coordinates(tokens, placekey_latlon, pad_id)
+    if located is None:
         return torch.zeros(tokens.size(0))
-    gathered, valid = _gather_coords(
-        tokens, coords_tbl, valid_tbl, max_id, pad_id
-    )
+    gathered, valid = located
     mask_f = valid.float().unsqueeze(-1)
     totals = (gathered * mask_f).sum(dim=1)
     counts = mask_f.sum(dim=1).squeeze(-1)
@@ -307,38 +298,18 @@ def per_sequence_radius_of_gyration(
 
 
 def _scalar_histogram_contributions(
-    real_values: torch.Tensor,
-    generated_values: torch.Tensor,
-    *,
-    n_bins: int,
+    real_values: torch.Tensor, generated_values: torch.Tensor
 ) -> tuple[np.ndarray, np.ndarray]:
+    """One-hot distance-bin row per trajectory, for cluster bootstrapping."""
     if real_values.shape != generated_values.shape:
         raise ValueError("paired scalar distributions must align by row")
+    one_hot = np.eye(_DISTANCE_BINS, dtype=np.int32)
     if real_values.numel() == 0:
-        empty = np.zeros((0, n_bins), dtype=np.int32)
-        return empty, empty.copy()
-    max_value = float(
-        torch.maximum(real_values.max(), generated_values.max()).item()
-    )
-
-    def _contributions(values: torch.Tensor) -> np.ndarray:
-        out = np.zeros((len(values), n_bins), dtype=np.int32)
-        if not len(values):
-            return out
-        if max_value == 0.0:
-            indices = np.zeros(len(values), dtype=np.int64)
-        else:
-            indices = (
-                (values / max_value * n_bins)
-                .long()
-                .clamp_(0, n_bins - 1)
-                .cpu()
-                .numpy()
-            )
-        out[np.arange(len(values)), indices] = 1
-        return out
-
-    return _contributions(real_values), _contributions(generated_values)
+        return one_hot[:0], one_hot[:0]
+    real_bins, generated_bins = _distance_bins(real_values, generated_values)
+    return one_hot[real_bins.cpu().numpy()], one_hot[
+        generated_bins.cpu().numpy()
+    ]
 
 
 def _geohash_contributions(
@@ -347,17 +318,14 @@ def _geohash_contributions(
     *,
     pad_id: int,
 ) -> np.ndarray:
-    table, lookup_valid, max_id, geohash_index = _build_geohash_table(
-        geohash_lookup
+    table, lookup_valid, max_id, geohash_index = _cached_table(
+        _geohash_table, geohash_lookup
     )
     out = np.zeros((tokens.size(0), len(geohash_index)), dtype=np.int32)
     if max_id < 0 or not geohash_index:
         return out
-    values = tokens.long().cpu()
-    in_range = (values >= 0) & (values <= max_id)
-    safe = values.clamp(0, max_id)
-    keep = in_range & (values != pad_id) & lookup_valid[safe]
-    rows = torch.arange(values.size(0)).unsqueeze(1).expand_as(values)
+    safe, keep = _table_rows(tokens.cpu(), lookup_valid, max_id, pad_id)
+    rows = torch.arange(safe.size(0)).unsqueeze(1).expand_as(safe)
     np.add.at(
         out,
         (rows[keep].numpy(), table[safe][keep].numpy()),
@@ -374,54 +342,31 @@ def spatial_guardrail_uncertainty(
     geohash_lookup: dict[int, str] | None = None,
     cluster_ids: Sequence[str] | None = None,
     pad_id: int = PAD_ID,
-    bootstrap_seed: int = 20260714,
-    bootstrap_resamples: int = 1000,
     compute_device: torch.device | str | None = None,
 ) -> dict[str, Any]:
     if tokens_real.shape != tokens_gen.shape:
         raise ValueError("paired spatial trajectories must have equal shape")
-    travel = _scalar_histogram_contributions(
-        per_sequence_travel_distance(
-            tokens_real, placekey_latlon, pad_id=pad_id
-        ),
-        per_sequence_travel_distance(
-            tokens_gen, placekey_latlon, pad_id=pad_id
-        ),
-        n_bins=50,
-    )
-    radius = _scalar_histogram_contributions(
-        per_sequence_radius_of_gyration(
-            tokens_real, placekey_latlon, pad_id=pad_id
-        ),
-        per_sequence_radius_of_gyration(
-            tokens_gen, placekey_latlon, pad_id=pad_id
-        ),
-        n_bins=50,
+    bootstrap = functools.partial(
+        cluster_histogram_jsd_bootstrap,
+        cluster_ids=cluster_ids,
+        compute_device=compute_device,
     )
     result = {
-        "travel_distance_jsd": cluster_histogram_jsd_bootstrap(
-            *travel,
-            cluster_ids=cluster_ids,
-            seed=bootstrap_seed,
-            resamples=bootstrap_resamples,
-            compute_device=compute_device,
-        ),
-        "radius_of_gyration_jsd": cluster_histogram_jsd_bootstrap(
-            *radius,
-            cluster_ids=cluster_ids,
-            seed=bootstrap_seed,
-            resamples=bootstrap_resamples,
-            compute_device=compute_device,
-        ),
+        name: bootstrap(
+            *_scalar_histogram_contributions(
+                per_sequence(tokens_real, placekey_latlon, pad_id=pad_id),
+                per_sequence(tokens_gen, placekey_latlon, pad_id=pad_id),
+            )
+        )
+        for name, per_sequence in (
+            ("travel_distance_jsd", per_sequence_travel_distance),
+            ("radius_of_gyration_jsd", per_sequence_radius_of_gyration),
+        )
     }
     if geohash_lookup is not None:
-        result["geohash_spatial_jsd"] = cluster_histogram_jsd_bootstrap(
+        result["geohash_spatial_jsd"] = bootstrap(
             _geohash_contributions(tokens_real, geohash_lookup, pad_id=pad_id),
             _geohash_contributions(tokens_gen, geohash_lookup, pad_id=pad_id),
-            cluster_ids=cluster_ids,
-            seed=bootstrap_seed,
-            resamples=bootstrap_resamples,
-            compute_device=compute_device,
         )
     return result
 
@@ -433,21 +378,19 @@ def spatial_jsd(
     *,
     pad_id: int = PAD_ID,
 ) -> float:
-    gh_table, valid_tbl, max_id, gh_index = _build_geohash_table(
-        geohash_lookup
+    gh_table, valid_tbl, max_id, gh_index = _cached_table(
+        _geohash_table, geohash_lookup
     )
     if max_id < 0:
         return float("nan")
     n_hashes = len(gh_index)
 
     def _hist(tokens: torch.Tensor) -> torch.Tensor:
-        flat = tokens.flatten().long()
-        local_table = gh_table.to(flat.device)
-        local_valid = valid_tbl.to(flat.device)
-        in_range = (flat >= 0) & (flat <= max_id)
-        safe = flat.clamp(0, max_id)
-        keep = in_range & (flat != pad_id) & local_valid[safe]
-        idx = local_table[safe][keep]
+        flat = tokens.flatten()
+        safe, keep = _table_rows(
+            flat, valid_tbl.to(flat.device), max_id, pad_id
+        )
+        idx = gh_table.to(flat.device)[safe][keep]
         counts = torch.bincount(idx, minlength=n_hashes).float()
         total = counts.sum()
         return counts / total if total > 0 else counts

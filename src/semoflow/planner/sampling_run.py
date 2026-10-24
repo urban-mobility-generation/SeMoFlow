@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -11,9 +12,7 @@ from semoflow.planner.artifacts import (
     load_occurrence_planner_conditions,
     save_occurrence_planner_samples,
 )
-from semoflow.planner.sampling import (
-    sample_occurrence_sequences,
-)
+from semoflow.planner.sampling import sample_occurrence_sequences
 from semoflow.planner.types import OccurrenceSample
 
 logger = logging.getLogger(__name__)
@@ -24,6 +23,70 @@ class OccurrencePlannerSampleResult:
     output_path: Path
     num_samples: int
     batch_size: int
+
+
+# Column order of the stored [N, 4] log-probability tensors.
+_LOG_PROBABILITY_TERMS = ("length", "gap", "duration", "prefix")
+
+
+def _pack_samples(
+    samples: list[OccurrenceSample], *, prefix_depth: int, temporal: bool
+) -> dict[str, Any]:
+    """Stack sampled sequences into zero-padded sample-artifact tensors."""
+    num_samples = len(samples)
+    max_length = max(sample.sequence.length for sample in samples)
+    prefix_codes = torch.zeros(
+        (num_samples, max_length, prefix_depth), dtype=torch.long
+    )
+    gap_tokens = torch.zeros((num_samples, max_length), dtype=torch.long)
+    event_time_minutes = (
+        torch.zeros((num_samples, max_length), dtype=torch.float32)
+        if temporal
+        else None
+    )
+    city_ids = torch.empty(num_samples, dtype=torch.long)
+    for row, sample in enumerate(samples):
+        sequence = sample.sequence
+        prefix_codes[row, : sequence.length] = sequence.prefix_codes
+        gap_tokens[row, : sequence.length] = sequence.gap_tokens
+        if event_time_minutes is not None:
+            assert sequence.event_time_minutes is not None
+            event_time_minutes[row, : sequence.length] = (
+                sequence.event_time_minutes
+            )
+        if sequence.city_id is None:
+            raise RuntimeError("sampled planner sequence is missing city_id")
+        city_ids[row] = sequence.city_id
+
+    def log_probabilities(kind: str) -> torch.Tensor:
+        return torch.tensor(
+            [
+                [
+                    getattr(getattr(sample, kind), term)
+                    for term in _LOG_PROBABILITY_TERMS
+                ]
+                for sample in samples
+            ],
+            dtype=torch.float32,
+        )
+
+    return {
+        "prefix_codes": prefix_codes,
+        "gap_tokens": gap_tokens,
+        "lengths": torch.tensor(
+            [sample.sequence.length for sample in samples], dtype=torch.long
+        ),
+        "model_log_probability": log_probabilities("model_log_probability"),
+        "sampling_log_probability": log_probabilities(
+            "sampling_log_probability"
+        ),
+        "length_was_sampled": torch.tensor(
+            [sample.length_was_sampled for sample in samples],
+            dtype=torch.bool,
+        ),
+        "city_ids": city_ids,
+        "event_time_minutes": event_time_minutes,
+    }
 
 
 def sample_occurrence_planner(
@@ -123,81 +186,27 @@ def sample_occurrence_planner(
             num_samples,
         )
 
-    max_length = max(sample.sequence.length for sample in samples)
-    prefix_depth = checkpoint.config.prefix_depth
-    prefix_codes = torch.zeros(
-        (num_samples, max_length, prefix_depth), dtype=torch.long
-    )
-    gap_tokens = torch.zeros((num_samples, max_length), dtype=torch.long)
-    lengths_out = torch.empty(num_samples, dtype=torch.long)
-    model_log_probability = torch.empty((num_samples, 4), dtype=torch.float32)
-    sampling_log_probability = torch.empty(
-        (num_samples, 4), dtype=torch.float32
-    )
-    length_was_sampled = torch.empty(num_samples, dtype=torch.bool)
-    city_ids_out = torch.empty(num_samples, dtype=torch.long)
-    event_time_minutes = (
-        torch.zeros((num_samples, max_length), dtype=torch.float32)
-        if checkpoint.config.temporal_state_enabled
-        else None
-    )
-    for row, sample in enumerate(samples):
-        length = sample.sequence.length
-        lengths_out[row] = length
-        prefix_codes[row, :length] = sample.sequence.prefix_codes
-        gap_tokens[row, :length] = sample.sequence.gap_tokens
-        if event_time_minutes is not None:
-            assert sample.sequence.event_time_minutes is not None
-            event_time_minutes[row, :length] = (
-                sample.sequence.event_time_minutes
-            )
-        model_log_probability[row] = torch.tensor(
-            (
-                sample.model_log_probability.length,
-                sample.model_log_probability.gap,
-                sample.model_log_probability.duration,
-                sample.model_log_probability.prefix,
-            )
-        )
-        sampling_log_probability[row] = torch.tensor(
-            (
-                sample.sampling_log_probability.length,
-                sample.sampling_log_probability.gap,
-                sample.sampling_log_probability.duration,
-                sample.sampling_log_probability.prefix,
-            )
-        )
-        length_was_sampled[row] = sample.length_was_sampled
-        if sample.sequence.city_id is None:
-            raise RuntimeError("sampled planner sequence is missing city_id")
-        city_ids_out[row] = sample.sequence.city_id
-
+    temperatures = {
+        "length_temperature": length_temperature,
+        "gap_temperature": gap_temperature,
+        "prefix_temperature": prefix_temperature,
+        "route_temperature": route_temperature,
+    }
     save_occurrence_planner_samples(
         output_path,
-        prefix_codes=prefix_codes,
-        gap_tokens=gap_tokens,
-        lengths=lengths_out,
-        model_log_probability=model_log_probability,
-        sampling_log_probability=sampling_log_probability,
-        length_was_sampled=length_was_sampled,
-        city_ids=city_ids_out,
+        **_pack_samples(
+            samples,
+            prefix_depth=checkpoint.config.prefix_depth,
+            temporal=checkpoint.config.temporal_state_enabled,
+        ),
         context_features=context_features,
         context_schema=checkpoint.config.context_schema,
-        event_time_minutes=event_time_minutes,
         seed=seed,
         temperature=temperature,
-        length_temperature=(
-            temperature if length_temperature is None else length_temperature
-        ),
-        gap_temperature=temperature
-        if gap_temperature is None
-        else gap_temperature,
-        prefix_temperature=(
-            temperature if prefix_temperature is None else prefix_temperature
-        ),
-        route_temperature=(
-            temperature if route_temperature is None else route_temperature
-        ),
+        **{
+            name: temperature if value is None else value
+            for name, value in temperatures.items()
+        },
         force=force,
     )
     logger.info(

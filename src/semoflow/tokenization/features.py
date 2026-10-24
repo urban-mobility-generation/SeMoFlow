@@ -8,9 +8,7 @@ import numpy as np
 import polars as pl
 import torch
 
-from semoflow.encoder.artifacts import (
-    load_poi_embedding_artifact,
-)
+from semoflow.encoder.artifacts import load_poi_embedding_artifact
 
 logger = logging.getLogger(__name__)
 

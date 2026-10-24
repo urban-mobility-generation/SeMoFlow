@@ -66,11 +66,13 @@ def _load_aligned(places: Path, text_dir: Path, graph_dir: Path, pca_dim: int):
             pl.Series("g", np.arange(graph.shape[0]))
         ),
         on=graph_key,
+        maintain_order="left",
     ).join(
         ti.select(text_key).with_columns(
             pl.Series("t", ti["embedding_row"].to_numpy())
         ),
         on=text_key,
+        maintain_order="left",
     )
     if joined.height != pi.height:
         raise ValueError(

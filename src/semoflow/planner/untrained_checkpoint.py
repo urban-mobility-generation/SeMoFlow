@@ -1,14 +1,15 @@
 from __future__ import annotations
 
-import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import torch
 
-from semoflow.planner.artifacts import (
+from semoflow.config.schemas.planner_config import (
     OccurrencePlannerTrainingOptions,
+)
+from semoflow.planner.artifacts import (
     load_occurrence_planner_checkpoint,
     load_occurrence_planner_dataset,
     save_occurrence_planner_checkpoint,
@@ -20,6 +21,7 @@ from semoflow.planner.warm_start import (
     PlannerWarmStart,
     apply_planner_warm_start,
 )
+from semoflow.utils.serialization import write_json
 
 
 def publish_untrained_warm_start(
@@ -149,10 +151,7 @@ def publish_untrained_warm_start(
         "dataset": str(dataset_path),
         **report.to_dict(),
     }
-    warm_start_path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
-        encoding="utf-8",
-    )
+    write_json(warm_start_path, payload)
     return payload
 
 

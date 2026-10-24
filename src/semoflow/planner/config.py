@@ -3,12 +3,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from semoflow.planner.gap_codec import (
-    validate_gap_codec_contract,
-)
-from semoflow.planner.mobility_router import (
-    ExploreRetrieveRouter,
-)
+from semoflow.planner.gap_codec import validate_gap_codec_contract
+from semoflow.planner.mobility_router import ExploreRetrieveRouter
 
 
 def validate_gap_duration_minutes(

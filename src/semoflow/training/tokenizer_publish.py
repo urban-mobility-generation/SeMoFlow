@@ -11,20 +11,18 @@ import polars as pl
 
 from semoflow.config import ExperimentConfig
 from semoflow.config.artifacts import TokenizerArtifacts
-from semoflow.tokenization.features import (
-    load_graph_embeddings,
-)
+from semoflow.tokenization.features import load_graph_embeddings
 from semoflow.tokenization.shared_local import (
     semantic_id_lookup_fingerprint,
     shared_codebook_fingerprint,
 )
-from semoflow.utils import write_run_manifest
 from semoflow.utils.provenance import (
     ClosureComponent,
     ProvenanceClosure,
     load_closure,
     write_closure,
 )
+from semoflow.utils.run_metadata import write_run_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +43,7 @@ def _attach_catalog_city_ids(
         on="placekey_id",
         how="left",
         validate="m:1",
+        maintain_order="left",
     )
     if result["city_id"].null_count() > 0:
         raise ValueError(
@@ -63,9 +62,7 @@ def publish_tokenizer_artifacts(
 ) -> Path | None:
     import torch
 
-    from semoflow.tokenization.decoding.codebooks import (
-        SIDCodebookBundle,
-    )
+    from semoflow.tokenization.decoding.codebooks import SIDCodebookBundle
 
     tcfg = cfg.tokenizer_config
     stays = prepared.stays
@@ -136,6 +133,7 @@ def publish_tokenizer_artifacts(
             codes_df.select(["placekey_id", *code_cols]),
             on="placekey_id",
             how="left",
+            maintain_order="left",
         )
         for c in code_cols:
             stays_aug = stays_aug.with_columns(
@@ -232,9 +230,7 @@ def run_semantic_id_eval(
         build_simple_baseline_lookups,
         select_baseline_metrics,
     )
-    from semoflow.metrics.semantic_id_eval import (
-        evaluate_semantic_id_families,
-    )
+    from semoflow.metrics.semantic_id_eval import evaluate_semantic_id_families
     from semoflow.metrics.tokenization import (
         SemanticIDGroundingIndex,
         evaluate_semantic_ids,
@@ -356,15 +352,14 @@ def run_semantic_id_eval(
     write_semantic_id_eval_report(result, eval_dir / "semantic_id_eval.md")
     write_run_manifest(
         eval_dir,
-        output_dir=eval_dir,
-        data_artifact_paths={
+        inputs={
             "run_dir": artifacts.run_dir,
             "placekey_lookup": artifacts.placekey_lookup,
             "grounding_index": artifacts.grounding_index,
             "tokenizer_codebooks": artifacts.tokenizer_codebooks,
             "graphsage_artifact_dir": cfg.graphsage_artifact_dir,
         },
-        metric_artifact_paths={
+        outputs={
             "semantic_id_eval": eval_dir / "semantic_id_eval.json",
             "semantic_id_report": eval_dir / "semantic_id_eval.md",
         },
@@ -397,20 +392,17 @@ def _enrich_sid_lookup_for_eval(
         return lookup
     return lookup.join(
         places_index.select([id_column, *metadata_columns]).unique(
-            subset=[id_column]
+            subset=[id_column], keep="first"
         ),
         on=id_column,
         how="left",
+        maintain_order="left",
     )
 
 
 def _grounding_for_eval_lookup(lookup: pl.DataFrame) -> Any:
-    from semoflow.metrics.tokenization import (
-        SemanticIDGroundingIndex,
-    )
-    from semoflow.tokenization.token_space import (
-        sid_code_columns,
-    )
+    from semoflow.metrics.tokenization import SemanticIDGroundingIndex
+    from semoflow.tokenization.token_space import sid_code_columns
 
     id_column = (
         "placekey_id" if "placekey_id" in lookup.columns else "placekey"
@@ -479,9 +471,7 @@ def write_grounding_artifacts(
     code_cols: list[str],
     grounding_index_path: Path,
 ) -> Any:
-    from semoflow.metrics.tokenization import (
-        SemanticIDGroundingIndex,
-    )
+    from semoflow.metrics.tokenization import SemanticIDGroundingIndex
 
     payload_cols = [
         c
@@ -499,9 +489,10 @@ def write_grounding_artifacts(
         "placekey_id" if "placekey_id" in codes_df.columns else "placekey"
     )
     grounding_frame = codes_df.join(
-        metadata_frame.select(payload_cols).unique(id_column),
+        metadata_frame.select(payload_cols).unique(id_column, keep="first"),
         on=id_column,
         how="left",
+        maintain_order="left",
     )
     grounding_index = SemanticIDGroundingIndex.from_frame(
         grounding_frame,

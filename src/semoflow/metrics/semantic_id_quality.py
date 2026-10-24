@@ -8,16 +8,12 @@ from typing import Any, cast
 import numpy as np
 import polars as pl
 
-from semoflow.metrics.semantic_id_uncertainty import (
-    bootstrap_mean_ci,
-)
+from semoflow.metrics.semantic_id_uncertainty import bootstrap_mean_ci
 from semoflow.metrics.trajectory.geo import haversine_km
 from semoflow.tokenization.decoding.grounding_index import (
     SemanticIDGroundingIndex,
 )
-from semoflow.tokenization.token_space import (
-    sid_code_columns,
-)
+from semoflow.tokenization.token_space import sid_code_columns
 
 
 def _codebook_entropy_perplexity(
@@ -206,6 +202,123 @@ def _category_column(frame: pl.DataFrame) -> str | None:
     )
 
 
+_PREFIX_CATEGORY_KEYS = (
+    "prefix_category_purity",
+    "prefix_category_macro_purity",
+    "prefix_category_entropy_weighted",
+    "prefix_category_ami",
+    "prefix_category_nmi",
+    "prefix_category_neighbor_recall",
+    "prefix_category_purity_ci",
+)
+
+
+def _with_category_column(
+    frame: pl.DataFrame,
+    *,
+    id_column: str,
+    placekey_lookup: pl.DataFrame | None,
+) -> tuple[pl.DataFrame, str | None]:
+    """Use the grounding's category column, or join one from the lookup."""
+    category_col = _category_column(frame)
+    if category_col is not None or placekey_lookup is None:
+        return frame, category_col
+    lookup_category_col = _category_column(placekey_lookup)
+    if lookup_category_col is None or id_column not in frame.columns:
+        return frame, None
+    if id_column in placekey_lookup.columns:
+        join_col = id_column
+    elif (
+        id_column == "placekey_id"
+        and "placekey" in frame.columns
+        and "placekey" in placekey_lookup.columns
+    ):
+        join_col = "placekey"
+    else:
+        return frame, None
+    categories = placekey_lookup.select(
+        [join_col, lookup_category_col]
+    ).unique(subset=[join_col], keep="first")
+    return (
+        frame.join(categories, on=join_col, how="left", maintain_order="left"),
+        lookup_category_col,
+    )
+
+
+def _first_occurrence_ids(rows: np.ndarray) -> np.ndarray:
+    """Label each row by the order in which its value first appears."""
+    _, first, inverse = np.unique(
+        rows, axis=0, return_index=True, return_inverse=True
+    )
+    rank = np.empty_like(first)
+    rank[np.argsort(first)] = np.arange(first.size)
+    return rank[inverse.reshape(-1)]
+
+
+def _prefix_category_scores(
+    clusters: np.ndarray,
+    categories: list[Any],
+    encoded_categories: np.ndarray,
+    category_totals: Counter[Any],
+) -> tuple[dict[str, float], list[float]]:
+    """Category agreement of one prefix depth; also per-POI purity."""
+    from sklearn.metrics import (
+        adjusted_mutual_info_score,
+        normalized_mutual_info_score,
+    )
+
+    members = list(zip(clusters.tolist(), categories, strict=True))
+    cluster_categories: list[Counter[Any]] = [
+        Counter() for _ in range(int(clusters.max()) + 1)
+    ]
+    for cluster_id, category in members:
+        cluster_categories[cluster_id][category] += 1
+    total = len(categories)
+    weighted_majority = 0
+    cluster_purities: list[float] = []
+    weighted_entropy = 0.0
+    for counts in cluster_categories:
+        size = counts.total()
+        majority = max(counts.values())
+        weighted_majority += majority
+        cluster_purities.append(majority / size)
+        probabilities = np.asarray(list(counts.values()), dtype=np.float64)
+        probabilities /= probabilities.sum()
+        weighted_entropy += (size / total) * float(
+            -np.sum(probabilities * np.log(probabilities))
+        )
+    majority_category = [
+        counts.most_common(1)[0][0] for counts in cluster_categories
+    ]
+    per_poi_purity = [
+        float(category == majority_category[cluster_id])
+        for cluster_id, category in members
+    ]
+    recalls = [
+        (cluster_categories[cluster_id][category] - 1)
+        / (category_totals[category] - 1)
+        for cluster_id, category in members
+        if category_totals[category] > 1
+    ]
+    scores = {
+        "prefix_category_purity": weighted_majority / total,
+        "prefix_category_macro_purity": float(np.mean(cluster_purities)),
+        "prefix_category_entropy_weighted": weighted_entropy,
+        "prefix_category_ami": float(
+            adjusted_mutual_info_score(encoded_categories, clusters)
+        ),
+        "prefix_category_nmi": float(
+            normalized_mutual_info_score(
+                encoded_categories, clusters, average_method="arithmetic"
+            )
+        ),
+        "prefix_category_neighbor_recall": (
+            float(np.mean(recalls)) if recalls else 0.0
+        ),
+    }
+    return scores, per_poi_purity
+
+
 def prefix_category_metrics(
     grounding: SemanticIDGroundingIndex,
     *,
@@ -217,161 +330,42 @@ def prefix_category_metrics(
     frame = grounding.to_frame()
     code_cols = list(sid_code_columns(frame.columns))
     if frame.is_empty() or not code_cols:
-        return {
-            "prefix_category_purity": None,
-            "prefix_category_macro_purity": None,
-            "prefix_category_entropy_weighted": None,
-            "prefix_category_ami": None,
-            "prefix_category_nmi": None,
-            "prefix_category_neighbor_recall": None,
-            "prefix_category_purity_ci": None,
-        }
-
-    category_col = _category_column(frame)
-    if category_col is None and placekey_lookup is not None:
-        lookup_category_col = _category_column(placekey_lookup)
-        join_col = grounding.id_column
-        if lookup_category_col is not None and join_col in frame.columns:
-            if join_col in placekey_lookup.columns:
-                frame = frame.join(
-                    placekey_lookup.select(
-                        [join_col, lookup_category_col]
-                    ).unique(subset=[join_col]),
-                    on=join_col,
-                    how="left",
-                )
-                category_col = lookup_category_col
-            elif (
-                join_col == "placekey_id"
-                and "placekey" in frame.columns
-                and "placekey" in placekey_lookup.columns
-            ):
-                frame = frame.join(
-                    placekey_lookup.select(
-                        ["placekey", lookup_category_col]
-                    ).unique(subset=["placekey"]),
-                    on="placekey",
-                    how="left",
-                )
-                category_col = lookup_category_col
-
+        return dict.fromkeys(_PREFIX_CATEGORY_KEYS)
+    frame, category_col = _with_category_column(
+        frame, id_column=grounding.id_column, placekey_lookup=placekey_lookup
+    )
     if category_col is None:
-        return {
-            "prefix_category_purity": None,
-            "prefix_category_macro_purity": None,
-            "prefix_category_entropy_weighted": None,
-            "prefix_category_ami": None,
-            "prefix_category_nmi": None,
-            "prefix_category_neighbor_recall": None,
-            "prefix_category_purity_ci": None,
-        }
-
+        return dict.fromkeys(_PREFIX_CATEGORY_KEYS)
     valid = frame.filter(pl.col(category_col).is_not_null())
     if valid.is_empty():
-        return {
-            "prefix_category_purity": None,
-            "prefix_category_macro_purity": None,
-            "prefix_category_entropy_weighted": None,
-            "prefix_category_ami": None,
-            "prefix_category_nmi": None,
-            "prefix_category_neighbor_recall": None,
-            "prefix_category_purity_ci": None,
-        }
+        return dict.fromkeys(_PREFIX_CATEGORY_KEYS)
 
     code_values = np.column_stack(
         [valid[column].to_numpy() for column in code_cols]
     ).astype(np.int64, copy=False)
     categories = valid[category_col].to_list()
-    category_ids: dict[Any, int] = {}
-    encoded_categories = np.empty(len(categories), dtype=np.int64)
-    for index, category in enumerate(categories):
-        if category not in category_ids:
-            category_ids[category] = len(category_ids)
-        encoded_categories[index] = category_ids[category]
-
-    purity: dict[int, float] = {}
-    macro_purity: dict[int, float] = {}
-    entropy_weighted: dict[int, float] = {}
-    ami: dict[int, float] = {}
-    nmi: dict[int, float] = {}
-    neighbour_recall: dict[int, float] = {}
-    purity_ci: dict[int, list[float]] = {}
+    category_ids = {
+        category: index
+        for index, category in enumerate(dict.fromkeys(categories))
+    }
+    encoded_categories = np.fromiter(
+        (category_ids[category] for category in categories),
+        dtype=np.int64,
+        count=len(categories),
+    )
     category_totals = Counter(categories)
 
-    try:
-        from sklearn.metrics import (
-            adjusted_mutual_info_score,
-            normalized_mutual_info_score,
-        )
-    except ImportError:
-        adjusted_mutual_info_score = None
-        normalized_mutual_info_score = None
-
+    result: dict[str, Any] = {key: {} for key in _PREFIX_CATEGORY_KEYS}
+    purity_ci = result["prefix_category_purity_ci"]
     for depth in range(1, len(code_cols) + 1):
-        cluster_ids: dict[tuple[int, ...], int] = {}
-        cluster_categories: dict[int, Counter[Any]] = defaultdict(Counter)
-        encoded_clusters = np.empty(len(categories), dtype=np.int64)
-        for index in range(code_values.shape[0]):
-            prefix = tuple(
-                int(value) for value in code_values[index, :depth].tolist()
-            )
-            cluster_id = cluster_ids.setdefault(prefix, len(cluster_ids))
-            encoded_clusters[index] = cluster_id
-            cluster_categories[cluster_id][categories[index]] += 1
-
-        cluster_sizes = np.bincount(encoded_clusters)
-        weighted_majority = 0
-        cluster_purities: list[float] = []
-        weighted_entropy = 0.0
-        for cluster_id, counts in cluster_categories.items():
-            size = int(cluster_sizes[cluster_id])
-            majority = max(counts.values())
-            weighted_majority += majority
-            cluster_purities.append(majority / size)
-            probabilities = np.asarray(list(counts.values()), dtype=np.float64)
-            probabilities /= probabilities.sum()
-            weighted_entropy += (size / len(categories)) * float(
-                -np.sum(probabilities * np.log(probabilities))
-            )
-
-        per_poi_purity = [
-            float(
-                category
-                == cluster_categories[int(cluster_id)].most_common(1)[0][0]
-            )
-            for cluster_id, category in zip(
-                encoded_clusters, categories, strict=True
-            )
-        ]
-
-        purity[depth] = weighted_majority / len(categories)
-        macro_purity[depth] = float(np.mean(cluster_purities))
-        entropy_weighted[depth] = weighted_entropy
-
-        if adjusted_mutual_info_score is not None:
-            ami[depth] = float(
-                adjusted_mutual_info_score(
-                    encoded_categories, encoded_clusters
-                )
-            )
-        if normalized_mutual_info_score is not None:
-            nmi[depth] = float(
-                normalized_mutual_info_score(
-                    encoded_categories,
-                    encoded_clusters,
-                    average_method="arithmetic",
-                )
-            )
-
-        recalls: list[float] = []
-        for index, category in enumerate(categories):
-            denominator = category_totals[category] - 1
-            if denominator <= 0:
-                continue
-            cluster_id = int(encoded_clusters[index])
-            numerator = cluster_categories[cluster_id][category] - 1
-            recalls.append(numerator / denominator)
-        neighbour_recall[depth] = float(np.mean(recalls)) if recalls else 0.0
+        scores, per_poi_purity = _prefix_category_scores(
+            _first_occurrence_ids(code_values[:, :depth]),
+            categories,
+            encoded_categories,
+            category_totals,
+        )
+        for key, value in scores.items():
+            result[key][depth] = value
         if bootstrap_resamples > 0:
             interval = bootstrap_mean_ci(
                 per_poi_purity,
@@ -381,16 +375,8 @@ def prefix_category_metrics(
             )
             if interval is not None:
                 purity_ci[depth] = interval
-
-    return {
-        "prefix_category_purity": purity,
-        "prefix_category_macro_purity": macro_purity,
-        "prefix_category_entropy_weighted": entropy_weighted,
-        "prefix_category_ami": ami if ami else None,
-        "prefix_category_nmi": nmi if nmi else None,
-        "prefix_category_neighbor_recall": neighbour_recall,
-        "prefix_category_purity_ci": purity_ci or None,
-    }
+    result["prefix_category_purity_ci"] = purity_ci or None
+    return result
 
 
 def prefix_catalog_metrics(

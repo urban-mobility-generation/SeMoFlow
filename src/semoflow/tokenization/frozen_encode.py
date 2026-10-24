@@ -10,21 +10,13 @@ import numpy as np
 import polars as pl
 import torch
 
-from semoflow.config.schemas.tokenizer_config import (
-    TokenizerConfig,
-)
+from semoflow.config.schemas.tokenizer_config import TokenizerConfig
 from semoflow.tokenization.features import (
-    GRAPH_PREFIX,
-    PCA_GRAPH_PREFIX,
     build_features,
     scale_feature_blocks,
 )
-from semoflow.tokenization.rqvae import (
-    build_tokenizer_model,
-)
-from semoflow.training.tokenizer_publish import (
-    encode_feature_tensors,
-)
+from semoflow.tokenization.rqvae import build_tokenizer_model
+from semoflow.training.tokenizer_publish import encode_feature_tensors
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +93,6 @@ def load_frozen_features(
     city_ids: list[int] | None = None,
     text_embeddings: Path | None = None,
     graphsage_artifact_dir: Path | None = None,
-    missing_graph_policy: str | None = None,
 ) -> FrozenFeatures:
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     fitted_columns = list(payload["feature_columns"])
@@ -142,54 +133,26 @@ def load_frozen_features(
         places = places.filter(pl.col("city_id").is_in(city_ids))
     logger.info("encoding %d POIs", places.height)
 
-    if missing_graph_policy not in {None, "source_mean"}:
-        raise ValueError("missing_graph_policy must be None or 'source_mean'")
     if text_embeddings is None:
         text_embeddings = Path(config.text_embeddings_path)
-    if missing_graph_policy == "source_mean":
-        if source != "pca_concat":
-            raise ValueError(
-                "source-mean graph masking requires a pca_concat checkpoint"
-            )
-        frame, _ = build_features(
-            places_index=places,
-            source="pca_text",
-            text_embeddings_path=text_embeddings,
-            graphsage_artifact_dir=None,
-            pca_text_dim=config.pca_text_dim,
-            state=pca,
-        )
-    else:
-        graph_dir = graphsage_artifact_dir
-        if graph_dir is None and config.graphsage_artifact_dir:
-            graph_dir = Path(config.graphsage_artifact_dir)
-        frame, _ = build_features(
-            places_index=places,
-            source=source,
-            text_embeddings_path=text_embeddings,
-            graphsage_artifact_dir=graph_dir,
-            pca_text_dim=config.pca_text_dim,
-            pca_graph_dim=config.pca_graph_dim,
-            geo_relative_dim=config.geo_relative_dim,
-            state=pca,
-        )
+    if graphsage_artifact_dir is None and config.graphsage_artifact_dir:
+        graphsage_artifact_dir = Path(config.graphsage_artifact_dir)
+    frame, _ = build_features(
+        places_index=places,
+        source=source,
+        text_embeddings_path=text_embeddings,
+        graphsage_artifact_dir=graphsage_artifact_dir,
+        pca_text_dim=config.pca_text_dim,
+        pca_graph_dim=config.pca_graph_dim,
+        geo_relative_dim=config.geo_relative_dim,
+        state=pca,
+    )
     values, zero_filled, dropped = _align_to_fitted_columns(
         frame, fitted_columns
     )
-
-    x = torch.from_numpy(values)
-    x = (x - payload["feature_mean"]) / payload["feature_std"]
-    if missing_graph_policy == "source_mean":
-        graph_columns = [
-            index
-            for index, name in enumerate(fitted_columns)
-            if name.startswith((GRAPH_PREFIX, PCA_GRAPH_PREFIX))
-        ]
-        if not graph_columns:
-            raise ValueError(
-                "source-mean graph masking found no fitted graph columns"
-            )
-        x[:, graph_columns] = 0.0
+    x = (torch.from_numpy(values) - payload["feature_mean"]) / payload[
+        "feature_std"
+    ]
     x = scale_feature_blocks(
         x,
         fitted_columns,
@@ -214,8 +177,6 @@ def encode_with_frozen_tokenizer(
     city_ids: list[int] | None = None,
     text_embeddings: Path | None = None,
     graphsage_artifact_dir: Path | None = None,
-    missing_graph_policy: str | None = None,
-    city_id_override: int | None = None,
     device: str = "cpu",
 ) -> FrozenEncodeResult:
     features = load_frozen_features(
@@ -224,7 +185,6 @@ def encode_with_frozen_tokenizer(
         city_ids=city_ids,
         text_embeddings=text_embeddings,
         graphsage_artifact_dir=graphsage_artifact_dir,
-        missing_graph_policy=missing_graph_policy,
     )
     payload = features.payload
     places = features.places
@@ -244,11 +204,7 @@ def encode_with_frozen_tokenizer(
         [c for c in ("placekey_id", "placekey") if c in places.columns]
     )
     if "city_id" in places.columns:
-        out = out.with_columns(
-            pl.lit(city_id_override, dtype=pl.Int32).alias("city_id")
-            if city_id_override is not None
-            else places["city_id"]
-        )
+        out = out.with_columns(places["city_id"])
     for level in range(codes.shape[1]):
         out = out.with_columns(pl.Series(f"sem_code_{level}", codes[:, level]))
 

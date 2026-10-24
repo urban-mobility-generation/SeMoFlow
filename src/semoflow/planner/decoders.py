@@ -150,20 +150,33 @@ class HierarchicalPrefixDecoder(PrefixDecoder):
             nn.Linear(model_dim, codebook_size) for _ in range(prefix_depth)
         )
 
-    def _step(
+    def _level_logits(
         self,
         state: torch.Tensor,
-        previous_codes: torch.Tensor | None,
         level: int,
+        parents: torch.Tensor,
+        catalog_rows: torch.Tensor | None,
+        distance: PrefixDistanceContext | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Advance the GRU past ``parents``; legal logits for ``level``."""
         decoder_input = (
             self.start_embedding.expand(state.shape[0], -1)
-            if previous_codes is None
-            else self.code_embedding(previous_codes)
+            if level == 0
+            else self.code_embedding(parents[:, level - 1])
         )
         decoder_input = decoder_input + self.level_embedding.weight[level]
         state = self.cell(decoder_input, state)
-        return state, self.heads[level](state)
+        logits = self.heads[level](state)
+        valid = (
+            self.legality.next_mask(level, parents)
+            if catalog_rows is None
+            else self.legality.next_mask_for_catalog_rows(
+                level, parents, catalog_rows
+            )
+        )
+        if distance is not None:
+            logits = logits + distance.level_bias(level, parents)
+        return state, logits.masked_fill(~valid, _ILLEGAL_LOGIT)
 
     def forward(
         self,
@@ -187,22 +200,15 @@ class HierarchicalPrefixDecoder(PrefixDecoder):
         flat_distance = None if distance is None else distance.flatten()
         state = self.context(flat_hidden)
         logits: list[torch.Tensor] = []
-        previous: torch.Tensor | None = None
         for level in range(self.prefix_depth):
-            state, current = self._step(state, previous, level)
-            valid = (
-                self.legality.next_mask(level, flat_targets[:, :level])
-                if flat_catalog_rows is None
-                else self.legality.next_mask_for_catalog_rows(
-                    level, flat_targets[:, :level], flat_catalog_rows
-                )
+            state, level_logits = self._level_logits(
+                state,
+                level,
+                flat_targets[:, :level],
+                flat_catalog_rows,
+                flat_distance,
             )
-            if flat_distance is not None:
-                current = current + flat_distance.level_bias(
-                    level, flat_targets[:, :level]
-                )
-            logits.append(current.masked_fill(~valid, _ILLEGAL_LOGIT))
-            previous = flat_targets[:, level]
+            logits.append(level_logits)
         stacked = torch.stack(logits, dim=1).reshape(
             *shape, self.prefix_depth, -1
         )
@@ -227,41 +233,29 @@ class HierarchicalPrefixDecoder(PrefixDecoder):
         sampling_log_probability = torch.zeros(
             hidden.shape[0], dtype=torch.float32, device=hidden.device
         )
-        previous: torch.Tensor | None = None
         for level in range(self.prefix_depth):
-            state, logits = self._step(state, previous, level)
             parents = (
-                torch.empty(
+                torch.stack(codes, dim=-1)
+                if codes
+                else torch.empty(
                     (hidden.shape[0], 0),
                     dtype=torch.long,
                     device=hidden.device,
                 )
-                if not codes
-                else torch.stack(codes, dim=-1)
             )
-            valid = (
-                self.legality.next_mask(level, parents)
-                if catalog_rows is None
-                else self.legality.next_mask_for_catalog_rows(
-                    level, parents, catalog_rows
-                )
+            state, logits = self._level_logits(
+                state, level, parents, catalog_rows, distance
             )
-            if distance is not None:
-                logits = logits + distance.level_bias(level, parents)
             sampled = sample_categorical_logits(
-                logits.masked_fill(~valid, _ILLEGAL_LOGIT),
-                temperature=temperature,
-                generator=generator,
+                logits, temperature=temperature, generator=generator
             )
-            choice = sampled.choices
-            codes.append(choice)
+            codes.append(sampled.choices)
             model_log_probability = (
                 model_log_probability + sampled.model_log_probability
             )
             sampling_log_probability = (
                 sampling_log_probability + sampled.sampling_log_probability
             )
-            previous = choice
         return (
             torch.stack(codes, dim=-1),
             model_log_probability,
@@ -275,6 +269,24 @@ class FlatLegalPrefixDecoder(PrefixDecoder):
         object.__setattr__(self, "legality", legality)
         self.head = nn.Linear(model_dim, legality.vocabulary_size)
 
+    def _logits(
+        self,
+        hidden: torch.Tensor,
+        catalog_rows: torch.Tensor | None,
+        distance: PrefixDistanceContext | None,
+    ) -> torch.Tensor:
+        logits = self.head(hidden)
+        if distance is not None:
+            logits = logits + distance.flat_bias()
+        if catalog_rows is None:
+            return logits
+        if catalog_rows.shape != hidden.shape[:1]:
+            raise ValueError("catalog_rows must have shape [batch]")
+        catalog_mask = self.legality.city_legal_prefix_mask[catalog_rows]
+        if logits.ndim > 2:
+            catalog_mask = catalog_mask[:, None, :]
+        return logits.masked_fill(~catalog_mask, _ILLEGAL_LOGIT)
+
     def forward(
         self,
         hidden: torch.Tensor,
@@ -283,17 +295,10 @@ class FlatLegalPrefixDecoder(PrefixDecoder):
         catalog_rows: torch.Tensor | None = None,
         distance: PrefixDistanceContext | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = self.head(hidden)
-        if distance is not None:
-            logits = logits + distance.flat_bias()
-        if catalog_rows is not None:
-            if catalog_rows.shape != hidden.shape[:1]:
-                raise ValueError("catalog_rows must have shape [batch]")
-            catalog_mask = self.legality.city_legal_prefix_mask[catalog_rows]
-            if logits.ndim > 2:
-                catalog_mask = catalog_mask[:, None, :]
-            logits = logits.masked_fill(~catalog_mask, _ILLEGAL_LOGIT)
-        return logits, self.legality.token_ids(target_codes)
+        return (
+            self._logits(hidden, catalog_rows, distance),
+            self.legality.token_ids(target_codes),
+        )
 
     def sample(
         self,
@@ -304,16 +309,8 @@ class FlatLegalPrefixDecoder(PrefixDecoder):
         catalog_rows: torch.Tensor | None = None,
         distance: PrefixDistanceContext | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits = self.head(hidden)
-        if distance is not None:
-            logits = logits + distance.flat_bias()
-        if catalog_rows is not None:
-            if catalog_rows.shape != hidden.shape[:1]:
-                raise ValueError("catalog_rows must have shape [batch]")
-            catalog_mask = self.legality.city_legal_prefix_mask[catalog_rows]
-            logits = logits.masked_fill(~catalog_mask, _ILLEGAL_LOGIT)
         sampled = sample_categorical_logits(
-            logits,
+            self._logits(hidden, catalog_rows, distance),
             temperature=temperature,
             generator=generator,
         )

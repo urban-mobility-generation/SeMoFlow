@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-from collections import Counter, defaultdict
-from collections.abc import Iterable, Mapping
+from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,15 +12,9 @@ import polars as pl
 import torch
 import torch.nn.functional as F
 
-from semoflow.metrics.semantic_id_baselines import (
-    select_baseline_metrics,
-)
-from semoflow.metrics.semantic_id_cf import (
-    cf_alignment_metrics,
-)
-from semoflow.metrics.semantic_id_eval import (
-    evaluate_semantic_id_families,
-)
+from semoflow.metrics.semantic_id_baselines import select_baseline_metrics
+from semoflow.metrics.semantic_id_cf import cf_alignment_metrics
+from semoflow.metrics.semantic_id_eval import evaluate_semantic_id_families
 from semoflow.metrics.semantic_id_quality import (
     poi_recovery_metrics,
     prefix_catalog_metrics,
@@ -179,40 +173,6 @@ class SemanticIDEvaluation:
             return value
 
         return stringify_keys(d)
-
-
-def _codebook_entropy_perplexity(
-    codes: np.ndarray, *, codebook_size: int
-) -> tuple[float, float]:
-    counts = np.bincount(codes, minlength=codebook_size).astype(np.float64)
-    probs = counts / counts.sum()
-    probs = probs[probs > 0]
-    entropy = float(-np.sum(probs * np.log(probs)))
-    perplexity = float(np.exp(entropy))
-    return entropy, perplexity
-
-
-def _code_balance_gini(codes: np.ndarray, *, codebook_size: int) -> float:
-    counts = np.bincount(codes, minlength=codebook_size).astype(np.float64)
-    counts = np.sort(counts)
-    n = len(counts)
-    index = np.arange(1, n + 1, dtype=np.float64)
-    return float(
-        (2.0 * np.sum(index * counts) / (n * np.sum(counts))) - (n + 1) / n
-    )
-
-
-def _top1_concentration(codes: np.ndarray) -> float:
-    counts = np.bincount(codes)
-    return float(counts.max() / counts.sum())
-
-
-def _purity(values: Iterable[Any]) -> float | None:
-    vals = [v for v in values if v is not None]
-    if not vals:
-        return None
-    counts = Counter(vals)
-    return counts.most_common(1)[0][1] / len(vals)
 
 
 def _subset_rows(n: int, max_pois: int, seed: int) -> torch.Tensor:

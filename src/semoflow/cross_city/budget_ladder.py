@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -13,6 +12,7 @@ from semoflow.cross_city.union_catalog import (
     write_sidecar_manifest,
 )
 from semoflow.utils.data import hash_fraction
+from semoflow.utils.serialization import write_json
 
 BUDGET_SELECTION_SEED = 20260921
 INNER_ROLE_SEED = 20260922
@@ -173,10 +173,7 @@ def build_budget_ladder(
             rung, city=city, fraction=fraction, eligible=eligible.height
         )
         manifest["devices_path"] = str(devices_path)
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        write_json(manifest_path, manifest)
         rungs.append(manifest)
 
     ladder = {
@@ -190,9 +187,7 @@ def build_budget_ladder(
         "nested_verified": True,
         "rungs": rungs,
     }
-    ladder_path.write_text(
-        json.dumps(ladder, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    write_json(ladder_path, ladder)
     return {"ladder": str(ladder_path), "rungs": len(rungs)}
 
 
@@ -278,9 +273,19 @@ def build_rung_augmented_visits(
     rows = (
         pl.scan_parquet(visits)
         .filter(pl.col("split") == "train")
-        .join(inner_splits.lazy(), on="device_key", how="inner")
-        .join(bridge.lazy(), on="placekey_id", how="inner")
-        .join(lookup.lazy(), on="placekey", how="inner")
+        .join(
+            inner_splits.lazy(),
+            on="device_key",
+            how="inner",
+            maintain_order="left",
+        )
+        .join(
+            bridge.lazy(),
+            on="placekey_id",
+            how="inner",
+            maintain_order="left",
+        )
+        .join(lookup.lazy(), on="placekey", how="inner", maintain_order="left")
         .drop("placekey_id", "placekey")
         .rename({"_union_placekey_id": "placekey_id"})
         .with_columns(
@@ -414,12 +419,16 @@ def build_rung_segments(
             f"{len(stray)} panel devices are absent from the cache's outer "
             f"train split, e.g. {stray[:3]}"
         )
-    rows = outer_train.join(inner_splits, on="device_key", how="inner")
+    rows = outer_train.join(
+        inner_splits, on="device_key", how="inner", maintain_order="left"
+    )
     if rows.is_empty():
         raise ValueError("the rung selected no segments")
 
     holdout_ids = pl.read_parquet(holdout_panel, columns=["_seg_id"])
-    holdout = cache.join(holdout_ids, on="_seg_id", how="inner")
+    holdout = cache.join(
+        holdout_ids, on="_seg_id", how="inner", maintain_order="left"
+    )
     if holdout.height != holdout_ids.height:
         raise ValueError(
             f"held-out panel names {holdout_ids.height} segments but the cache "

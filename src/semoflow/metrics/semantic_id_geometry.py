@@ -7,12 +7,8 @@ import numpy as np
 import polars as pl
 import torch
 
-from semoflow.metrics.semantic_id_trajectory import (
-    collapse_consecutive_pois,
-)
-from semoflow.tokenization.token_space import (
-    sid_code_columns,
-)
+from semoflow.metrics.semantic_id_trajectory import collapse_consecutive_pois
+from semoflow.tokenization.token_space import sid_code_columns
 
 
 def summed_codebook_geometry_metrics(
@@ -194,7 +190,9 @@ def _align_graph_rows(
             return frame, None
         index = index.with_row_index("embedding_row")
     joined = frame.join(
-        index.select([id_column, "embedding_row"]).unique(subset=[id_column]),
+        index.select([id_column, "embedding_row"]).unique(
+            subset=[id_column], maintain_order=True
+        ),
         on=id_column,
         how="inner",
     )
@@ -336,7 +334,7 @@ def _transition_targets(
         .filter(pl.col("_next_poi").is_in(ids))
         .filter(pl.col(id_column) != pl.col("_next_poi"))
         .select([id_column, "_next_poi"])
-        .unique()
+        .unique(maintain_order=True)
     )
     result: dict[Any, set[Any]] = defaultdict(set)
     for source, target in targets.iter_rows():
@@ -365,7 +363,7 @@ def _temporal_profiles(
         .drop_nulls([id_column, "_hour"])
         .filter(pl.col(id_column).is_in(ids))
         .filter(pl.col("_hour").is_between(0, 23))
-        .group_by(id_column)
+        .group_by(id_column, maintain_order=True)
         .agg(
             *[
                 (pl.col("_hour") == hour).sum().alias(f"h{hour}")

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import shutil
 from pathlib import Path
 from typing import Any
@@ -11,12 +10,9 @@ import torch
 from semoflow.tokenization.decoding.grounding_index import (
     SemanticIDGroundingIndex,
 )
-from semoflow.tokenization.shared_local import (
-    semantic_id_lookup_fingerprint,
-)
-from semoflow.tokenization.token_space import (
-    sid_code_columns,
-)
+from semoflow.tokenization.shared_local import semantic_id_lookup_fingerprint
+from semoflow.tokenization.token_space import sid_code_columns
+from semoflow.utils.serialization import write_json
 
 CONTROL_MANIFEST = "sid_assignment_control.json"
 _COPIED_METADATA = ("config.yaml", "config_resolved.yaml", "provenance.json")
@@ -56,7 +52,7 @@ def write_control_tokenizer_dir(
         sid_code_columns(source_index.to_frame().columns)
     )
     grounding_frame = lookup.select(["placekey_id", *code_cols]).join(
-        payload, on="placekey_id", how="left"
+        payload, on="placekey_id", how="left", maintain_order="left"
     )
     index = SemanticIDGroundingIndex.from_frame(
         grounding_frame,
@@ -111,9 +107,7 @@ def write_control_tokenizer_dir(
         **control,
         **(manifest_extra or {}),
     }
-    (output_dir / CONTROL_MANIFEST).write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    write_json(output_dir / CONTROL_MANIFEST, manifest)
     return manifest
 
 

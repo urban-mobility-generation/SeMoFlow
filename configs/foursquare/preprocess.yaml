@@ -3,9 +3,11 @@
 # Download and extract the global 415-city release from the source page into
 # data/foursquare_global_2015/, or override data.foursquare.archive_path with
 # an absolute path to the extracted directory.
+#
+#   uv run semoflow-preprocess --config configs/foursquare/preprocess.yaml
 
 experiment:
-  name: preprocessing_foursquare_five_city
+  name: foursquare_preprocess
   phase: preprocessing
 
 data:
@@ -28,4 +30,4 @@ preprocessing:
     path: null
 
 output:
-  output_dir: outputs/preprocessing/foursquare_five_city
+  output_dir: outputs/preprocessing

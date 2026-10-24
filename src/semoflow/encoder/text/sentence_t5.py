@@ -16,7 +16,7 @@ from semoflow.encoder.artifacts import (
 )
 
 if TYPE_CHECKING:
-    from semoflow.config.schemas import TextEncoderConfig
+    from semoflow.config.schemas.encoder_config import TextEncoderConfig
 
 logger = logging.getLogger(__name__)
 

@@ -88,7 +88,7 @@ def visit_count_jsd(
     tokens_real: torch.Tensor,
     tokens_gen: torch.Tensor,
     *,
-    pad_id: int = 0,
+    pad_id: int = PAD_ID,
 ) -> float:
     max_len = max(tokens_real.size(1), tokens_gen.size(1))
     counts_real = (tokens_real != pad_id).sum(dim=1)
@@ -103,7 +103,7 @@ def od_pair_jsd(
     tokens_gen: torch.Tensor,
     vocab_size: int,
     *,
-    pad_id: int = 0,
+    pad_id: int = PAD_ID,
     max_vocab: int = 500,
 ) -> float | None:
     if vocab_size > max_vocab:
@@ -150,7 +150,7 @@ def token_change_count_jsd(
     tokens_real: torch.Tensor,
     tokens_gen: torch.Tensor,
     *,
-    pad_id: int = 0,
+    pad_id: int = PAD_ID,
 ) -> float:
     def _change_counts(tokens: torch.Tensor) -> torch.Tensor:
         t = tokens.long()
@@ -163,23 +163,6 @@ def token_change_count_jsd(
     p = _change_counts(tokens_real)
     q = _change_counts(tokens_gen)
     return jsd(p, q)
-
-
-def token_sequence_min_distance(
-    tokens_gen: torch.Tensor,
-    tokens_train: torch.Tensor,
-    *,
-    pad_id: int = 0,
-    max_train: int = 200,
-    max_gen: int = 200,
-) -> float:
-    r = tokens_gen[:max_gen]
-    t = tokens_train[:max_train]
-    mismatch = (r.unsqueeze(1) != t.unsqueeze(0)).float()
-    valid = ((r.unsqueeze(1) != pad_id) | (t.unsqueeze(0) != pad_id)).float()
-    hamming = mismatch.sum(-1) / valid.sum(-1).clamp(min=1)
-    min_dist = hamming.min(dim=1).values
-    return float(min_dist.mean().item())
 
 
 def unique_location_count_jsd(

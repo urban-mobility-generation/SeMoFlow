@@ -23,21 +23,18 @@ def log_run_start(
     name: str,
     phase: str,
     output_dir: Path,
-    device: str,
-    seed: int,
+    device: str | None = None,
+    seed: int | None = None,
 ) -> None:
+    rows = [
+        ("experiment", name),
+        ("phase", phase),
+        ("output_dir", output_dir),
+        ("device", device),
+        ("seed", seed),
+    ]
     log_section(logger, "Run Start")
-    log_kv_block(
-        logger,
-        None,
-        [
-            ("experiment", name),
-            ("phase", phase),
-            ("output_dir", output_dir),
-            ("device", device),
-            ("seed", seed),
-        ],
-    )
+    log_kv_block(logger, None, [row for row in rows if row[1] is not None])
     log_section_end(logger)
 
 

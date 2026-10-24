@@ -83,6 +83,7 @@ def _align_embeddings(
         embedding_index.select([id_column, "embedding_row"]),
         on=id_column,
         how="left",
+        maintain_order="left",
     )
     if joined["embedding_row"].null_count() > 0:
         return None
@@ -100,7 +101,6 @@ def build_simple_baseline_lookups(
     seed: int = 20260729,
     text_embeddings: np.ndarray | None = None,
     graph_embeddings: np.ndarray | None = None,
-    embedding_index: pl.DataFrame | None = None,
     text_embedding_index: pl.DataFrame | None = None,
     graph_embedding_index: pl.DataFrame | None = None,
 ) -> dict[str, pl.DataFrame]:
@@ -108,7 +108,7 @@ def build_simple_baseline_lookups(
     id_column = (
         "placekey_id" if "placekey_id" in catalog.columns else "placekey"
     )
-    frame = catalog.unique(subset=[id_column])
+    frame = catalog.unique(subset=[id_column], maintain_order=True)
     result: dict[str, pl.DataFrame] = {}
 
     ids = _factorize(frame[id_column].to_list())
@@ -152,52 +152,34 @@ def build_simple_baseline_lookups(
                 code_cols,
             )
 
-    if text_embedding_index is None:
-        text_embedding_index = embedding_index
-    if graph_embedding_index is None:
-        graph_embedding_index = embedding_index
-    if text_embedding_index is not None or graph_embedding_index is not None:
-        for name, embeddings in (
-            ("text_kmeans", text_embeddings),
-            ("graph_kmeans", graph_embeddings),
-        ):
-            if embeddings is None:
-                continue
-            current_index = (
-                text_embedding_index
-                if name == "text_kmeans"
-                else graph_embedding_index
-            )
-            if current_index is None:
-                continue
-            aligned = _align_embeddings(
-                frame,
-                embeddings,
-                current_index,
-                id_column=id_column,
-            )
-            if aligned is None or len(aligned) < 2:
-                continue
-            try:
-                from sklearn.cluster import KMeans
-            except ImportError:
-                continue
-            n_clusters = min(codebook_size, len(aligned))
-            labels = KMeans(
-                n_clusters=n_clusters,
-                n_init=10,
-                random_state=seed,
-            ).fit_predict(aligned)
-            result[name] = _with_codes(
-                frame,
-                _suffix_balanced_codes(
-                    labels,
-                    n_codebooks=n_codebooks,
-                    codebook_size=codebook_size,
-                    seed=seed,
-                ),
-                code_cols,
-            )
+    for name, embeddings, embedding_index in (
+        ("text_kmeans", text_embeddings, text_embedding_index),
+        ("graph_kmeans", graph_embeddings, graph_embedding_index),
+    ):
+        if embeddings is None or embedding_index is None:
+            continue
+        aligned = _align_embeddings(
+            frame, embeddings, embedding_index, id_column=id_column
+        )
+        if aligned is None or len(aligned) < 2:
+            continue
+        from sklearn.cluster import KMeans
+
+        labels = KMeans(
+            n_clusters=min(codebook_size, len(aligned)),
+            n_init=10,
+            random_state=seed,
+        ).fit_predict(aligned)
+        result[name] = _with_codes(
+            frame,
+            _suffix_balanced_codes(
+                labels,
+                n_codebooks=n_codebooks,
+                codebook_size=codebook_size,
+                seed=seed,
+            ),
+            code_cols,
+        )
     return result
 
 

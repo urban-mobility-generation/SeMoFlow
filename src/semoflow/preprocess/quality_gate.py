@@ -33,7 +33,9 @@ class QualityGate:
         qualified = stats.filter(
             pl.col("quality_score") >= self.config.min_quality_score
         ).select("device_key")
-        filtered = scored_stays.join(qualified, on="device_key", how="semi")
+        filtered = scored_stays.join(
+            qualified, on="device_key", how="semi", maintain_order="left"
+        )
 
         logger.info(
             "quality_gate  devices_in=%d  devices_kept=%d  "
@@ -73,7 +75,7 @@ class QualityGate:
         )
         poi_expr = pl.col(poi_col).n_unique() if poi_col else pl.lit(1)
 
-        stats = stays.group_by("device_key").agg(
+        stats = stays.group_by("device_key", maintain_order=True).agg(
             [
                 pl.len().cast(pl.Int32).alias("n_stays"),
                 pl.col(ts_col).min().alias("first_stay"),

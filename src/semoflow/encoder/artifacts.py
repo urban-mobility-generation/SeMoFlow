@@ -8,6 +8,8 @@ import numpy as np
 import polars as pl
 import torch
 
+from semoflow.utils.serialization import write_json
+
 _SIDECAR_BY_ARTIFACT_NAME: dict[str, tuple[str, ...]] = {
     "poi_graph_emb.pt": ("places_index.parquet",),
     "cf_embeddings.pt": ("cf_index.parquet",),
@@ -111,9 +113,8 @@ def write_poi_embedding_artifact(
         torch.save(artifact.embeddings, output)
     index.write_parquet(_embedding_index_path(output))
     if metadata is not None:
-        _embedding_index_path(output).with_suffix(".json").write_text(
-            json.dumps(metadata, sort_keys=True, indent=2) + "\n",
-            encoding="utf-8",
+        write_json(
+            _embedding_index_path(output).with_suffix(".json"), metadata
         )
     return artifact
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import pickle
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
@@ -11,9 +12,7 @@ from typing import Any, cast
 import numpy as np
 import polars as pl
 
-from semoflow.tokenization.token_space import (
-    sid_code_columns,
-)
+from semoflow.tokenization.token_space import sid_code_columns
 
 CodeKey = tuple[int, ...]
 
@@ -47,6 +46,14 @@ def _row_key(
     if order_agnostic:
         return tuple(sorted(int(row[col]) for col in key_columns))
     return tuple(int(row[col]) for col in key_columns)
+
+
+def pack_code_rows(rows: np.ndarray) -> np.ndarray:
+    """Pack each row of byte-sized codes into one uint64 key."""
+    packed = np.zeros(rows.shape[0], dtype=np.uint64)
+    for column in range(rows.shape[1]):
+        packed |= rows[:, column].astype(np.uint64) << (8 * column)
+    return packed
 
 
 def _purity(values: Iterable[Any]) -> float | None:
@@ -173,22 +180,23 @@ class SemanticIDGroundingIndex:
         key = self._lookup_key(code_values)
         return [dict(item) for item in self._mapping.get(key, [])]
 
-    def packed_lookup_table(
+    @functools.cached_property
+    def _packed_lookup(
         self,
-    ) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
-        cached = getattr(self, "_packed_lookup_cache", None)
-        if cached is not None:
-            return cached
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        list[dict[str, Any]],
+        list[list[dict[str, Any]]],
+    ]:
+        """Sorted packed keys with each key's candidate count and payloads."""
         if not self._mapping:
-            empty = (
+            return (
                 np.empty(0, dtype=np.uint64),
                 np.empty(0, dtype=np.int32),
                 [],
+                [],
             )
-            self._packed_lookup_cache = empty
-            self._packed_lookup_groups_cache = []
-            return empty
-
         key_rows = np.asarray(list(self._mapping), dtype=np.int64)
         if key_rows.ndim != 2 or key_rows.shape[1] != len(self.key_columns):
             raise ValueError("grounding index keys have inconsistent widths")
@@ -196,34 +204,25 @@ class SemanticIDGroundingIndex:
             raise ValueError(
                 "bulk grounding lookup supports code values in [0, 255]"
             )
-        packed = np.zeros(key_rows.shape[0], dtype=np.uint64)
-        for column in range(key_rows.shape[1]):
-            packed |= key_rows[:, column].astype(np.uint64) << (8 * column)
+        packed = pack_code_rows(key_rows)
         order = np.argsort(packed, kind="mergesort")
         payload_rows = list(self._mapping.values())
-        table = (
+        groups = [payload_rows[int(index)] for index in order]
+        return (
             packed[order],
-            np.asarray(
-                [len(payload_rows[int(index)]) for index in order],
-                dtype=np.int32,
-            ),
-            [payload_rows[int(index)][0] for index in order],
+            np.asarray([len(group) for group in groups], dtype=np.int32),
+            [group[0] for group in groups],
+            groups,
         )
-        self._packed_lookup_cache = table
-        self._packed_lookup_groups_cache = [
-            payload_rows[int(index)] for index in order
-        ]
-        return table
 
-    def packed_lookup_groups(self) -> list[Sequence[Mapping[str, Any]]]:
-        cached = getattr(self, "_packed_lookup_groups_cache", None)
-        if cached is None:
-            self._packed_lookup_cache = None
-            self.packed_lookup_table()
-            cached = getattr(self, "_packed_lookup_groups_cache", None)
-        if cached is None:
-            raise RuntimeError("failed to build packed candidate groups")
-        return cached
+    def packed_lookup_table(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
+        keys, counts, first_payloads, _groups = self._packed_lookup
+        return keys, counts, first_payloads
+
+    def packed_lookup_groups(self) -> list[list[dict[str, Any]]]:
+        return self._packed_lookup[3]
 
     def _lookup_key(
         self, code_values: Sequence[int] | Mapping[str, int]
@@ -326,4 +325,4 @@ class SemanticIDGroundingIndex:
         return obj
 
 
-__all__ = ["GroundingStats", "SemanticIDGroundingIndex"]
+__all__ = ["GroundingStats", "SemanticIDGroundingIndex", "pack_code_rows"]

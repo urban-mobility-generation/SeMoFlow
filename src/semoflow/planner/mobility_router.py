@@ -283,6 +283,45 @@ class ExploreRetrieveRouter(nn.Module):
             residual = residual + self.gate_prior_module(distinct_prefix_count)
         return residual.masked_fill(~history_available, _NEG_INF)
 
+    def _route(
+        self,
+        query_states: torch.Tensor,
+        memory_states: torch.Tensor,
+        expert_log_probabilities: tuple[torch.Tensor, ...],
+        history_mask: torch.Tensor,
+        distinct_prefix_count: torch.Tensor,
+    ) -> ExploreRetrieveRoutingOutput:
+        """Mix the retrieval experts and gate retrieval against exploration;
+        rows without history always explore."""
+        mechanism_log_weights = F.log_softmax(
+            self.mechanism_router(query_states).float(), dim=-1
+        )
+        history_available = history_mask.any(dim=-1)
+        retrieval_log_probability = _mix_expert_log_probabilities(
+            expert_log_probabilities,
+            mechanism_log_weights,
+            history_mask,
+            history_available,
+        )
+        retrieve_logit = self._router_logit(
+            query_states,
+            memory_states,
+            retrieval_log_probability,
+            distinct_prefix_count,
+            history_available,
+        )
+        retrieve_probability = torch.sigmoid(retrieve_logit).masked_fill(
+            ~history_available, 0.0
+        )
+        return ExploreRetrieveRoutingOutput(
+            retrieve_logit=retrieve_logit,
+            retrieve_probability=retrieve_probability,
+            mechanism_weights=mechanism_log_weights.exp(),
+            retrieval_log_probability=retrieval_log_probability,
+            history_mask=history_mask,
+            distinct_prefix_count=distinct_prefix_count,
+        )
+
     def forward_step(
         self,
         query_state: torch.Tensor,
@@ -309,38 +348,16 @@ class ExploreRetrieveRouter(nn.Module):
         neural_log_probability = self._neural_expert(
             query_state[:, None, :], memory_states, history_mask[:, None, :]
         ).squeeze(1)
-        expert_log_probabilities = (
-            neural_log_probability,
-            self._frequency_expert(frequency_count, history_mask),
-            self._last_expert(history_mask),
-        )
-        mechanism_log_weights = F.log_softmax(
-            self.mechanism_router(query_state).float(), dim=-1
-        )
-        history_available = history_mask.any(dim=-1)
-        retrieval_log_probability = _mix_expert_log_probabilities(
-            expert_log_probabilities,
-            mechanism_log_weights,
-            history_mask,
-            history_available,
-        )
-        retrieve_logit = self._router_logit(
+        return self._route(
             query_state,
             memory_states,
-            retrieval_log_probability,
+            (
+                neural_log_probability,
+                self._frequency_expert(frequency_count, history_mask),
+                self._last_expert(history_mask),
+            ),
+            history_mask,
             distinct_prefix_count,
-            history_available,
-        )
-        retrieve_probability = torch.sigmoid(retrieve_logit).masked_fill(
-            ~history_available, 0.0
-        )
-        return ExploreRetrieveRoutingOutput(
-            retrieve_logit=retrieve_logit,
-            retrieve_probability=retrieve_probability,
-            mechanism_weights=mechanism_log_weights.exp(),
-            retrieval_log_probability=retrieval_log_probability,
-            history_mask=history_mask,
-            distinct_prefix_count=distinct_prefix_count,
         )
 
     def forward(
@@ -370,39 +387,16 @@ class ExploreRetrieveRouter(nn.Module):
             history_mask,
             distinct_prefix_count,
         ) = _prefix_statistics(memory_prefix_codes, causal_history_mask)
-        expert_log_probabilities = (
-            self._neural_expert(query_states, memory_states, history_mask),
-            self._frequency_expert(frequency_count, history_mask),
-            self._last_expert(history_mask),
-        )
-        mechanism_log_weights = F.log_softmax(
-            self.mechanism_router(query_states).float(), dim=-1
-        )
-        history_available = history_mask.any(dim=-1)
-        retrieval_log_probability = _mix_expert_log_probabilities(
-            expert_log_probabilities,
-            mechanism_log_weights,
-            history_mask,
-            history_available,
-        )
-        retrieve_logit = self._router_logit(
+        return self._route(
             query_states,
             memory_states,
-            retrieval_log_probability,
+            (
+                self._neural_expert(query_states, memory_states, history_mask),
+                self._frequency_expert(frequency_count, history_mask),
+                self._last_expert(history_mask),
+            ),
+            history_mask,
             distinct_prefix_count,
-            history_available,
-        )
-        retrieve_probability = torch.sigmoid(retrieve_logit)
-        retrieve_probability = retrieve_probability.masked_fill(
-            ~history_available, 0.0
-        )
-        return ExploreRetrieveRoutingOutput(
-            retrieve_logit=retrieve_logit,
-            retrieve_probability=retrieve_probability,
-            mechanism_weights=mechanism_log_weights.exp(),
-            retrieval_log_probability=retrieval_log_probability,
-            history_mask=history_mask,
-            distinct_prefix_count=distinct_prefix_count,
         )
 
 

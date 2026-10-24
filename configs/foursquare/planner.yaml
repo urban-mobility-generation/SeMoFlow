@@ -1,0 +1,51 @@
+# Occurrence planner for the Foursquare five-city catalog. `build` derives
+# the weekly segments and the planner dataset from the tokenizer outputs of
+# configs/foursquare/tokenizer.yaml, with that tokenizer's codebook size.
+#
+#   uv run semoflow-artifacts build --config configs/foursquare/planner.yaml
+#   uv run semoflow-train planner --config configs/foursquare/planner.yaml
+#
+# training.device: cpu, cuda:N, or "[0,1,...]" (quoted) to spawn one DDP rank
+# per listed GPU.
+
+experiment:
+  name: foursquare_planner
+  phase: planner
+
+planner:
+  # Keep weeks with at least two active days, truncate each to 128 visits,
+  # and condition the planner on the week's city.
+  data:
+    tokenization_dir: outputs/tokenization
+    places_path: outputs/preprocessing/places_index.parquet
+    segments_path: outputs/segments.parquet
+    min_active_days: 2
+    max_occurrences: 128
+    context_mode: city
+
+  dataset_path: outputs/planner_dataset.pt
+  output_dir: outputs/planner
+  seed: 0
+
+  architecture:
+    model_dim: 256
+    n_heads: 8
+    n_layers: 6
+    dropout: 0.2
+    prefix_decoder: hierarchical
+    mobility_router: explore_retrieve
+    mobility_gate_prior: log_distinct
+    use_distance_prior: true
+
+  training:
+    epochs: 60
+    batch_size: 512
+    learning_rate: 0.0003
+    weight_decay: 0.0001
+    lr_scheduler: cosine
+    warmup_steps: 100
+    min_lr: 0.00003
+    early_stopping_patience: 5
+    num_workers: 8
+    compile_model: true
+    device: cuda:0

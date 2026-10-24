@@ -8,12 +8,16 @@ from typing import Annotated, cast
 import typer
 
 from semoflow.cli.common import (
+    ConfigOpt,
     ForceOpt,
     LogLevelOpt,
+    SetArgsOpt,
     bad_parameter_on,
     echo_json,
+    resolve_cli_config,
 )
 from semoflow.logging.primitives import configure_logging
+from semoflow.utils.serialization import write_json
 
 app = typer.Typer(
     help="Derive and assemble identity-keyed SeMoFlow artifacts.",
@@ -23,8 +27,42 @@ app = typer.Typer(
 
 
 @app.command(
+    "build",
+    help=(
+        "Build a stage's training data from its config: the weekly segments "
+        "and planner dataset for a planner config, or the bank for a "
+        "realizer config."
+    ),
+)
+def build_cmd(
+    config: ConfigOpt = None,
+    set_args: SetArgsOpt = None,
+    force: ForceOpt = False,
+    log_level: LogLevelOpt = "INFO",
+) -> None:
+    from semoflow.planner.dataset_build import build_planner_data
+    from semoflow.realizer.bank import build_realizer_data
+
+    cfg = resolve_cli_config(config, set_args, log_level=log_level)
+    with bad_parameter_on(FileExistsError, OSError, TypeError, ValueError):
+        if cfg.planner is not None and cfg.planner.data is not None:
+            result = build_planner_data(
+                cfg.planner.data,
+                dataset_path=cfg.planner.dataset_path,
+                force=force,
+            )
+        elif cfg.realizer is not None and cfg.realizer.data is not None:
+            result = build_realizer_data(cfg.realizer)
+        else:
+            raise ValueError(
+                "--config must define planner.data or realizer.data"
+            )
+    echo_json(result)
+
+
+@app.command(
     "build-weekly-segments",
-    help=("Build the weekly segment cache read by the planner and realizer."),
+    help="Build the weekly segment cache read by the planner and realizer.",
 )
 def build_weekly_segments_cmd(
     stays: Annotated[
@@ -42,9 +80,7 @@ def build_weekly_segments_cmd(
     log_level: LogLevelOpt = "INFO",
 ) -> None:
     configure_logging(level=log_level)
-    from semoflow.preprocess.weekly_segments import (
-        build_weekly_segment_cache,
-    )
+    from semoflow.preprocess.weekly_segments import build_weekly_segment_cache
 
     with bad_parameter_on(FileExistsError, OSError, ValueError):
         result = build_weekly_segment_cache(
@@ -88,9 +124,7 @@ def build_realizer_bank_cmd(
     log_level: LogLevelOpt = "INFO",
 ) -> None:
     configure_logging(level=log_level)
-    from semoflow.realizer.bank import (
-        build_bank,
-    )
+    from semoflow.realizer.bank import build_bank
 
     with bad_parameter_on(OSError, TypeError, ValueError):
         result = build_bank(
@@ -118,19 +152,45 @@ def build_grounding_candidate_prior_cmd(
     log_level: LogLevelOpt = "INFO",
 ) -> None:
     configure_logging(level=log_level)
-    from semoflow.metrics.grounding_candidate_prior import (
-        build_prior,
-    )
+    from semoflow.metrics.grounding_candidate_prior import build_prior
 
     with bad_parameter_on(OSError, TypeError, ValueError):
         prior = build_prior(bank, split=split)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(
-            json.dumps(prior, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        write_json(output, prior)
     summary = {key: value for key, value in prior.items() if key != "counts"}
     echo_json({"output": str(output), **summary})
+
+
+@app.command(
+    "extract-city",
+    help=(
+        "Write one city's segments, SID lookup, and grounding index from "
+        "joint multi-city artifacts, for per-city banks, priors, and "
+        "composition."
+    ),
+)
+def extract_city_cmd(
+    city_id: Annotated[int, typer.Option("--city-id")],
+    segments: Annotated[Path, typer.Option("--segments")],
+    lookup: Annotated[Path, typer.Option("--lookup")],
+    grounding_index: Annotated[Path, typer.Option("--grounding-index")],
+    output_dir: Annotated[Path, typer.Option("--output-dir")],
+    force: ForceOpt = False,
+    log_level: LogLevelOpt = "INFO",
+) -> None:
+    configure_logging(level=log_level)
+    from semoflow.metrics.city_inputs import extract_city_inputs
+
+    with bad_parameter_on(FileExistsError, OSError, TypeError, ValueError):
+        result = extract_city_inputs(
+            city_id,
+            segments=segments,
+            lookup=lookup,
+            grounding_index=grounding_index,
+            output_dir=output_dir,
+            force=force,
+        )
+    echo_json(result)
 
 
 def _parse_sources(values: list[str]) -> dict[int, Path]:
@@ -151,7 +211,7 @@ def _parse_sources(values: list[str]) -> dict[int, Path]:
 
 @app.command(
     "subset-cities",
-    help=("Derive a remapped city subset from joint preprocessing artifacts."),
+    help="Derive a remapped city subset from joint preprocessing artifacts.",
 )
 def subset_cities_cmd(
     source_dir: Annotated[Path, typer.Option("--source-dir")],
@@ -160,9 +220,7 @@ def subset_cities_cmd(
     log_level: LogLevelOpt = "INFO",
 ) -> None:
     configure_logging(level=log_level)
-    from semoflow.preprocess.city_subset import (
-        derive_city_subset,
-    )
+    from semoflow.preprocess.city_subset import derive_city_subset
 
     result = derive_city_subset(source_dir, output_dir, city_ids)
     echo_json(result.to_dict())
@@ -185,9 +243,7 @@ def assemble_text_cmd(
     log_level: LogLevelOpt = "INFO",
 ) -> None:
     configure_logging(level=log_level)
-    from semoflow.encoder.text.assembly import (
-        assemble_text_embeddings,
-    )
+    from semoflow.encoder.text.assembly import assemble_text_embeddings
 
     result = assemble_text_embeddings(
         places_index, _parse_sources(source), output
@@ -197,7 +253,7 @@ def assemble_text_cmd(
 
 @app.command(
     "size-tokenizer",
-    help=("Estimate a city's tokenizer codebook size and residual depth."),
+    help="Estimate a city's tokenizer codebook size and residual depth.",
 )
 def size_tokenizer_cmd(
     places: Annotated[Path, typer.Option("--places")],
@@ -284,7 +340,7 @@ def assemble_composed_tokenizer_cmd(
 
 @app.command(
     "category-relative-geo-assignment",
-    help=("Derive a category + city-relative geography control tokenizer."),
+    help="Derive a category + city-relative geography control tokenizer.",
 )
 def category_relative_geo_assignment_cmd(
     source_dir: Annotated[
@@ -493,9 +549,7 @@ def build_occurrence_planner_dataset_cmd(
     log_level: LogLevelOpt = "INFO",
 ) -> None:
     configure_logging(level=log_level)
-    from semoflow.planner.dataset_build import (
-        build_occurrence_planner_dataset,
-    )
+    from semoflow.planner.dataset_build import build_occurrence_planner_dataset
 
     with bad_parameter_on(FileExistsError, TypeError, ValueError):
         result = build_occurrence_planner_dataset(
@@ -537,14 +591,16 @@ def build_occurrence_planner_conditions_cmd(
     log_level: LogLevelOpt = "INFO",
 ) -> None:
     configure_logging(level=log_level)
+    import polars as pl
+
     from semoflow.planner.conditions_build import (
         build_occurrence_planner_conditions,
     )
 
-    with bad_parameter_on(FileExistsError, TypeError, ValueError):
+    with bad_parameter_on(FileExistsError, OSError, TypeError, ValueError):
         result = build_occurrence_planner_conditions(
             checkpoint_path=checkpoint,
-            input_path=input_path,
+            rows=pl.read_parquet(input_path),
             output_path=output,
             force=force,
         )
@@ -600,7 +656,7 @@ def build_budget_ladder_cmd(
 
 @app.command(
     "build-budget-rung-visits",
-    help=("Write one rung's inner-role visits for the rung's visit graph."),
+    help="Write one rung's inner-role visits for the rung's visit graph.",
 )
 def build_budget_rung_visits_cmd(
     visits: Annotated[Path, typer.Option("--visits")],
@@ -613,9 +669,7 @@ def build_budget_rung_visits_cmd(
     log_level: LogLevelOpt = "INFO",
 ) -> None:
     configure_logging(level=log_level)
-    from semoflow.cross_city.budget_ladder import (
-        build_rung_visits,
-    )
+    from semoflow.cross_city.budget_ladder import build_rung_visits
 
     with bad_parameter_on(*_ARTIFACT_ERRORS):
         result = build_rung_visits(
@@ -630,7 +684,7 @@ def build_budget_rung_visits_cmd(
 
 @app.command(
     "build-budget-rung-augmented-visits",
-    help=("Write one rung's union-numbered, SID-coded visits for SID banks."),
+    help="Write one rung's union-numbered, SID-coded visits for SID banks.",
 )
 def build_budget_rung_augmented_visits_cmd(
     visits: Annotated[Path, typer.Option("--visits")],
@@ -646,9 +700,7 @@ def build_budget_rung_augmented_visits_cmd(
     log_level: LogLevelOpt = "INFO",
 ) -> None:
     configure_logging(level=log_level)
-    from semoflow.cross_city.budget_ladder import (
-        build_rung_augmented_visits,
-    )
+    from semoflow.cross_city.budget_ladder import build_rung_augmented_visits
 
     with bad_parameter_on(*_ARTIFACT_ERRORS):
         result = build_rung_augmented_visits(
@@ -665,7 +717,7 @@ def build_budget_rung_augmented_visits_cmd(
 
 @app.command(
     "build-holdout-reference-panel",
-    help=("Select the campaign's fixed, seed-determined held-out reference."),
+    help="Select the campaign's fixed, seed-determined held-out reference.",
 )
 def build_holdout_reference_panel_cmd(
     segments: Annotated[Path, typer.Option("--segments")],
@@ -679,9 +731,7 @@ def build_holdout_reference_panel_cmd(
     log_level: LogLevelOpt = "INFO",
 ) -> None:
     configure_logging(level=log_level)
-    from semoflow.cross_city.budget_ladder import (
-        build_holdout_reference_panel,
-    )
+    from semoflow.cross_city.budget_ladder import build_holdout_reference_panel
 
     with bad_parameter_on(*_ARTIFACT_ERRORS):
         result = build_holdout_reference_panel(
@@ -743,7 +793,7 @@ def build_budget_rung_segments_cmd(
 
 @app.command(
     "build-union-lookup",
-    help=("Union a source multi-city lookup with a renumbered target lookup."),
+    help="Union a source multi-city lookup with a renumbered target lookup.",
 )
 def build_union_lookup_cmd(
     source_lookup: Annotated[Path, typer.Option("--source-lookup")],
@@ -753,9 +803,7 @@ def build_union_lookup_cmd(
     log_level: LogLevelOpt = "INFO",
 ) -> None:
     configure_logging(level=log_level)
-    from semoflow.cross_city.union_catalog import (
-        build_union_lookup,
-    )
+    from semoflow.cross_city.union_catalog import build_union_lookup
 
     with bad_parameter_on(*_ARTIFACT_ERRORS):
         result = build_union_lookup(
@@ -781,9 +829,7 @@ def build_union_places_index_cmd(
     log_level: LogLevelOpt = "INFO",
 ) -> None:
     configure_logging(level=log_level)
-    from semoflow.cross_city.union_catalog import (
-        build_union_places_index,
-    )
+    from semoflow.cross_city.union_catalog import build_union_places_index
 
     with bad_parameter_on(*_ARTIFACT_ERRORS):
         result = build_union_places_index(
@@ -815,9 +861,7 @@ def build_union_grounding_index_cmd(
     log_level: LogLevelOpt = "INFO",
 ) -> None:
     configure_logging(level=log_level)
-    from semoflow.cross_city.union_catalog import (
-        build_union_grounding_index,
-    )
+    from semoflow.cross_city.union_catalog import build_union_grounding_index
 
     with bad_parameter_on(*_ARTIFACT_ERRORS):
         result = build_union_grounding_index(
@@ -859,9 +903,7 @@ def derive_target_city_tokenizer_cmd(
     log_level: LogLevelOpt = "INFO",
 ) -> None:
     configure_logging(level=log_level)
-    from semoflow.tokenization.target_city import (
-        derive_target_city_tokenizer,
-    )
+    from semoflow.tokenization.target_city import derive_target_city_tokenizer
 
     with bad_parameter_on(*_ARTIFACT_ERRORS):
         result = derive_target_city_tokenizer(

@@ -26,7 +26,7 @@ def codebook_utilization_by_level(
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for level, column in enumerate(key_columns):
-        counts = frame[column].value_counts()["count"].to_numpy().astype(float)
+        counts = frame[column].value_counts().sort(column)["count"].to_numpy()
         share = counts / counts.sum()
         entropy_bits = float(-(share * np.log2(share)).sum())
         rows.append(
@@ -73,6 +73,7 @@ def _size_weighted_geo_radius_km(
             pl.len().alias("count"),
         )
         .filter(pl.col("count") > 1)
+        .sort(prefix)
     )
     if grouped.height == 0:
         return 0.0
@@ -206,14 +207,22 @@ def covisitation_coherence(
         same = joined.filter(pl.col("_src_bucket") == pl.col("_dst_bucket"))
         observed = float(same["w"].sum()) / total
 
-        out_mass = joined.group_by("_src_bucket").agg(
-            pl.col("w").sum().alias("out")
+        out_mass = (
+            joined.group_by("_src_bucket")
+            .agg(pl.col("w").sum().alias("out"))
+            .sort("_src_bucket")
         )
-        in_mass = joined.group_by("_dst_bucket").agg(
-            pl.col("w").sum().alias("inn")
+        in_mass = (
+            joined.group_by("_dst_bucket")
+            .agg(pl.col("w").sum().alias("inn"))
+            .sort("_dst_bucket")
         )
         marg = out_mass.join(
-            in_mass, left_on="_src_bucket", right_on="_dst_bucket", how="full"
+            in_mass,
+            left_on="_src_bucket",
+            right_on="_dst_bucket",
+            how="full",
+            maintain_order="left_right",
         ).fill_null(0)
         out_v = marg["out"].to_numpy().astype(float) / total
         in_v = marg["inn"].to_numpy().astype(float) / total
@@ -226,11 +235,13 @@ def covisitation_coherence(
                 ),
                 on="_src_bucket",
                 how="left",
+                maintain_order="left",
             )
             .join(
                 in_mass.rename({"_dst_bucket": "_src_bucket"}),
                 on="_src_bucket",
                 how="left",
+                maintain_order="left",
             )
             .fill_null(0)
             .filter(pl.col("out") > 0)

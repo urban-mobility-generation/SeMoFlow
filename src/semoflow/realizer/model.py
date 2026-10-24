@@ -24,6 +24,36 @@ def model_type(latent_target_scope: str) -> str:
     return "prefix_time_suffix_latent_flow_realizer"
 
 
+_ARCHITECTURE_CHOICES = {
+    "prefix_embedding_mode": ("learned", "hybrid_frozen_codebook"),
+    "tail_representation": ("summed", "factorized"),
+    "latent_target_scope": ("suffix", "full_sid"),
+    "catalog_decoder_mode": ("nearest", "calibrated"),
+}
+
+
+def _transformer_encoder(
+    model_dim: int,
+    *,
+    num_heads: int,
+    mlp_ratio: float,
+    dropout: float,
+    num_layers: int,
+) -> nn.TransformerEncoder:
+    layer = nn.TransformerEncoderLayer(
+        d_model=model_dim,
+        nhead=num_heads,
+        dim_feedforward=max(1, int(model_dim * mlp_ratio)),
+        dropout=dropout,
+        activation="gelu",
+        batch_first=True,
+        norm_first=True,
+    )
+    return nn.TransformerEncoder(
+        layer, num_layers=num_layers, enable_nested_tensor=False
+    )
+
+
 class PrefixTimeSuffixLatentFlowRealizer(nn.Module):
     def __init__(
         self,
@@ -71,32 +101,23 @@ class PrefixTimeSuffixLatentFlowRealizer(nn.Module):
             )
         if not 0.0 <= dropout <= 1.0:
             raise ValueError("dropout must be in [0, 1]")
-        if prefix_embedding_mode not in {
-            "learned",
-            "hybrid_frozen_codebook",
-        }:
-            raise ValueError(
-                "prefix_embedding_mode must be 'learned' or "
-                "'hybrid_frozen_codebook'"
-            )
-        if tail_representation not in {"summed", "factorized"}:
-            raise ValueError(
-                "tail_representation must be 'summed' or 'factorized'"
-            )
-        if latent_target_scope not in {"suffix", "full_sid"}:
-            raise ValueError(
-                "latent_target_scope must be 'suffix' or 'full_sid'"
-            )
+        for name, value in (
+            ("prefix_embedding_mode", prefix_embedding_mode),
+            ("tail_representation", tail_representation),
+            ("latent_target_scope", latent_target_scope),
+            ("catalog_decoder_mode", catalog_decoder_mode),
+        ):
+            choices = _ARCHITECTURE_CHOICES[name]
+            if value not in choices:
+                raise ValueError(
+                    f"{name} must be " + " or ".join(map(repr, choices))
+                )
         if (
             latent_target_scope == "full_sid"
             and tail_representation != "summed"
         ):
             raise ValueError(
                 "full-SID latent targets require tail_representation='summed'"
-            )
-        if catalog_decoder_mode not in {"nearest", "calibrated"}:
-            raise ValueError(
-                "catalog_decoder_mode must be 'nearest' or 'calibrated'"
             )
         if (
             tail_representation == "factorized"
@@ -111,13 +132,9 @@ class PrefixTimeSuffixLatentFlowRealizer(nn.Module):
                 raise ValueError(
                     "hybrid_frozen_codebook requires prefix_plan_codebooks"
                 )
-            if prefix_plan_codebooks.ndim != 3:
-                raise ValueError(
-                    "prefix_plan_codebooks must have shape "
-                    "[prefix_depth, codebook_size, embedding_dim]"
-                )
-            if prefix_plan_codebooks.shape[0] != prefix_depth or (
-                prefix_plan_codebooks.shape[1] != codebook_size
+            if prefix_plan_codebooks.ndim != 3 or (
+                prefix_plan_codebooks.shape[:2]
+                != (prefix_depth, codebook_size)
             ):
                 raise ValueError(
                     "prefix_plan_codebooks must have shape "
@@ -128,6 +145,12 @@ class PrefixTimeSuffixLatentFlowRealizer(nn.Module):
                 "prefix_plan_codebooks is only valid for "
                 "hybrid_frozen_codebook"
             )
+        if city_vocab < 0:
+            raise ValueError("city_vocab must be non-negative")
+        if spatial_conditioning and spatial_num_basis < 1:
+            raise ValueError("spatial_num_basis must be positive")
+        if spatial_conditioning and spatial_max_km <= 0.0:
+            raise ValueError("spatial_max_km must be positive")
 
         self.max_seq_len = int(max_seq_len)
         self.prefix_depth = int(prefix_depth)
@@ -145,16 +168,10 @@ class PrefixTimeSuffixLatentFlowRealizer(nn.Module):
         )
         self.target_depth = self.num_codebooks - self.target_level_start
         self.catalog_decoder_mode = catalog_decoder_mode
-        if city_vocab < 0:
-            raise ValueError("city_vocab must be non-negative")
         self.city_vocab = int(city_vocab)
         if self.city_vocab > 0:
             self.city_embedding = nn.Embedding(self.city_vocab, model_dim)
             nn.init.zeros_(self.city_embedding.weight)
-        if spatial_conditioning and spatial_num_basis < 1:
-            raise ValueError("spatial_num_basis must be positive")
-        if spatial_conditioning and spatial_max_km <= 0.0:
-            raise ValueError("spatial_max_km must be positive")
         self.spatial_conditioning = bool(spatial_conditioning)
         self.spatial_num_basis = int(spatial_num_basis)
         self.spatial_max_km = float(spatial_max_km)
@@ -210,19 +227,12 @@ class PrefixTimeSuffixLatentFlowRealizer(nn.Module):
             self.max_seq_len, self.model_dim
         )
 
-        condition_layer = nn.TransformerEncoderLayer(
-            d_model=self.model_dim,
-            nhead=num_heads,
-            dim_feedforward=max(1, int(self.model_dim * mlp_ratio)),
+        self.condition_encoder = _transformer_encoder(
+            self.model_dim,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
             dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.condition_encoder = nn.TransformerEncoder(
-            condition_layer,
             num_layers=condition_depth,
-            enable_nested_tensor=False,
         )
 
         self.input_projection = nn.Linear(self.flow_latent_dim, self.model_dim)
@@ -231,19 +241,12 @@ class PrefixTimeSuffixLatentFlowRealizer(nn.Module):
         self.flow_position_embedding = nn.Embedding(
             self.max_seq_len, self.model_dim
         )
-        flow_layer = nn.TransformerEncoderLayer(
-            d_model=self.model_dim,
-            nhead=num_heads,
-            dim_feedforward=max(1, int(self.model_dim * mlp_ratio)),
+        self.flow_trunk = _transformer_encoder(
+            self.model_dim,
+            num_heads=num_heads,
+            mlp_ratio=mlp_ratio,
             dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.flow_trunk = nn.TransformerEncoder(
-            flow_layer,
             num_layers=depth,
-            enable_nested_tensor=False,
         )
         self.output_norm = nn.LayerNorm(self.model_dim)
         self.output_projection = nn.Linear(

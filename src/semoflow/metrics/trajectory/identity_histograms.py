@@ -79,7 +79,7 @@ def rowwise_jsd_counts(real: np.ndarray, generated: np.ndarray) -> np.ndarray:
     return result
 
 
-def _torch_rowwise_jsd_counts(
+def torch_rowwise_jsd_counts(
     real: torch.Tensor, generated: torch.Tensor
 ) -> torch.Tensor:
     real = real.to(dtype=torch.float64)
@@ -143,7 +143,7 @@ def cluster_bootstrap_histogram_jsd(
             generated_by_cluster, dtype=torch.float64, device=device
         )
         draws = (
-            _torch_rowwise_jsd_counts(
+            torch_rowwise_jsd_counts(
                 weights @ real_clusters,
                 weights @ generated_clusters,
             )
@@ -182,4 +182,5 @@ __all__ = [
     "identity_histogram_contributions",
     "normalise_histograms",
     "rowwise_jsd_counts",
+    "torch_rowwise_jsd_counts",
 ]

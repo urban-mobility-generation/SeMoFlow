@@ -13,6 +13,7 @@ from typing import Any
 import torch
 
 from semoflow.config import ExperimentConfig
+from semoflow.utils.serialization import write_json
 
 logger = logging.getLogger(__name__)
 
@@ -131,10 +132,7 @@ def write_graph_data_cache(
             "built_at": datetime.datetime.now(datetime.UTC).isoformat(),
             "payload": graph_data_cache_payload(cfg),
         }
-        Path(tmp_meta).write_text(
-            json.dumps(meta, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        write_json(Path(tmp_meta), meta)
         os.replace(tmp_payload, payload_path)
         os.replace(tmp_meta, meta_path)
         logger.info("graph_data_cache wrote path=%s", cache_dir)

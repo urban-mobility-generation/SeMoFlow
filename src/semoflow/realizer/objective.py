@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Self
 
@@ -184,6 +185,146 @@ class CatalogCandidateBatch:
     valid_mask: torch.BoolTensor
 
 
+def _count_catalog_occurrences(
+    catalog_keys: torch.Tensor,
+    observed_codes: torch.Tensor,
+    observed_valid_mask: torch.BoolTensor | None,
+    *,
+    codebook_size: int,
+    width: int,
+    count_device: torch.device | str | None,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Count how often each catalog SID occurs among the observed codes."""
+    if observed_codes.ndim not in (2, 3):
+        raise ValueError("observed_codes must have shape [N, M] or [B, L, M]")
+    if observed_codes.shape[-1] != width:
+        raise ValueError("observed_codes and catalog have different widths")
+    if observed_codes.ndim == 3:
+        if (
+            observed_valid_mask is None
+            or observed_valid_mask.dtype != torch.bool
+            or observed_valid_mask.shape != observed_codes.shape[:2]
+        ):
+            raise ValueError(
+                "rank-three observed_codes require a boolean "
+                "observed_valid_mask with shape [B, L]"
+            )
+    elif observed_valid_mask is not None and (
+        observed_valid_mask.dtype != torch.bool
+        or observed_valid_mask.shape != observed_codes.shape[:1]
+    ):
+        raise ValueError("observed_valid_mask must align with observed_codes")
+    if chunk_size <= 0:
+        raise ValueError("count_chunk_size must be positive")
+
+    device = (
+        observed_codes.device
+        if count_device is None
+        else torch.device(count_device)
+    )
+    catalog_order = torch.argsort(catalog_keys, stable=True)
+    sorted_catalog_keys = catalog_keys[catalog_order].to(device)
+    sorted_counts = torch.zeros(
+        catalog_keys.numel(), dtype=torch.long, device=device
+    )
+    flat_observed = observed_codes.reshape(-1, width)
+    flat_mask = (
+        None
+        if observed_valid_mask is None
+        else observed_valid_mask.reshape(-1)
+    )
+    for start in range(0, flat_observed.size(0), chunk_size):
+        end = min(start + chunk_size, flat_observed.size(0))
+        chunk = flat_observed[start:end]
+        if flat_mask is not None:
+            chunk_mask = flat_mask[start:end]
+            if not chunk_mask.any():
+                continue
+            chunk = chunk[chunk_mask]
+        chunk_keys = _sid_keys(
+            chunk.to(device, dtype=torch.long, non_blocking=True),
+            codebook_size=codebook_size,
+            width=width,
+        )
+        positions = torch.searchsorted(sorted_catalog_keys, chunk_keys)
+        in_range = positions < sorted_catalog_keys.numel()
+        safe = positions.clamp_max(sorted_catalog_keys.numel() - 1)
+        matched = in_range & sorted_catalog_keys[safe].eq(chunk_keys)
+        sorted_counts.scatter_add_(
+            0, safe[matched], torch.ones_like(safe[matched])
+        )
+    counts = torch.zeros(catalog_keys.numel(), dtype=torch.long)
+    counts[catalog_order] = sorted_counts.cpu()
+    return counts
+
+
+def _global_candidate_rows(
+    catalog_counts: torch.Tensor, max_candidates: int
+) -> torch.Tensor:
+    """Most frequent half of the budget, then evenly spaced coverage."""
+    frequency_order = torch.argsort(
+        catalog_counts, descending=True, stable=True
+    )
+    if catalog_counts.numel() <= max_candidates:
+        return frequency_order
+    frequent_count = max_candidates // 2
+    frequent = frequency_order[:frequent_count]
+    remaining_mask = torch.ones(catalog_counts.numel(), dtype=torch.bool)
+    remaining_mask[frequent] = False
+    remainder = torch.where(remaining_mask)[0]
+    positions = (
+        torch.linspace(
+            0, remainder.numel() - 1, steps=max_candidates - frequent_count
+        )
+        .round()
+        .long()
+    )
+    return torch.cat((frequent, remainder[positions]))
+
+
+def _prefix_candidate_rows(
+    rows: list[int],
+    *,
+    catalog_counts: torch.Tensor,
+    catalog_rows: list[list[int]],
+    max_candidates: int,
+) -> torch.Tensor:
+    """Most frequent half of the budget, then strided coverage."""
+    rows = sorted(
+        rows,
+        key=lambda row_index: (
+            -int(catalog_counts[row_index]),
+            tuple(catalog_rows[row_index]),
+        ),
+    )
+    if len(rows) > max_candidates:
+        frequent_count = max_candidates // 2
+        remainder = rows[frequent_count:]
+        stride = max(1, len(remainder) // max_candidates)
+        rows = (rows[:frequent_count] + remainder[::stride])[:max_candidates]
+    return torch.tensor(rows, dtype=torch.long)
+
+
+def _candidate_table(
+    catalog: torch.Tensor,
+    catalog_log_prior: torch.Tensor,
+    groups: list[torch.Tensor],
+    max_candidates: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad each group's catalog rows into [groups, max_candidates] tables."""
+    shape = (len(groups), max_candidates)
+    codes = torch.zeros((*shape, catalog.shape[1]), dtype=torch.long)
+    log_prior = torch.full(shape, float("-inf"), dtype=torch.float32)
+    mask = torch.zeros(shape, dtype=torch.bool)
+    for index, rows in enumerate(groups):
+        count = rows.numel()
+        codes[index, :count] = catalog[rows]
+        log_prior[index, :count] = catalog_log_prior[rows]
+        mask[index, :count] = True
+    return codes, log_prior, mask
+
+
 @dataclass(frozen=True, slots=True)
 class CatalogCandidateBank:
     prefix_depth: int
@@ -232,197 +373,65 @@ class CatalogCandidateBank:
             codebook_size=codebook_size,
             width=catalog.shape[1],
         )
-        catalog_counts = torch.zeros(catalog.size(0), dtype=torch.long)
-        if observed_codes is not None:
-            if observed_codes.ndim not in (2, 3):
-                raise ValueError(
-                    "observed_codes must have shape [N, M] or [B, L, M]"
-                )
-            if observed_codes.shape[-1] != catalog.shape[1]:
-                raise ValueError(
-                    "observed_codes and catalog have different widths"
-                )
-            if observed_codes.ndim == 3:
-                if (
-                    observed_valid_mask is None
-                    or observed_valid_mask.dtype != torch.bool
-                    or observed_valid_mask.shape != observed_codes.shape[:2]
-                ):
-                    raise ValueError(
-                        "rank-three observed_codes require a boolean "
-                        "observed_valid_mask with shape [B, L]"
-                    )
-            elif observed_valid_mask is not None and (
-                observed_valid_mask.dtype != torch.bool
-                or observed_valid_mask.shape != observed_codes.shape[:1]
-            ):
-                raise ValueError(
-                    "observed_valid_mask must align with observed_codes"
-                )
-            if count_chunk_size <= 0:
-                raise ValueError("count_chunk_size must be positive")
-
-            device = (
-                observed_codes.device
-                if count_device is None
-                else torch.device(count_device)
+        catalog_counts = (
+            torch.zeros(catalog.size(0), dtype=torch.long)
+            if observed_codes is None
+            else _count_catalog_occurrences(
+                catalog_keys,
+                observed_codes,
+                observed_valid_mask,
+                codebook_size=codebook_size,
+                width=catalog.shape[1],
+                count_device=count_device,
+                chunk_size=count_chunk_size,
             )
-            catalog_order = torch.argsort(catalog_keys, stable=True)
-            sorted_catalog_keys = catalog_keys[catalog_order].to(device)
-            sorted_counts = torch.zeros(
-                catalog.size(0), dtype=torch.long, device=device
-            )
-            flat_observed = observed_codes.reshape(-1, catalog.shape[1])
-            flat_mask = (
-                None
-                if observed_valid_mask is None
-                else observed_valid_mask.reshape(-1)
-            )
-            for start in range(0, flat_observed.size(0), count_chunk_size):
-                end = min(start + count_chunk_size, flat_observed.size(0))
-                chunk = flat_observed[start:end]
-                if flat_mask is not None:
-                    chunk_mask = flat_mask[start:end]
-                    if not chunk_mask.any():
-                        continue
-                    chunk = chunk[chunk_mask]
-                chunk_keys = _sid_keys(
-                    chunk.to(device, dtype=torch.long, non_blocking=True),
-                    codebook_size=codebook_size,
-                    width=catalog.shape[1],
-                )
-                positions = torch.searchsorted(sorted_catalog_keys, chunk_keys)
-                in_range = positions < sorted_catalog_keys.numel()
-                safe = positions.clamp_max(sorted_catalog_keys.numel() - 1)
-                matched = in_range & sorted_catalog_keys[safe].eq(chunk_keys)
-                sorted_counts.scatter_add_(
-                    0,
-                    safe[matched],
-                    torch.ones_like(safe[matched]),
-                )
-            catalog_counts[catalog_order] = sorted_counts.cpu()
-
+        )
         catalog_log_prior = torch.log1p(catalog_counts.float())
         full_order = torch.argsort(catalog_keys, stable=True)
-        full_code_keys = catalog_keys[full_order].contiguous()
-        full_log_prior = catalog_log_prior[full_order].contiguous()
 
         if prefix_depth == 0:
-            frequency_order = torch.argsort(
-                catalog_counts, descending=True, stable=True
-            )
-            if catalog.size(0) > max_candidates:
-                frequent_count = max_candidates // 2
-                frequent = frequency_order[:frequent_count]
-                remaining_mask = torch.ones(catalog.size(0), dtype=torch.bool)
-                remaining_mask[frequent] = False
-                remainder = torch.where(remaining_mask)[0]
-                coverage_count = max_candidates - frequent_count
-                positions = (
-                    torch.linspace(
-                        0,
-                        remainder.numel() - 1,
-                        steps=coverage_count,
-                    )
-                    .round()
-                    .long()
+            prefix_keys = torch.zeros(1, dtype=torch.long)
+            groups = [_global_candidate_rows(catalog_counts, max_candidates)]
+        else:
+            prefix_groups: dict[tuple[int, ...], list[int]] = {}
+            catalog_rows = catalog.tolist()
+            for row_index, row in enumerate(catalog_rows):
+                prefix_groups.setdefault(tuple(row[:prefix_depth]), []).append(
+                    row_index
                 )
-                selected_rows = torch.cat((frequent, remainder[positions]))
-            else:
-                selected_rows = frequency_order
-            count = int(selected_rows.numel())
-            candidate_codes = torch.zeros(
-                1, max_candidates, catalog.shape[1], dtype=torch.long
-            )
-            candidate_log_prior = torch.full(
-                (1, max_candidates), float("-inf"), dtype=torch.float32
-            )
-            candidate_mask = torch.zeros(1, max_candidates, dtype=torch.bool)
-            candidate_codes[0, :count] = catalog[selected_rows]
-            candidate_log_prior[0, :count] = catalog_log_prior[selected_rows]
-            candidate_mask[0, :count] = True
-            return cls(
-                prefix_depth=0,
+            # Keys are most-significant-first, so sorted prefixes are
+            # already in key order.
+            sorted_prefixes = sorted(prefix_groups)
+            prefix_keys = _sid_keys(
+                torch.tensor(sorted_prefixes, dtype=torch.long),
                 codebook_size=codebook_size,
-                max_candidates=max_candidates,
-                codebooks=codebooks.float().cpu().contiguous(),
-                prefix_keys=torch.zeros(1, dtype=torch.long),
-                candidate_codes=candidate_codes,
-                candidate_log_prior=candidate_log_prior,
-                candidate_mask=candidate_mask,
-                full_code_keys=full_code_keys,
-                full_log_prior=full_log_prior,
+                width=prefix_depth,
             )
-
-        prefix_groups: dict[tuple[int, ...], list[int]] = {}
-        catalog_rows = catalog.tolist()
-        for row_index, row in enumerate(catalog_rows):
-            prefix_groups.setdefault(tuple(row[:prefix_depth]), []).append(
-                row_index
-            )
-        sorted_prefixes = sorted(prefix_groups)
-        group_count = len(sorted_prefixes)
-        candidate_codes = torch.zeros(
-            group_count,
-            max_candidates,
-            catalog.shape[1],
-            dtype=torch.long,
-        )
-        candidate_log_prior = torch.full(
-            (group_count, max_candidates),
-            float("-inf"),
-            dtype=torch.float32,
-        )
-        candidate_mask = torch.zeros(
-            group_count, max_candidates, dtype=torch.bool
-        )
-        prefix_keys: list[int] = []
-        for group_index, prefix in enumerate(sorted_prefixes):
-            rows = prefix_groups[prefix]
-            rows.sort(
-                key=lambda row_index: (
-                    -int(catalog_counts[row_index]),
-                    tuple(int(value) for value in catalog_rows[row_index]),
+            groups = [
+                _prefix_candidate_rows(
+                    prefix_groups[prefix],
+                    catalog_counts=catalog_counts,
+                    catalog_rows=catalog_rows,
+                    max_candidates=max_candidates,
                 )
-            )
-            if len(rows) > max_candidates:
-                frequent_count = max_candidates // 2
-                frequent = rows[:frequent_count]
-                remainder = rows[frequent_count:]
-                stride = max(1, len(remainder) // max_candidates)
-                covered = remainder[::stride]
-                rows = (frequent + covered)[:max_candidates]
-            selected = catalog[rows]
-            count = selected.size(0)
-            candidate_codes[group_index, :count] = selected
-            candidate_mask[group_index, :count] = True
-            candidate_log_prior[group_index, :count] = catalog_log_prior[
-                torch.tensor(rows, dtype=torch.long)
+                for prefix in sorted_prefixes
             ]
-            prefix_keys.append(
-                0
-                if prefix_depth == 0
-                else int(
-                    _sid_keys(
-                        torch.tensor([prefix], dtype=torch.long),
-                        codebook_size=codebook_size,
-                        width=prefix_depth,
-                    )[0]
-                )
+        candidate_codes, candidate_log_prior, candidate_mask = (
+            _candidate_table(
+                catalog, catalog_log_prior, groups, max_candidates
             )
-
-        order = torch.argsort(torch.tensor(prefix_keys), stable=True)
+        )
         return cls(
             prefix_depth=prefix_depth,
             codebook_size=codebook_size,
             max_candidates=max_candidates,
             codebooks=codebooks.float().cpu().contiguous(),
-            prefix_keys=torch.tensor(prefix_keys, dtype=torch.long)[order],
-            candidate_codes=candidate_codes[order],
-            candidate_log_prior=candidate_log_prior[order],
-            candidate_mask=candidate_mask[order],
-            full_code_keys=full_code_keys,
-            full_log_prior=full_log_prior,
+            prefix_keys=prefix_keys,
+            candidate_codes=candidate_codes,
+            candidate_log_prior=candidate_log_prior,
+            candidate_mask=candidate_mask,
+            full_code_keys=catalog_keys[full_order].contiguous(),
+            full_log_prior=catalog_log_prior[full_order].contiguous(),
         )
 
     def to(self, device: torch.device | str) -> CatalogCandidateBank:
@@ -500,19 +509,15 @@ class CatalogCandidateBank:
         )
 
 
-def sid_level_sum_embeddings(
-    clean_codes: torch.Tensor,
-    codebooks: torch.Tensor,
-    *,
-    level_start: int,
-) -> torch.Tensor:
+def _check_sid_codes(
+    clean_codes: torch.Tensor, codebooks: torch.Tensor, level_start: int
+) -> None:
     if clean_codes.ndim != 3:
         raise ValueError("clean_codes must have shape [B, L, M]")
     if clean_codes.dtype.is_floating_point or clean_codes.dtype.is_complex:
         raise TypeError("clean_codes must contain integer SID codes")
     if codebooks.ndim != 3:
         raise ValueError("codebooks must have shape [M, C, D]")
-    codebooks = codebooks.to(clean_codes.device)
     if not 0 <= level_start < clean_codes.shape[-1]:
         raise ValueError("level_start must be within the SID width")
     if codebooks.shape[0] != clean_codes.shape[-1]:
@@ -521,9 +526,18 @@ def sid_level_sum_embeddings(
         clean_codes.min() < 0 or clean_codes.max() >= codebooks.shape[1]
     ):
         raise ValueError("clean_codes contain values outside codebook_size")
+
+
+def sid_level_sum_embeddings(
+    clean_codes: torch.Tensor,
+    codebooks: torch.Tensor,
+    *,
+    level_start: int,
+) -> torch.Tensor:
+    _check_sid_codes(clean_codes, codebooks, level_start)
     return codes_to_embeddings_from_codebooks(
         clean_codes[..., level_start:].long(),
-        codebooks[level_start:],
+        codebooks.to(clean_codes.device)[level_start:],
     )
 
 
@@ -533,23 +547,9 @@ def sid_level_embeddings(
     *,
     level_start: int,
 ) -> torch.Tensor:
-    if clean_codes.ndim != 3:
-        raise ValueError("clean_codes must have shape [B, L, M]")
-    if clean_codes.dtype.is_floating_point or clean_codes.dtype.is_complex:
-        raise TypeError("clean_codes must contain integer SID codes")
-    if codebooks.ndim != 3:
-        raise ValueError("codebooks must have shape [M, C, D]")
-    codebooks = codebooks.to(clean_codes.device)
-    if codebooks.shape[0] != clean_codes.shape[-1]:
-        raise ValueError("codebooks and clean_codes have different SID widths")
-    if not 0 <= level_start < clean_codes.shape[-1]:
-        raise ValueError("level_start must be within the SID width")
-    if clean_codes.numel() and (
-        clean_codes.min() < 0 or clean_codes.max() >= codebooks.shape[1]
-    ):
-        raise ValueError("clean_codes contain values outside codebook_size")
+    _check_sid_codes(clean_codes, codebooks, level_start)
     suffix_codes = clean_codes[..., level_start:].long()
-    suffix_codebooks = codebooks[level_start:]
+    suffix_codebooks = codebooks.to(clean_codes.device)[level_start:]
     suffix_depth = suffix_codes.shape[-1]
     flat_codes = suffix_codes.reshape(-1, suffix_depth)
     level_idx = torch.arange(suffix_depth, device=clean_codes.device)
@@ -831,6 +831,99 @@ def catalog_aware_tail_ranking_loss(
     return torch.stack(losses).mean()
 
 
+def _catalog_features(
+    model: PrefixTimeSuffixLatentFlowRealizer,
+    codes: torch.Tensor,
+    codebooks: torch.Tensor,
+    tail_mean: torch.Tensor,
+    tail_std: torch.Tensor,
+    *,
+    prefix_depth: int,
+    tail_whitener: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalized tails and catalog features of [N, M] or [N, K, M] SIDs."""
+    rows = codes if codes.ndim == 3 else codes.unsqueeze(1)
+    raw = suffix_tail_embeddings(rows, codebooks, prefix_depth=prefix_depth)
+    levels = suffix_tail_level_embeddings(
+        rows, codebooks, prefix_depth=prefix_depth
+    )
+    if codes.ndim == 2:
+        raw, levels = raw.squeeze(1), levels.squeeze(1)
+    normalized = normalize_tail(
+        raw, tail_mean, tail_std, tail_whitener=tail_whitener
+    )
+    return normalized, model.catalog_candidate_features(normalized, levels)
+
+
+def _with_target_column(
+    candidate_valid: torch.BoolTensor,
+) -> torch.BoolTensor:
+    """Prepend the always-valid target column to candidate validity."""
+    target = torch.ones(
+        candidate_valid.size(0),
+        1,
+        dtype=torch.bool,
+        device=candidate_valid.device,
+    )
+    return torch.cat((target, candidate_valid), dim=-1)
+
+
+def _catalog_softmax_losses(
+    logits: torch.Tensor,
+    log_prior: torch.Tensor,
+    valid_candidates: torch.BoolTensor,
+    *,
+    zero: torch.Tensor,
+    catalog_temperature: float,
+    population_loss_weight: float,
+    branch: str,
+    diagnostics: Callable[[], dict[str, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cross-entropy of the target (column 0) against its candidates, and
+    the prior-to-posterior KL when weighted (``zero`` otherwise)."""
+    logits = (logits / catalog_temperature).masked_fill(
+        ~valid_candidates, float("-inf")
+    )
+    catalog_loss = F.cross_entropy(
+        logits,
+        torch.zeros(logits.size(0), dtype=torch.long, device=logits.device),
+    )
+    population_loss = zero
+    prior = None
+    log_q = None
+    if population_loss_weight > 0.0:
+        prior = torch.softmax(
+            log_prior.masked_fill(~valid_candidates, float("-inf")), dim=-1
+        )
+        log_q = torch.log_softmax(logits, dim=-1)
+        safe_log_prior = torch.where(
+            valid_candidates,
+            prior.clamp_min(1e-8).log(),
+            torch.zeros_like(prior),
+        )
+        population_loss = (
+            (
+                prior
+                * (safe_log_prior - log_q).masked_fill(~valid_candidates, 0.0)
+            )
+            .sum(dim=-1)
+            .mean()
+        )
+    if logger.isEnabledFor(logging.DEBUG) and (
+        not bool(torch.isfinite(catalog_loss))
+        or not bool(torch.isfinite(population_loss))
+    ):
+        tensors = diagnostics()
+        tensors["valid_logits"] = logits[valid_candidates]
+        if prior is not None and log_q is not None:
+            tensors["valid_prior_probability"] = prior[valid_candidates]
+            tensors["valid_log_q"] = log_q[valid_candidates]
+        _debug_catalog_anomaly(
+            branch=branch, tensors=tensors, valid_candidates=valid_candidates
+        )
+    return catalog_loss, population_loss
+
+
 def _global_catalog_losses(
     model: PrefixTimeSuffixLatentFlowRealizer,
     conditioning: LatentSuffixConditioning,
@@ -852,50 +945,41 @@ def _global_catalog_losses(
     active_codes = clean_codes[valid_mask].long()
     active_pred = predicted_normalized[valid_mask]
     query = model.catalog_query_features(conditioning, active_pred, valid_mask)
-    target_raw = sid_level_sum_embeddings(
-        active_codes.unsqueeze(1), codebooks, level_start=0
-    ).squeeze(1)
-    target_normalized = normalize_tail(
-        target_raw, tail_mean, tail_std, tail_whitener=tail_whitener
-    )
-    target_levels = sid_level_embeddings(
-        active_codes.unsqueeze(1), codebooks, level_start=0
-    ).squeeze(1)
-    target_features = model.catalog_candidate_features(
-        target_normalized, target_levels
-    )
-
     negative_mask = candidates.candidate_mask[0]
     negative_codes = candidates.candidate_codes[0, negative_mask]
     negative_prior = candidates.candidate_log_prior[0, negative_mask]
-    negative_raw = sid_level_sum_embeddings(
-        negative_codes.unsqueeze(1), codebooks, level_start=0
-    ).squeeze(1)
-    negative_normalized = normalize_tail(
-        negative_raw, tail_mean, tail_std, tail_whitener=tail_whitener
+    target_normalized, target_features = _catalog_features(
+        model,
+        active_codes,
+        codebooks,
+        tail_mean,
+        tail_std,
+        prefix_depth=0,
+        tail_whitener=tail_whitener,
     )
-    negative_levels = sid_level_embeddings(
-        negative_codes.unsqueeze(1), codebooks, level_start=0
-    ).squeeze(1)
-    negative_features = model.catalog_candidate_features(
-        negative_normalized, negative_levels
+    negative_normalized, negative_features = _catalog_features(
+        model,
+        negative_codes,
+        codebooks,
+        tail_mean,
+        tail_std,
+        prefix_depth=0,
+        tail_whitener=tail_whitener,
     )
 
     scale = model.model_dim**0.5
     positive_compatibility = (query * target_features).sum(dim=-1) / scale
     negative_compatibility = query @ negative_features.transpose(0, 1) / scale
     positive_distance = (active_pred - target_normalized).square().mean(dim=-1)
-    distance_dtype = torch.float32
-    distance_pred = active_pred.to(distance_dtype)
-    distance_candidates = negative_normalized.to(distance_dtype)
+    distance_pred = active_pred.float()
+    distance_candidates = negative_normalized.float()
     negative_distance = (
         distance_pred.square().mean(dim=-1, keepdim=True)
         + distance_candidates.square().mean(dim=-1).unsqueeze(0)
         - 2.0
         * (distance_pred @ distance_candidates.transpose(0, 1))
         / distance_pred.size(-1)
-    )
-    negative_distance = negative_distance.clamp_min(0.0)
+    ).clamp_min(0.0)
     target_prior = candidates.log_prior_for_codes(active_codes)
     logits = torch.cat(
         (
@@ -910,76 +994,33 @@ def _global_catalog_losses(
         ),
         dim=-1,
     )
-    duplicate = (
-        negative_codes[None, :, :].eq(active_codes[:, None, :]).all(dim=-1)
-    )
-    valid_candidates = torch.cat(
+    log_prior = torch.cat(
         (
-            torch.ones(
-                active_codes.size(0),
-                1,
-                dtype=torch.bool,
-                device=active_codes.device,
-            ),
-            ~duplicate,
+            target_prior[:, None],
+            negative_prior[None, :].expand(active_codes.size(0), -1),
         ),
         dim=-1,
     )
-    logits = (logits / catalog_temperature).masked_fill(
-        ~valid_candidates, float("-inf")
+    duplicate = (
+        negative_codes[None, :, :].eq(active_codes[:, None, :]).all(dim=-1)
     )
-    catalog_loss = F.cross_entropy(
+    return _catalog_softmax_losses(
         logits,
-        torch.zeros(logits.size(0), dtype=torch.long, device=logits.device),
-    )
-    population_loss = positive_compatibility.sum() * 0.0
-    prior = None
-    log_q = None
-    if population_loss_weight > 0.0:
-        log_prior = torch.cat(
-            (
-                target_prior[:, None],
-                negative_prior[None, :].expand(active_codes.size(0), -1),
-            ),
-            dim=-1,
-        ).masked_fill(~valid_candidates, float("-inf"))
-        prior = torch.softmax(log_prior, dim=-1)
-        log_q = torch.log_softmax(logits, dim=-1)
-        safe_log_prior = torch.where(
-            valid_candidates,
-            prior.clamp_min(1e-8).log(),
-            torch.zeros_like(prior),
-        )
-        population_loss = (
-            (
-                prior
-                * (safe_log_prior - log_q).masked_fill(~valid_candidates, 0.0)
-            )
-            .sum(dim=-1)
-            .mean()
-        )
-    if logger.isEnabledFor(logging.DEBUG) and (
-        not bool(torch.isfinite(catalog_loss))
-        or not bool(torch.isfinite(population_loss))
-    ):
-        diagnostics = {
+        log_prior,
+        _with_target_column(~duplicate),
+        zero=positive_compatibility.sum() * 0.0,
+        catalog_temperature=catalog_temperature,
+        population_loss_weight=population_loss_weight,
+        branch="global",
+        diagnostics=lambda: {
             "positive_compatibility": positive_compatibility,
             "negative_compatibility": negative_compatibility,
             "positive_distance": positive_distance,
             "negative_distance": negative_distance,
             "target_prior": target_prior,
             "negative_prior": negative_prior,
-            "valid_logits": logits[valid_candidates],
-        }
-        if prior is not None and log_q is not None:
-            diagnostics["valid_prior_probability"] = prior[valid_candidates]
-            diagnostics["valid_log_q"] = log_q[valid_candidates]
-        _debug_catalog_anomaly(
-            branch="global",
-            tensors=diagnostics,
-            valid_candidates=valid_candidates,
-        )
-    return catalog_loss, population_loss
+        },
+    )
 
 
 def _prefix_catalog_losses(
@@ -1007,58 +1048,33 @@ def _prefix_catalog_losses(
     prefix_indices = candidates._prefix_indices(
         active_codes[:, : candidates.prefix_depth]
     )
+    # Candidate features are computed once per distinct prefix.
     unique_indices, inverse = torch.unique(
         prefix_indices, sorted=True, return_inverse=True
     )
-
-    base_codes = candidates.candidate_codes[unique_indices]
-    base_mask = candidates.candidate_mask[unique_indices]
-    base_prior = candidates.candidate_log_prior[unique_indices]
-    base_raw = suffix_tail_embeddings(
-        base_codes,
+    base_normalized, base_features = _catalog_features(
+        model,
+        candidates.candidate_codes[unique_indices],
         codebooks,
-        prefix_depth=candidates.prefix_depth,
-    )
-    base_normalized = normalize_tail(
-        base_raw,
         tail_mean,
         tail_std,
+        prefix_depth=candidates.prefix_depth,
         tail_whitener=tail_whitener,
     )
-    base_levels = suffix_tail_level_embeddings(
-        base_codes,
+    target_normalized, target_features = _catalog_features(
+        model,
+        active_codes,
         codebooks,
-        prefix_depth=candidates.prefix_depth,
-    )
-    base_features = model.catalog_candidate_features(
-        base_normalized, base_levels
-    )
-
-    target_raw = suffix_tail_embeddings(
-        active_codes.unsqueeze(1),
-        codebooks,
-        prefix_depth=candidates.prefix_depth,
-    ).squeeze(1)
-    target_normalized = normalize_tail(
-        target_raw,
         tail_mean,
         tail_std,
-        tail_whitener=tail_whitener,
-    )
-    target_levels = suffix_tail_level_embeddings(
-        active_codes.unsqueeze(1),
-        codebooks,
         prefix_depth=candidates.prefix_depth,
-    ).squeeze(1)
-    target_features = model.catalog_candidate_features(
-        target_normalized, target_levels
+        tail_whitener=tail_whitener,
     )
     query = model.catalog_query_features(conditioning, active_pred, valid_mask)
     scale = model.model_dim**0.5
     target_compatibility = (query * target_features).sum(dim=-1) / scale
-    selected_features = base_features[inverse]
     base_compatibility = torch.einsum(
-        "nd,nkd->nk", query, selected_features
+        "nd,nkd->nk", query, base_features[inverse]
     ).div(scale)
 
     distance_pred = active_pred.float()
@@ -1074,77 +1090,165 @@ def _prefix_catalog_losses(
         / distance_pred.size(-1)
     ).clamp_min(0.0)
 
-    target_prior = candidates.log_prior_for_codes(active_codes)
-    selected_prior = base_prior[inverse]
-    selected_mask = base_mask[inverse]
-    selected_codes = base_codes[inverse]
-    duplicate = selected_codes.eq(active_codes[:, None, :]).all(dim=-1)
-    valid_candidates = torch.cat(
-        (
-            torch.ones(
-                active_codes.size(0),
-                1,
-                dtype=torch.bool,
-                device=active_codes.device,
-            ),
-            selected_mask & ~duplicate,
-        ),
-        dim=-1,
+    duplicate = (
+        candidates.candidate_codes[prefix_indices]
+        .eq(active_codes[:, None, :])
+        .all(dim=-1)
+    )
+    valid_candidates = _with_target_column(
+        candidates.candidate_mask[prefix_indices] & ~duplicate
     )
     compatibility = torch.cat(
         (target_compatibility[:, None], base_compatibility), dim=-1
     )
     distance = torch.cat((target_distance[:, None], base_distance), dim=-1)
-    log_prior = torch.cat((target_prior[:, None], selected_prior), dim=-1)
-    logits = (
-        compatibility - 0.5 * distance + catalog_prior_weight * log_prior
-    ) / catalog_temperature
-    logits = logits.masked_fill(~valid_candidates, float("-inf"))
-    catalog_loss = F.cross_entropy(
-        logits,
-        torch.zeros(logits.size(0), dtype=torch.long, device=logits.device),
+    log_prior = torch.cat(
+        (
+            candidates.log_prior_for_codes(active_codes)[:, None],
+            candidates.candidate_log_prior[prefix_indices],
+        ),
+        dim=-1,
     )
-
-    population_loss = target_compatibility.sum() * 0.0
-    prior = None
-    log_q = None
-    if population_loss_weight > 0.0:
-        prior = torch.softmax(
-            log_prior.masked_fill(~valid_candidates, float("-inf")), dim=-1
-        )
-        log_q = torch.log_softmax(logits, dim=-1)
-        safe_log_prior = torch.where(
-            valid_candidates,
-            prior.clamp_min(1e-8).log(),
-            torch.zeros_like(prior),
-        )
-        population_loss = (
-            (
-                prior
-                * (safe_log_prior - log_q).masked_fill(~valid_candidates, 0.0)
-            )
-            .sum(dim=-1)
-            .mean()
-        )
-    if logger.isEnabledFor(logging.DEBUG) and (
-        not bool(torch.isfinite(catalog_loss))
-        or not bool(torch.isfinite(population_loss))
-    ):
-        diagnostics = {
+    return _catalog_softmax_losses(
+        compatibility - 0.5 * distance + catalog_prior_weight * log_prior,
+        log_prior,
+        valid_candidates,
+        zero=target_compatibility.sum() * 0.0,
+        catalog_temperature=catalog_temperature,
+        population_loss_weight=population_loss_weight,
+        branch="prefix",
+        diagnostics=lambda: {
             "compatibility": compatibility,
             "distance": distance,
             "valid_log_prior": log_prior[valid_candidates],
-            "valid_logits": logits[valid_candidates],
-        }
-        if prior is not None and log_q is not None:
-            diagnostics["valid_prior_probability"] = prior[valid_candidates]
-            diagnostics["valid_log_q"] = log_q[valid_candidates]
-        _debug_catalog_anomaly(
-            branch="prefix",
-            tensors=diagnostics,
-            valid_candidates=valid_candidates,
+        },
+    )
+
+
+def check_tail_statistics(
+    model: PrefixTimeSuffixLatentFlowRealizer,
+    tail_mean: torch.Tensor,
+    tail_std: torch.Tensor,
+    tail_whitener: torch.Tensor | None,
+    tail_dewhitener: torch.Tensor | None,
+) -> None:
+    """Tail normalization statistics must match the model's tail layout."""
+    factorized = model.tail_representation == "factorized"
+    if factorized:
+        expected_stats_shape = (model.suffix_depth, model.latent_dim)
+    else:
+        expected_stats_shape = (model.latent_dim,)
+    if (
+        tuple(tail_mean.shape) != expected_stats_shape
+        or tail_std.shape != tail_mean.shape
+    ):
+        raise ValueError(
+            "tail statistics do not match the model representation: "
+            f"expected {expected_stats_shape}"
         )
-    return catalog_loss, population_loss
+    if (tail_std <= 0).any() or not torch.isfinite(tail_std).all():
+        raise ValueError("tail_std must be finite and strictly positive")
+    if tail_whitener is None and tail_dewhitener is None:
+        return
+    if factorized:
+        raise ValueError("tail whitening is supported only for summed tails")
+    matrix_shape = (model.latent_dim, model.latent_dim)
+    if (
+        tail_whitener is None
+        or tail_dewhitener is None
+        or tuple(tail_whitener.shape) != matrix_shape
+        or tuple(tail_dewhitener.shape) != matrix_shape
+    ):
+        raise ValueError("tail whiteners must both have shape [D, D]")
+
+
+def _clean_tail_targets(
+    core: PrefixTimeSuffixLatentFlowRealizer,
+    clean_codes: torch.Tensor,
+    codebooks: torch.Tensor,
+    tail_mean: torch.Tensor,
+    tail_std: torch.Tensor,
+    tail_whitener: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Raw tail embeddings ([..., S, D] per level when factorized) and
+    their normalized, flattened flow targets."""
+    if core.tail_representation == "factorized":
+        raw = suffix_tail_level_embeddings(
+            clean_codes, codebooks, prefix_depth=core.prefix_depth
+        ).to(dtype=tail_mean.dtype)
+        normalized = ((raw - tail_mean) / tail_std).reshape(
+            clean_codes.size(0), clean_codes.size(1), -1
+        )
+        return raw, normalized
+    raw = sid_level_sum_embeddings(
+        clean_codes, codebooks, level_start=core.target_level_start
+    ).to(dtype=tail_mean.dtype)
+    return raw, normalize_tail(
+        raw, tail_mean, tail_std, tail_whitener=tail_whitener
+    )
+
+
+def _check_auxiliary_losses(
+    core: PrefixTimeSuffixLatentFlowRealizer,
+    *,
+    endpoint_loss_weight: float,
+    population_loss_weight: float,
+    catalog_prior_weight: float,
+    catalog_temperature: float,
+    catalog_loss_weight: float,
+    has_catalog: bool,
+    has_candidates: bool,
+) -> None:
+    if endpoint_loss_weight < 0.0 or population_loss_weight < 0.0:
+        raise ValueError("auxiliary loss weights must be non-negative")
+    if catalog_prior_weight < 0.0:
+        raise ValueError("catalog_prior_weight must be non-negative")
+    if catalog_temperature <= 0.0:
+        raise ValueError("catalog_temperature must be positive")
+    if catalog_loss_weight < 0.0:
+        raise ValueError("catalog_loss_weight must be non-negative")
+    if core.catalog_decoder_mode == "calibrated":
+        if core.tail_representation == "factorized":
+            raise ValueError(
+                "factorized tails are incompatible with calibrated catalog "
+                "decoding"
+            )
+        if catalog_loss_weight <= 0.0:
+            raise ValueError(
+                "catalog_loss_weight must be positive for calibrated "
+                "catalog decoding"
+            )
+        if not has_catalog:
+            raise ValueError(
+                "candidate_bank is required for calibrated catalog decoding"
+            )
+    if catalog_loss_weight > 0.0 and not (has_catalog or has_candidates):
+        raise ValueError(
+            "candidate_bank or catalog_candidates is required when "
+            "catalog loss is enabled"
+        )
+
+
+def _raw_tails(
+    core: PrefixTimeSuffixLatentFlowRealizer,
+    x0_pred: torch.Tensor,
+    clean_tail_raw: torch.Tensor,
+    tail_mean: torch.Tensor,
+    tail_std: torch.Tensor,
+    tail_dewhitener: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Predicted and target tails summed in raw codebook space."""
+    if core.tail_representation == "factorized":
+        level_shape = (*x0_pred.shape[:2], core.suffix_depth, core.latent_dim)
+        predicted_levels = x0_pred.reshape(level_shape)
+        return (
+            (predicted_levels * tail_std + tail_mean).sum(dim=2),
+            clean_tail_raw.sum(dim=2),
+        )
+    predicted = denormalize_tail(
+        x0_pred, tail_mean, tail_std, tail_dewhitener=tail_dewhitener
+    )
+    return predicted, clean_tail_raw
 
 
 def prefix_time_suffix_latent_flow_loss(
@@ -1190,81 +1294,26 @@ def prefix_time_suffix_latent_flow_loss(
             raise ValueError(
                 "proposal_prefix_codes must have shape [B, L, prefix_depth]"
             )
-    if core.tail_representation == "factorized":
-        expected_stats_shape = (core.suffix_depth, core.latent_dim)
-    else:
-        expected_stats_shape = (core.latent_dim,)
-    if (
-        tuple(tail_mean.shape) != expected_stats_shape
-        or tail_std.shape != tail_mean.shape
-    ):
-        raise ValueError(
-            "tail statistics do not match the model representation: "
-            f"expected {expected_stats_shape}"
-        )
-    if (tail_std <= 0).any() or not torch.isfinite(tail_std).all():
-        raise ValueError("tail_std must be finite and strictly positive")
-    factorized = core.tail_representation == "factorized"
-    if tail_whitener is not None or tail_dewhitener is not None:
-        if factorized:
-            raise ValueError(
-                "tail whitening is supported only for summed tails"
-            )
-        matrix_shape = (core.latent_dim, core.latent_dim)
-        if (
-            tail_whitener is None
-            or tail_dewhitener is None
-            or tuple(tail_whitener.shape) != matrix_shape
-            or tuple(tail_dewhitener.shape) != matrix_shape
-        ):
-            raise ValueError("tail whiteners must both have shape [D, D]")
-    if endpoint_loss_weight < 0.0 or population_loss_weight < 0.0:
-        raise ValueError("auxiliary loss weights must be non-negative")
-    if catalog_prior_weight < 0.0:
-        raise ValueError("catalog_prior_weight must be non-negative")
-    if catalog_temperature <= 0.0:
-        raise ValueError("catalog_temperature must be positive")
-    if core.catalog_decoder_mode == "calibrated":
-        if factorized:
-            raise ValueError(
-                "factorized tails are incompatible with calibrated catalog "
-                "decoding"
-            )
-        if catalog_loss_weight <= 0.0:
-            raise ValueError(
-                "catalog_loss_weight must be positive for calibrated "
-                "catalog decoding"
-            )
-        if candidate_bank is None:
-            raise ValueError(
-                "candidate_bank is required for calibrated catalog decoding"
-            )
+    check_tail_statistics(
+        core, tail_mean, tail_std, tail_whitener, tail_dewhitener
+    )
+    _check_auxiliary_losses(
+        core,
+        endpoint_loss_weight=endpoint_loss_weight,
+        population_loss_weight=population_loss_weight,
+        catalog_prior_weight=catalog_prior_weight,
+        catalog_temperature=catalog_temperature,
+        catalog_loss_weight=catalog_loss_weight,
+        has_catalog=candidate_bank is not None,
+        has_candidates=catalog_candidates is not None,
+    )
 
-    if factorized:
-        clean_tail_raw = suffix_tail_level_embeddings(
-            clean_codes,
-            codebooks,
-            prefix_depth=core.prefix_depth,
-        ).to(dtype=tail_mean.dtype)
-        clean_tail_levels = (clean_tail_raw - tail_mean) / tail_std
-        clean_tail = clean_tail_levels.reshape(
-            clean_codes.size(0), clean_codes.size(1), -1
-        )
-    else:
-        clean_tail_raw = sid_level_sum_embeddings(
-            clean_codes,
-            codebooks,
-            level_start=core.target_level_start,
-        ).to(dtype=tail_mean.dtype)
-        clean_tail = normalize_tail(
-            clean_tail_raw,
-            tail_mean,
-            tail_std,
-            tail_whitener=tail_whitener,
-        )
-    mask = valid_mask[..., None]
-    clean_tail = clean_tail.masked_fill(~mask, 0.0)
-    noise = torch.randn_like(clean_tail).masked_fill(~mask, 0.0)
+    clean_tail_raw, clean_tail = _clean_tail_targets(
+        core, clean_codes, codebooks, tail_mean, tail_std, tail_whitener
+    )
+    padding = ~valid_mask[..., None]
+    clean_tail = clean_tail.masked_fill(padding, 0.0)
+    noise = torch.randn_like(clean_tail).masked_fill(padding, 0.0)
     if lognormal_t:
         timesteps = sample_logit_normal_timesteps(
             clean_codes.size(0),
@@ -1276,8 +1325,9 @@ def prefix_time_suffix_latent_flow_loss(
         timesteps = sample_uniform_timesteps(
             clean_codes.size(0), clean_codes.device
         )
-    noisy_tail = linear_interpolate(clean_tail, noise, timesteps)
-    noisy_tail = noisy_tail.masked_fill(~mask, 0.0)
+    noisy_tail = linear_interpolate(clean_tail, noise, timesteps).masked_fill(
+        padding, 0.0
+    )
     conditioning = core.encode_conditioning(
         (
             clean_codes[..., : core.prefix_depth].long()
@@ -1299,97 +1349,67 @@ def prefix_time_suffix_latent_flow_loss(
     predicted_velocity = velocity_from_x0(noisy_tail, x0_pred, timesteps)
     per_event = (predicted_velocity - target_velocity).square().mean(dim=-1)
     flow_loss = per_event[valid_mask].mean()
-    endpoint_loss = clean_tail.sum() * 0.0
-    if endpoint_loss_weight > 0.0:
-        endpoint_loss = F.smooth_l1_loss(
-            x0_pred[valid_mask],
-            clean_tail[valid_mask],
-        )
-    sum_consistency_loss = clean_tail.sum() * 0.0
-    if factorized:
-        predicted_levels = x0_pred.reshape(
-            clean_codes.size(0),
-            clean_codes.size(1),
-            core.suffix_depth,
-            core.latent_dim,
-        )
-        target_levels = clean_tail.reshape(
-            clean_codes.size(0),
-            clean_codes.size(1),
-            core.suffix_depth,
-            core.latent_dim,
-        )
+
+    def zero() -> torch.Tensor:
+        return clean_tail.sum() * 0.0
+
+    endpoint_loss = (
+        F.smooth_l1_loss(x0_pred[valid_mask], clean_tail[valid_mask])
+        if endpoint_loss_weight > 0.0
+        else zero()
+    )
+    sum_consistency_loss = zero()
+    if core.tail_representation == "factorized":
+        level_shape = (*valid_mask.shape, core.suffix_depth, core.latent_dim)
         sum_consistency_loss = (
-            (predicted_levels.sum(dim=2) - target_levels.sum(dim=2))
+            (
+                x0_pred.reshape(level_shape).sum(dim=2)
+                - clean_tail.reshape(level_shape).sum(dim=2)
+            )
             .square()
             .mean(dim=-1)[valid_mask]
             .mean()
         )
-        predicted_tail_raw = (predicted_levels * tail_std + tail_mean).sum(
-            dim=2
+
+    catalog_loss, population_loss = zero(), zero()
+    if catalog_loss_weight > 0.0 and candidate_bank is not None:
+        bank_losses = (
+            _global_catalog_losses
+            if candidate_bank.prefix_depth == 0
+            else _prefix_catalog_losses
         )
-        target_tail_raw = clean_tail_raw.sum(dim=2)
-    else:
-        predicted_tail_raw = denormalize_tail(
+        catalog_loss, population_loss = bank_losses(
+            core,
+            conditioning,
             x0_pred,
+            clean_codes,
+            valid_mask,
+            codebooks,
+            candidate_bank,
             tail_mean,
             tail_std,
-            tail_dewhitener=tail_dewhitener,
+            tail_whitener=tail_whitener,
+            catalog_prior_weight=catalog_prior_weight,
+            catalog_temperature=catalog_temperature,
+            population_loss_weight=population_loss_weight,
         )
-        target_tail_raw = clean_tail_raw
-    catalog_loss = clean_tail.sum() * 0.0
-    population_loss = clean_tail.sum() * 0.0
-    if catalog_loss_weight < 0.0:
-        raise ValueError("catalog_loss_weight must be non-negative")
-    if catalog_loss_weight > 0.0:
-        if candidate_bank is not None:
-            if candidate_bank.prefix_depth == 0:
-                catalog_loss, population_loss = _global_catalog_losses(
-                    core,
-                    conditioning,
-                    x0_pred,
-                    clean_codes,
-                    valid_mask,
-                    codebooks,
-                    candidate_bank,
-                    tail_mean,
-                    tail_std,
-                    tail_whitener=tail_whitener,
-                    catalog_prior_weight=catalog_prior_weight,
-                    catalog_temperature=catalog_temperature,
-                    population_loss_weight=population_loss_weight,
-                )
-            else:
-                catalog_loss, population_loss = _prefix_catalog_losses(
-                    core,
-                    conditioning,
-                    x0_pred,
-                    clean_codes,
-                    valid_mask,
-                    codebooks,
-                    candidate_bank,
-                    tail_mean,
-                    tail_std,
-                    tail_whitener=tail_whitener,
-                    catalog_prior_weight=catalog_prior_weight,
-                    catalog_temperature=catalog_temperature,
-                    population_loss_weight=population_loss_weight,
-                )
-        elif catalog_candidates is None:
-            raise ValueError(
-                "candidate_bank or catalog_candidates is required when "
-                "catalog loss is enabled"
-            )
-        else:
-            catalog_loss = catalog_aware_tail_ranking_loss(
-                predicted_tail_raw,
-                target_tail_raw,
-                clean_codes,
-                valid_mask,
-                catalog_candidates,
-                num_negatives=catalog_negative_count,
-                temperature=catalog_temperature,
-            )
+    elif catalog_loss_weight > 0.0:
+        assert catalog_candidates is not None
+        catalog_loss = catalog_aware_tail_ranking_loss(
+            *_raw_tails(
+                core,
+                x0_pred,
+                clean_tail_raw,
+                tail_mean,
+                tail_std,
+                tail_dewhitener,
+            ),
+            clean_codes,
+            valid_mask,
+            catalog_candidates,
+            num_negatives=catalog_negative_count,
+            temperature=catalog_temperature,
+        )
     loss = (
         flow_loss
         + endpoint_loss_weight * endpoint_loss
@@ -1420,6 +1440,7 @@ __all__ = [
     "CatalogTailCandidates",
     "LatentSuffixFlowObjectiveOutput",
     "catalog_aware_tail_ranking_loss",
+    "check_tail_statistics",
     "compute_factorized_tail_stats",
     "compute_tail_stats",
     "compute_tail_whitening_stats",

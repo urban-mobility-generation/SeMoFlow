@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -25,11 +26,7 @@ class OccurrencePlannerConditionsBuildResult:
     lengths_conditioned: bool
 
     def to_dict(self) -> dict[str, object]:
-        return {
-            "output_path": str(self.output_path),
-            "num_samples": self.num_samples,
-            "lengths_conditioned": self.lengths_conditioned,
-        }
+        return dataclasses.asdict(self)
 
 
 def _require_week_start(value: object) -> date | datetime:
@@ -41,10 +38,11 @@ def _require_week_start(value: object) -> date | datetime:
 def build_occurrence_planner_conditions(
     *,
     checkpoint_path: Path,
-    input_path: Path,
+    rows: pl.DataFrame,
     output_path: Path,
     force: bool = False,
 ) -> OccurrencePlannerConditionsBuildResult:
+    """Save one condition per row of ``rows`` (city_id, optional length)."""
     checkpoint = load_occurrence_planner_checkpoint(checkpoint_path)
     city_only = (
         checkpoint.config.city_conditioning
@@ -58,7 +56,7 @@ def build_occurrence_planner_conditions(
     if not city_only and not city_calendar_origin:
         raise ValueError("checkpoint does not use supported city conditioning")
 
-    schema = pl.read_parquet_schema(input_path)
+    schema = rows.schema
     required = {"city_id"}
     if city_calendar_origin:
         required.update(("week_start", "origin_geohash_5"))
@@ -74,7 +72,7 @@ def build_occurrence_planner_conditions(
     has_lengths = "length" in schema
     if has_lengths:
         columns.append("length")
-    frame = pl.read_parquet(input_path, columns=columns)
+    frame = rows.select(columns)
     if frame.height < 1:
         raise ValueError("conditions input must contain at least one row")
 

@@ -10,6 +10,7 @@ import polars as pl
 from semoflow.tokenization.decoding.grounding_index import (
     SemanticIDGroundingIndex,
 )
+from semoflow.utils.serialization import write_json
 
 _CODE_COLUMNS = tuple(f"sem_code_{level}" for level in range(6))
 _LOOKUP_COLUMNS = ("placekey_id", "placekey", "city_id", *_CODE_COLUMNS)
@@ -35,10 +36,7 @@ def refuse_existing(*paths: Path, force: bool) -> None:
 
 
 def write_sidecar_manifest(output: Path, manifest: dict[str, Any]) -> None:
-    output.with_suffix(".manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_json(output.with_suffix(".manifest.json"), manifest)
 
 
 def read_union_target(union_manifest: Path) -> tuple[int, int]:
@@ -209,8 +207,10 @@ def build_union_grounding_index(
             for path in places
         ],
         how="vertical",
-    ).unique(subset=["placekey"])
-    frame = lookup.join(metadata, on="placekey", how="left")
+    ).unique(subset=["placekey"], keep="first")
+    frame = lookup.join(
+        metadata, on="placekey", how="left", maintain_order="left"
+    )
     unresolved = int(frame.get_column("top_category").is_null().sum())
 
     index = SemanticIDGroundingIndex.from_frame(frame)

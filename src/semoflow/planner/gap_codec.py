@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import torch
 
@@ -155,6 +156,15 @@ def reconstruct_event_time_minutes(
     )
 
 
+def bucketize_gap_durations(
+    durations: torch.Tensor, bucket_edges_minutes: Sequence[float]
+) -> torch.Tensor:
+    boundaries = torch.tensor(
+        bucket_edges_minutes, dtype=durations.dtype, device=durations.device
+    )
+    return torch.bucketize(durations, boundaries, right=False).to(torch.long)
+
+
 def gap_tokens_from_event_time_minutes(
     event_time_minutes: torch.Tensor,
     *,
@@ -165,17 +175,16 @@ def gap_tokens_from_event_time_minutes(
         raise ValueError("event_time_minutes must be a non-empty vector")
     if not bool(torch.isfinite(times).all()) or bool((times < 0).any()):
         raise ValueError("event_time_minutes must be finite and non-negative")
-    durations = exact_gap_duration_minutes(times)
-    boundaries = torch.tensor(
-        bucket_edges_minutes, dtype=times.dtype, device=times.device
+    return bucketize_gap_durations(
+        exact_gap_duration_minutes(times), bucket_edges_minutes
     )
-    return torch.bucketize(durations, boundaries, right=False).to(torch.long)
 
 
 __all__ = [
     "PLANNER_GAP_BUCKET_EDGES_MINUTES",
     "PLANNER_GAP_CODEC_VERSION",
     "PLANNER_GAP_REPRESENTATIVES_MINUTES",
+    "bucketize_gap_durations",
     "exact_gap_duration_minutes",
     "gap_tokens_from_event_time_minutes",
     "reconstruct_event_time_minutes",

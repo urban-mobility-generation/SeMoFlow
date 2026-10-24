@@ -13,10 +13,7 @@ from torch.utils.data import DataLoader
 
 from semoflow.config import ExperimentConfig
 from semoflow.config.artifacts import TokenizerArtifacts
-from semoflow.logging.primitives import configure_logging
-from semoflow.preprocess.places_index import (
-    load_places_index,
-)
+from semoflow.preprocess.places_index import load_places_index
 from semoflow.tokenization.features import (
     GRAPH_PREFIX,
     build_features,
@@ -33,13 +30,7 @@ from semoflow.training.tokenizer import (
     TensorDictDataset,
     train_tokenizer,
 )
-from semoflow.training.tokenizer_publish import (
-    publish_tokenizer_artifacts,
-)
-from semoflow.utils import (
-    init_run_directory,
-    write_run_manifest,
-)
+from semoflow.training.tokenizer_publish import publish_tokenizer_artifacts
 
 logger = logging.getLogger(__name__)
 
@@ -168,53 +159,16 @@ def fit_tokenizer(
     return model, history
 
 
-def run_semantic_id_tokenizer(
-    cfg: ExperimentConfig,
-    *,
-    force: bool = False,
-    log_level: str = "INFO",
-    log_file: Path | None = None,
-) -> Path | None:
-    tcfg = cfg.tokenizer_config
-    arts = TokenizerArtifacts.from_run_dir(tcfg.run_dir())
-    paths = init_run_directory(arts.run_dir)
-    if log_file is None:
-        configure_logging(level=log_level, log_file=paths.logs_dir / "run.log")
-
-    if arts.is_complete() and not force:
-        logger.info(
-            "semantic tokenizer run already complete: %s", arts.run_dir
-        )
-        return None
-    if arts.augmented_processed_visits.exists() and not force:
-        logger.info(
-            "partial tokenizer run detected; republishing: %s", arts.run_dir
-        )
-
+def run_semantic_id_tokenizer(cfg: ExperimentConfig) -> Path | None:
+    """Fit the RQ-VAE and publish its artifacts into the run directory."""
+    arts = TokenizerArtifacts.from_run_dir(cfg.tokenizer_config.run_dir())
+    if arts.augmented_processed_visits.exists():
+        logger.info("replacing existing tokenizer outputs: %s", arts.run_dir)
     cfg.save_yaml(arts.config_yaml, phase="tokenizer")
-    resolved_config_path = arts.run_dir / cfg.output.config_filename
-    cfg.save_yaml(resolved_config_path, phase="tokenizer")
-    write_run_manifest(
-        arts.run_dir,
-        config_path=resolved_config_path,
-        output_dir=arts.run_dir,
-        data_artifact_paths={
-            "data_root": cfg.data.data_root,
-            "preprocessed_processed_visits_path": cfg.paths.preprocessed_processed_visits_path,
-            "semantic_id_lookup_path": cfg.paths.semantic_id_lookup_path,
-            "semantic_id_grounding_path": cfg.paths.semantic_id_grounding_path,
-            "tokenizer_preprocessing_dir": tcfg.preprocessing_dir,
-            "tokenizer_graphsage_artifact_dir": tcfg.graphsage_artifact_dir,
-        },
-        metric_artifact_paths={
-            "semantic_id_eval": arts.eval_dir / "semantic_id_eval.json"
-        },
-    )
-
     logger.info("building semantic IDs  run_dir=%s", arts.run_dir)
     prepared = prepare_features(cfg)
     model, history = fit_tokenizer(
-        cfg, prepared, checkpoints_dir=paths.checkpoints_dir
+        cfg, prepared, checkpoints_dir=arts.run_dir / "checkpoints"
     )
     return publish_tokenizer_artifacts(
         cfg, arts, model=model, prepared=prepared, history=history

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -9,12 +8,9 @@ import torch
 
 from semoflow.encoder.graph.data import build_hetero_data
 from semoflow.encoder.graph.heterosage import HeteroSAGE
-from semoflow.preprocess.places_index import (
-    load_places_index,
-)
-from semoflow.training.graph_encoder import (
-    _apply_graph_warm_start,
-)
+from semoflow.preprocess.places_index import load_places_index
+from semoflow.training.graph_encoder import apply_graph_warm_start
+from semoflow.utils.serialization import write_json
 
 _EMPTY_STAYS = {
     "device_key": pl.Utf8,
@@ -78,9 +74,7 @@ def encode_catalog_only_graph(
         id_embedding_dim=id_embedding_dim,
         id_embedding_counts=id_counts,
     )
-    record = _apply_graph_warm_start(
-        model, warm_start_checkpoint, device="cpu"
-    )
+    record = apply_graph_warm_start(model, warm_start_checkpoint, device="cpu")
     unexpected = [
         name
         for name in record["reinitialized_tensors"]
@@ -136,10 +130,7 @@ def encode_catalog_only_graph(
         "output": str(emb_path),
         **record,
     }
-    (output_dir / "warm_start.json").write_text(
-        json.dumps(report, indent=2, sort_keys=True, default=str) + "\n",
-        encoding="utf-8",
-    )
+    write_json(output_dir / "warm_start.json", report)
     return report
 
 

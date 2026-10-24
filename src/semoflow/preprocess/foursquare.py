@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 import logging
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -10,27 +8,19 @@ import numpy as np
 import polars as pl
 
 from semoflow.config import constants
-from semoflow.config.schemas.data_config import (
-    FoursquareAdapterConfig,
-)
-from semoflow.preprocess.pipeline import (
-    PLACE_INDEX_COLUMNS,
-    PreprocessWorkspace,
-    log_pipeline_done,
-)
-from semoflow.preprocess.places_index import (
-    write_places_index,
-)
+from semoflow.config.artifacts import PreprocessingArtifacts
+from semoflow.config.schemas.data_config import FoursquareAdapterConfig
+from semoflow.preprocess.places_index import write_places_index
 from semoflow.preprocess.quality_gate import (
     QualityGateConfig,
     filter_quality,
 )
-from semoflow.utils import write_run_manifest
 from semoflow.utils.data import stable_device_key
 from semoflow.utils.provenance import (
     closure_from_stays,
     write_closure,
 )
+from semoflow.utils.serialization import write_json
 from semoflow.utils.splits import (
     GLOBAL_SPLIT_SEED,
     SPLIT_COLUMN,
@@ -41,6 +31,23 @@ if TYPE_CHECKING:
     from semoflow.config import ExperimentConfig
 
 logger = logging.getLogger(__name__)
+
+PLACE_INDEX_COLUMNS = (
+    "placekey",
+    "location_name",
+    "top_category",
+    "sub_category",
+    "naics_code",
+    "street_address",
+    "city",
+    "state",
+    "zipcode",
+    "census_block_group",
+    "brands",
+    "geohash_5",
+    "latitude",
+    "longitude",
+)
 
 FOURSQUARE_SOURCE_URL = (
     "https://sites.google.com/site/yangdingqi/home/foursquare-dataset"
@@ -266,7 +273,12 @@ def read_foursquare_global_catalog(
             batch.filter(
                 pl.col("_assigned_source_city").is_in(requested_names)
             )
-            .join(city_map, on="_assigned_source_city", how="inner")
+            .join(
+                city_map,
+                on="_assigned_source_city",
+                how="inner",
+                maintain_order="left",
+            )
             .drop("_assigned_source_city")
         )
         if not selected.is_empty():
@@ -300,7 +312,9 @@ def normalize_foursquare_global_events(
         raise ValueError(
             f"global Foursquare frame is missing columns: {sorted(missing)}"
         )
-    frame = raw.join(poi_catalog, on="venue_id", how="inner").with_columns(
+    frame = raw.join(
+        poi_catalog, on="venue_id", how="inner", maintain_order="left"
+    ).with_columns(
         [
             pl.col("latitude").cast(pl.Float64, strict=False),
             pl.col("longitude").cast(pl.Float64, strict=False),
@@ -501,9 +515,8 @@ def run_foursquare_pipeline(cfg: ExperimentConfig) -> None:
             f"Foursquare source not found: {source}. Download and extract the "
             f"global release from {FOURSQUARE_SOURCE_URL}"
         )
-    t0 = time.perf_counter()
-    workspace = PreprocessWorkspace.from_config(cfg)
-    workspace.prepare_output()
+    artifacts = PreprocessingArtifacts.from_config(cfg)
+    artifacts.run_dir.mkdir(parents=True, exist_ok=True)
 
     catalog = read_foursquare_global_catalog(
         source,
@@ -569,24 +582,25 @@ def run_foursquare_pipeline(cfg: ExperimentConfig) -> None:
     places = write_places_index(
         place_inputs,
         events.select(["placekey", "city_id"]),
-        path=workspace.artifacts.places_index,
+        path=artifacts.places_index,
     )
     stays = events.join(
         places.select(["placekey", "placekey_id"]),
         on="placekey",
         how="left",
+        maintain_order="left",
     ).drop("placekey")
     pl.concat(all_scores, how="diagonal_relaxed").write_parquet(
-        workspace.artifacts.quality_scores
+        artifacts.quality_scores
     )
-    stays.write_parquet(workspace.artifacts.processed_visits)
+    stays.write_parquet(artifacts.processed_visits)
     closure = closure_from_stays(
         stays,
-        artifact=str(workspace.artifacts.processed_visits),
+        artifact=str(artifacts.processed_visits),
         source=str(source),
         split_seed=GLOBAL_SPLIT_SEED,
     )
-    write_closure(closure, workspace.artifacts.run_dir)
+    write_closure(closure, artifacts.run_dir)
     readme = _source_readme(source)
     source_files = {
         "checkins": str(checkins_path),
@@ -617,29 +631,10 @@ def run_foursquare_pipeline(cfg: ExperimentConfig) -> None:
         },
         "split_seed": GLOBAL_SPLIT_SEED,
     }
-    (
-        workspace.artifacts.run_dir / "foursquare_source_manifest.json"
-    ).write_text(
-        json.dumps(source_manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    write_json(
+        artifacts.run_dir / "foursquare_source_manifest.json",
+        source_manifest,
     )
-    write_run_manifest(
-        workspace.artifacts.run_dir,
-        config_path=workspace.artifacts.run_dir / cfg.output.config_filename,
-        output_dir=workspace.artifacts.run_dir,
-        data_artifact_paths={
-            "foursquare_source": source,
-            "foursquare_checkins": checkins_path,
-        },
-        metric_artifact_paths={
-            "processed_visits": workspace.artifacts.processed_visits,
-            "quality_scores": workspace.artifacts.quality_scores,
-            "places_index": workspace.artifacts.places_index,
-            "foursquare_source_manifest": workspace.artifacts.run_dir
-            / "foursquare_source_manifest.json",
-        },
-    )
-    log_pipeline_done(t0, workspace.output_dir)
 
 
 __all__ = [

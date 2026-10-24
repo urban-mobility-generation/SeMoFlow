@@ -15,9 +15,7 @@ logger = logging.getLogger(__name__)
 def write_embedding_diagnostics(
     embeddings_path: Path, index_path: Path | None, *, kind: str
 ) -> None:
-    from semoflow.metrics.encoder_embeddings import (
-        write_embedding_eval,
-    )
+    from semoflow.metrics.encoder_embeddings import write_embedding_eval
 
     write_embedding_eval(
         embeddings_path,
@@ -32,9 +30,7 @@ def run_text_encoder(cfg: ExperimentConfig) -> None:
     if not text_cfg.enabled:
         logger.info("text encoder skipped (enabled=false)")
         return
-    from semoflow.encoder.text.sentence_t5 import (
-        build_text_embeddings,
-    )
+    from semoflow.encoder.text.sentence_t5 import build_text_embeddings
 
     places_index_path = cfg.tokenizer_config.places_index_output_path()
     if not places_index_path.exists():
@@ -58,9 +54,7 @@ def run_graph_encoder(cfg: ExperimentConfig) -> dict[str, Any] | None:
     if not graph_cfg.enabled:
         logger.info("graph encoder skipped (enabled=false)")
         return None
-    from semoflow.training.graph_encoder import (
-        train_heterosage,
-    )
+    from semoflow.training.graph_encoder import train_heterosage
 
     started = time.perf_counter()
     result = train_heterosage(cfg)

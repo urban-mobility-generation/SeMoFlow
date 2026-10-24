@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +11,7 @@ from semoflow.utils.provenance import (
     load_closure,
     write_closure,
 )
+from semoflow.utils.serialization import write_json
 
 
 @dataclass(frozen=True)
@@ -191,10 +191,7 @@ def derive_city_subset(
         **result.to_dict(),
         "identity_bridge": "placekey_id remapped through source places_index",
     }
-    (output_dir / "run_manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    write_json(output_dir / "run_manifest.json", manifest)
     return result
 
 

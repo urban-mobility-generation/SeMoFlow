@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import dataclasses
-import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,9 +10,8 @@ import numpy as np
 import polars as pl
 import torch
 
-from semoflow.tokenization.cross_city_projection import (
-    Projection,
-)
+from semoflow.tokenization.cross_city_projection import Projection
+from semoflow.utils.serialization import write_json
 
 logger = logging.getLogger(__name__)
 
@@ -116,20 +114,17 @@ def apply_cross_city_projection(
     applied_cities = sorted(
         int(c) for c in frame["city_id"].unique().to_list()
     )
-    (output_dir / "projection_provenance.json").write_text(
-        json.dumps(
-            {
-                "format_version": "cross_city_projection_applied_v1",
-                "projection": str(projection),
-                "projection_fitted_cities": fitted,
-                "applied_cities": applied_cities,
-                "source_embeddings": str(embeddings),
-                "source_template": source_template,
-                "rows": int(frame.height),
-            },
-            indent=2,
-        )
-        + "\n"
+    write_json(
+        output_dir / "projection_provenance.json",
+        {
+            "format_version": "cross_city_projection_applied_v1",
+            "projection": str(projection),
+            "projection_fitted_cities": fitted,
+            "applied_cities": applied_cities,
+            "source_embeddings": str(embeddings),
+            "source_template": source_template,
+            "rows": int(frame.height),
+        },
     )
     logger.info("wrote %s  shape %s", output_dir, out.shape)
     return CrossCityProjectionApplyResult(

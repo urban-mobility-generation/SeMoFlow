@@ -175,8 +175,6 @@ def corrupt_proposal_prefixes_hierarchical(
     index: ProposalCorruptionIndex,
     *,
     corruption_rate: float,
-    generator: torch.Generator | None = None,
-    validate_membership: bool = True,
 ) -> tuple[torch.LongTensor, torch.BoolTensor, torch.LongTensor]:
     if not 0.0 <= corruption_rate <= 1.0:
         raise ValueError("corruption_rate must be in [0, 1]")
@@ -199,12 +197,11 @@ def corrupt_proposal_prefixes_hierarchical(
     ) * codebook_size + proposal[..., 2]
     positions = torch.searchsorted(index.keys, prefix_keys)
     safe_positions = positions.clamp_max(index.keys.numel() - 1)
-    if validate_membership:
-        found = index.keys[safe_positions].eq(prefix_keys)
-        if not bool(found[valid_mask].all()):
-            raise ValueError(
-                "active clean prefixes are missing from the corruption catalog"
-            )
+    found = index.keys[safe_positions].eq(prefix_keys)
+    if not bool(found[valid_mask].all()):
+        raise ValueError(
+            "active clean prefixes are missing from the corruption catalog"
+        )
 
     level1_start = index.level1_start[safe_positions]
     level1_end = index.level1_end[safe_positions]
@@ -224,11 +221,7 @@ def corrupt_proposal_prefixes_hierarchical(
     any_available = available.any(dim=-1)
     corrupt = (
         (
-            torch.rand(
-                valid_mask.shape,
-                device=proposal.device,
-                generator=generator,
-            )
+            torch.rand(valid_mask.shape, device=proposal.device)
             < corruption_rate
         )
         & valid_mask
@@ -236,18 +229,12 @@ def corrupt_proposal_prefixes_hierarchical(
     )
 
     choice_scores = torch.rand(
-        (*valid_mask.shape, 3),
-        device=proposal.device,
-        generator=generator,
+        (*valid_mask.shape, 3), device=proposal.device
     ).masked_fill(~available, -1.0)
     choice = choice_scores.argmax(dim=-1)
     depth = torch.where(corrupt, choice + 1, depth)
 
-    uniform = torch.rand(
-        valid_mask.shape,
-        device=proposal.device,
-        generator=generator,
-    )
+    uniform = torch.rand(valid_mask.shape, device=proposal.device)
 
     sibling_offset = (
         uniform * sibling_count.clamp_min(1).to(uniform.dtype)

@@ -53,165 +53,93 @@ Install with [uv](https://docs.astral.sh/uv/):
 uv sync
 ```
 
-Reading the [sample trajectories](#sample-trajectories) needs only a Parquet
-reader, not this environment.
-
 ## Data and preprocessing
 
-Download the Foursquare global 2015 release from the
-[dataset source page](https://sites.google.com/site/yangdingqi/home/foursquare-dataset)
-and extract it under `data/foursquare_global_2015/`. The directory should
-contain `dataset_TIST2015_Checkins.txt`, `dataset_TIST2015_POIs.txt`, and
-`dataset_TIST2015_Cities.txt`. Then run:
+Download the **Global-scale Check-in Dataset** from the
+[Foursquare dataset page](https://sites.google.com/site/yangdingqi/home/foursquare-dataset)
+and extract these files:
 
-```bash
-uv run semoflow-preprocess --config configs/preprocess/foursquare.yaml
+```text
+data/foursquare_global_2015/
+├── dataset_TIST2015_Checkins.txt
+├── dataset_TIST2015_POIs.txt
+└── dataset_TIST2015_Cities.txt
 ```
 
-To read the release from another directory, add
-`--set data.foursquare.archive_path=/path/to/extracted/release`.
+```bash
+uv run semoflow-preprocess --config configs/foursquare/preprocess.yaml
+```
 
-The [preprocessing config](configs/preprocess/foursquare.yaml) selects
-Los Angeles, Washington, D.C., Atlanta, San Francisco, and Milwaukee. The run
-writes `processed_visits.parquet`, `quality_scores.parquet`, and
-`places_index.parquet` to `outputs/preprocessing/foursquare_five_city/`.
+This prepares **Los Angeles, Washington DC, Atlanta, San Francisco, and
+Milwaukee** in `outputs/preprocessing/`: visits, the POI catalog, and quality scores.
 
 ## Training
 
-Training runs in three stages, each a separate command, and continues from
-the preprocessing output above. The sequence was checked end to end. Set
-`--device` and the `device` fields in the YAML files for your hardware;
-every command documents its options under `--help`.
+Run the stages in order from the repository root. All recipes are in
+[`configs/foursquare/`](configs/foursquare/).
 
-| Stage | Trains | Main outputs |
-| --- | --- | --- |
-| [1. Tokenizer](#stage-1-poi-encoders-and-sid-tokenizer) | Text and graph POI encoders, then the SID tokenizer | `$T/placekey_lookup.parquet`, `$T/tokenizer_codebooks.pt`, `$T/grounding_index.pkl` |
-| [2. Planner](#stage-2-planner) | Autoregressive prefix planner | `outputs/planner/best.pt` |
-| [3. Realizer](#stage-3-realizer) | Suffix latent-flow realizer | `outputs/realizer/best.pt` |
+| Stage | Output |
+| --- | --- |
+| 1. Encoders + tokenizer | `outputs/tokenization/` |
+| 2. Planner | `outputs/planner/best.pt` |
+| 3. Realizer | `outputs/realizer/best.pt` |
 
-All training and sampling commands use these two paths:
+Configs use `cuda:0`. Select a physical GPU before running the commands:
 
 ```bash
-P=outputs/preprocessing/foursquare_five_city
-T=outputs/tokenization/foursquare_five_city/dense_f_full
+export CUDA_VISIBLE_DEVICES=0
 ```
 
-### Stage 1: POI encoders and SID tokenizer
-
-Train the text and graph POI encoders:
+### 1. Encoders and tokenizer
 
 ```bash
-uv run semoflow-train encoder --config configs/encoder/foursquare_five_city.yaml
+uv run semoflow-train encoder --config configs/foursquare/encoder.yaml
+uv run semoflow-train tokenizer --config configs/foursquare/tokenizer.yaml
 ```
 
-Train the tokenizer, which writes its outputs to `$T`:
+### 2. Planner
+
+Build weekly trajectories and train the prefix planner:
 
 ```bash
-uv run semoflow-train tokenizer \
-  --config configs/tokenization/multi_city/foursquare_five_city/dense_full_transfer.yaml
+uv run semoflow-artifacts build --config configs/foursquare/planner.yaml
+uv run semoflow-train planner --config configs/foursquare/planner.yaml
 ```
 
-### Stage 2: Planner
+### 3. Realizer
 
-Split visits into weekly segments:
+Build the trajectory bank and train the suffix realizer:
 
 ```bash
-uv run semoflow-artifacts build-weekly-segments \
-  --stays $T/augmented_processed_visits.parquet --output outputs/segments.parquet
+uv run semoflow-artifacts build --config configs/foursquare/realizer.yaml
+uv run semoflow-train realizer --config configs/foursquare/realizer.yaml
 ```
 
-Build the planner dataset. Multi-city catalogs need city context
-(`--context-mode city`) so samples can be assigned to a city:
-
-```bash
-uv run semoflow-artifacts build-occurrence-planner-dataset \
-  --segments outputs/segments.parquet --lookup $T/placekey_lookup.parquet \
-  --codebook-size 48 --context-mode city --output outputs/planner_dataset.pt
-```
-
-Train the planner:
-
-```bash
-uv run semoflow-train planner \
-  --dataset outputs/planner_dataset.pt --output-dir outputs/planner
-```
-
-### Stage 3: Realizer
-
-Build the realizer bank:
-
-```bash
-uv run semoflow-artifacts build-realizer-bank \
-  --lookup $T/placekey_lookup.parquet --segments outputs/segments.parquet \
-  --output outputs/bank.pt
-```
-
-Train the realizer:
-
-```bash
-uv run semoflow-train realizer --bank outputs/bank.pt \
-  --codebooks $T/tokenizer_codebooks.pt --codebook-size 48 \
-  --catalog-path $T/placekey_lookup.parquet --output-dir outputs/realizer
-```
-
-The other files in [`configs/`](configs/) record the encoder and tokenizer
-recipes for the Veraset cities. They read processed Veraset data, which is
-not distributed (see [Released checkpoints](#released-checkpoints)).
+Override settings with `--set`, for example `--set planner.training.epochs=20`.
+Use `--help` for command options.
 
 ## Sampling
 
-Sampling has two steps: the planner samples visit times and SID prefixes,
-then the realizer completes the SIDs and grounds them to catalog POIs. Set
-`N` to the number of trajectories to generate:
+**Generate and evaluate all five cities** with one command. Trajectory lengths
+are sampled; the test set supplies the number of trajectories to generate.
 
 ```bash
-N=1000
+uv run semoflow-eval evaluate --config configs/foursquare/evaluation.yaml
 ```
 
-### Step 1: Sample plans
+Results are saved under `outputs/evaluation/<city>/`:
 
-Prepare `CITIES.parquet` with one row per sample and a `city_id` column
-naming the city to sample for. City IDs are defined in
-[`constants.py`](src/semoflow/config/constants.py):
-
-| City | `city_id` |
+| File | Contents |
 | --- | --- |
-| Los Angeles | 7 |
-| Washington, D.C. | 8 |
-| Atlanta | 9 |
-| San Francisco | 10 |
-| Milwaukee | 11 |
+| `plans.pt` | Sampled lengths, visit times, and SID prefixes |
+| `generated_full_sids.pt` | Completed SID trajectories |
+| `composition.json` | Fidelity metrics, including the six JSD scores; lower is better |
 
-Turn it into planner conditions:
+To run one city, append `--set "evaluation.cities={atlanta: 9}"`.
+See [city IDs](src/semoflow/config/constants.py) and
+[evaluation settings](configs/foursquare/evaluation.yaml).
 
-```bash
-uv run semoflow-artifacts build-occurrence-planner-conditions \
-  --checkpoint outputs/planner/best.pt --input CITIES.parquet \
-  --output outputs/conditions.pt
-```
-
-Sample plans:
-
-```bash
-uv run semoflow-eval sample-plans --checkpoint outputs/planner/best.pt \
-  --conditions outputs/conditions.pt --num-samples $N --output outputs/plans.pt
-```
-
-### Step 2: Compose POI trajectories
-
-Complete the SIDs, ground them to POIs, and evaluate the result:
-
-```bash
-uv run semoflow-eval compose --realizer-checkpoint outputs/realizer/best.pt \
-  --planner-samples outputs/plans.pt --planner-checkpoint outputs/planner/best.pt \
-  --bank outputs/bank.pt --codebooks $T/tokenizer_codebooks.pt \
-  --lookup $T/placekey_lookup.parquet --grounding-index $T/grounding_index.pkl \
-  --places $P/places_index.parquet --max-samples $N --output outputs/composition.json
-```
-
-### Sampling from the released checkpoints
-
-The released planner checkpoints sample on their own:
+### Sample a released planner
 
 ```bash
 uv run semoflow-eval sample-plans \
@@ -219,17 +147,13 @@ uv run semoflow-eval sample-plans \
   --output outputs/samples/chicago_plans.pt --num-samples 1000
 ```
 
-Composing these plans into grounded POI trajectories also needs the city's
-validation bank, SID lookup, and places table. Those are derived from the
-licensed data and are not released, so the composed trajectories are
-released instead; see [Sample trajectories](#sample-trajectories).
+Grounded generation also requires the unreleased Veraset catalog artifacts.
+Ready-to-use POI trajectories are available [below](#sample-trajectories).
 
 ## Released checkpoints
 
-[`veraset_checkpoints/`](veraset_checkpoints/) holds one directory of trained
-models per city. They were trained on Veraset visit data. Its license does
-not allow redistribution, so neither the raw nor the processed Veraset data
-is included, and the public preprocessing pipeline covers Foursquare only.
+Models trained on Veraset are in [`veraset_checkpoints/`](veraset_checkpoints/).
+The licensed raw and processed Veraset data are not included.
 
 | City | Planner | Realizer | Grounding index |
 | --- | --- | --- | --- |
@@ -239,19 +163,13 @@ is included, and the public preprocessing pipeline covers Foursquare only.
 | New York City | [25 MB](veraset_checkpoints/new_york_city/planner.pt) | [38 MB](veraset_checkpoints/new_york_city/realizer.pt) | [47 MB](veraset_checkpoints/new_york_city/grounding.pkl) |
 | Pittsburgh | [24 MB](veraset_checkpoints/pittsburgh/planner.pt) | [38 MB](veraset_checkpoints/pittsburgh/realizer.pt) | [8 MB](veraset_checkpoints/pittsburgh/grounding.pkl) |
 
-Each city directory contains:
-
-| File | Contents |
-| --- | --- |
-| `planner.pt` | The autoregressive prefix planner. |
-| `realizer.pt` | The suffix latent-flow realizer, with its tokenizer codebooks embedded. |
-| `grounding.pkl` | The index that maps full SIDs to catalog POIs (placekey, category, NAICS code, and coordinates). |
+Each realizer includes its tokenizer codebooks. The grounding index maps full
+SIDs to POIs and their metadata.
 
 ## Sample trajectories
 
-[`sampled_data/`](sampled_data/) holds 30,000 generated trajectories for each
-city, one file per city named `generated_poi_trajectories_30k.parquet`. The
-files contain no real device identifiers or timestamps.
+[`sampled_data/`](sampled_data/) contains **30,000 generated trajectories per
+city**, with no real device identifiers or timestamps.
 
 | City | Trajectories | Visits | Size |
 | --- | --- | --- | --- |
@@ -261,21 +179,16 @@ files contain no real device identifiers or timestamps.
 | [New York City](sampled_data/new_york_city/generated_poi_trajectories_30k.parquet) | 30,000 | 753,268 | 18 MB |
 | [Pittsburgh](sampled_data/pittsburgh/generated_poi_trajectories_30k.parquet) | 30,000 | 629,518 | 11 MB |
 
-Each row is one visit:
+Each row represents one visit:
 
-| Column | Description |
+| Columns | Contents |
 | --- | --- |
-| `trajectory_id` | The generated trajectory the visit belongs to. |
-| `event_index` | The visit's position within its trajectory. |
-| `placekey_id`, `placekey` | The grounded POI. |
-| `top_category`, `naics_code` | The POI's category and NAICS code. |
-| `latitude`, `longitude` | The POI's coordinates. |
-| `sem_code_0`–`sem_code_5` | The visit's SID, coarse to fine. |
-| `grounding_candidate_count` | How many catalog POIs match the SID. |
-| `poi_selection` | How one POI was chosen when several match (sampled from a prior fitted on training visits). |
-
-To read one city's file and order each trajectory's visits, for example
-with [Polars](https://pola.rs/):
+| `trajectory_id`, `event_index` | Trajectory and visit order |
+| `placekey_id`, `placekey` | Grounded POI |
+| `top_category`, `naics_code` | POI category |
+| `latitude`, `longitude` | Coordinates |
+| `sem_code_0`–`sem_code_5` | Coarse-to-fine SID |
+| `grounding_candidate_count`, `poi_selection` | Candidate count and selection policy |
 
 ```python
 import polars as pl

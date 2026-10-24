@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import json
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -52,14 +52,12 @@ from semoflow.tokenization.decoding.codebooks import (
 from semoflow.tokenization.decoding.grounding_index import (
     SemanticIDGroundingIndex,
 )
-from semoflow.training.utils.checkpoint import (
-    load_checkpoint,
-)
+from semoflow.utils.serialization import normalize_mapping, write_json
 
 LOGGER = logging.getLogger(__name__)
 
 
-def _load_model(
+def load_realizer_checkpoint(
     checkpoint_path: Path,
     device: torch.device,
 ) -> tuple[
@@ -146,7 +144,7 @@ def _load_model(
         spatial_num_basis=int(config.get("spatial_num_basis", 8)),
         spatial_max_km=float(config.get("spatial_max_km", 50.0)),
     ).to(device)
-    load_checkpoint(checkpoint_path, model, device=device)
+    model.load_state_dict(state)
     model.eval()
     return (
         model,
@@ -372,23 +370,30 @@ def _sample(
     return sampled_cpu
 
 
-def _catalog_support(
-    gold_valid: torch.Tensor,
-    gold_supported: torch.Tensor,
-    sampled_valid: torch.Tensor,
-    sampled_supported: torch.Tensor,
-) -> dict[str, int]:
+@dataclass(frozen=True)
+class _Arm:
+    """One conditioning source for the realizer: gold or sampled prefixes."""
+
+    name: str
+    prefix: torch.Tensor
+    times: torch.Tensor
+    input_valid: torch.Tensor
+    supported: torch.Tensor
+    seed: int
+    city_id: torch.Tensor | None
+    hop_distance_km: torch.Tensor | None
+
+
+def _catalog_support(arms: Sequence[_Arm]) -> dict[str, int]:
     counts: dict[str, int] = {}
-    for arm, valid, supported in (
-        ("gold_prefix", gold_valid, gold_supported),
-        ("sampled_plan", sampled_valid, sampled_supported),
-    ):
-        counts[f"{arm}_input_events"] = int(valid.sum().item())
-        counts[f"{arm}_supported_events"] = int(supported.sum().item())
-        counts[f"{arm}_unsupported_events"] = int(
+    for arm in arms:
+        valid, supported = arm.input_valid, arm.supported
+        counts[f"{arm.name}_input_events"] = int(valid.sum().item())
+        counts[f"{arm.name}_supported_events"] = int(supported.sum().item())
+        counts[f"{arm.name}_unsupported_events"] = int(
             (valid & ~supported).sum().item()
         )
-        counts[f"{arm}_rows_without_support"] = int(
+        counts[f"{arm.name}_rows_without_support"] = int(
             (~supported.any(dim=1)).sum().item()
         )
     return counts
@@ -440,6 +445,296 @@ def _write_flow_trace(
     )
 
 
+@dataclass(frozen=True)
+class _Decoding:
+    tail_whitener: torch.Tensor | None
+    tail_dewhitener: torch.Tensor | None
+    prior_weight: float
+    candidate_count: int
+    checkpoint_temperature: float
+    temperature: float
+
+    def report(self, decoder_mode: str) -> dict[str, Any]:
+        return {
+            "nearest_legal_catalog_tail_embedding": decoder_mode == "nearest",
+            "calibrated_legal_catalog_posterior": decoder_mode == "calibrated",
+            "catalog_prior_weight": self.prior_weight,
+            "global_candidate_count": self.candidate_count,
+            "catalog_temperature": self.temperature,
+            "checkpoint_catalog_temperature": self.checkpoint_temperature,
+            "a4_quota_or_injective_assignment": False,
+        }
+
+
+def _decoding_settings(
+    checkpoint: Mapping[str, Any],
+    model: PrefixTimeSuffixLatentFlowRealizer,
+    temperature_override: float | None,
+    device: torch.device,
+) -> _Decoding:
+    config = checkpoint.get("config", {})
+    if not isinstance(config, dict):
+        raise ValueError("checkpoint config must be a dictionary")
+    checkpoint_temperature = float(config.get("catalog_temperature", 1.0))
+    temperature = (
+        checkpoint_temperature
+        if temperature_override is None
+        else float(temperature_override)
+    )
+    if temperature <= 0.0:
+        raise ValueError("catalog temperature must be positive")
+    if (
+        temperature_override is not None
+        and model.catalog_decoder_mode != "calibrated"
+    ):
+        raise ValueError(
+            "--catalog-temperature applies only to the calibrated "
+            "legal-catalog posterior decoder"
+        )
+
+    def _on_device(key: str) -> torch.Tensor | None:
+        value = checkpoint.get(key)
+        return None if value is None else value.float().to(device)
+
+    return _Decoding(
+        tail_whitener=_on_device("tail_whitener"),
+        tail_dewhitener=_on_device("tail_dewhitener"),
+        prior_weight=float(config.get("catalog_prior_weight", 0.25)),
+        candidate_count=int(config.get("catalog_candidate_count", 64)),
+        checkpoint_temperature=checkpoint_temperature,
+        temperature=temperature,
+    )
+
+
+def _check_options(
+    *,
+    max_samples: int,
+    batch_size: int,
+    reference_split: str,
+    flow_trace_rows: int,
+    flow_path_output: Path | None,
+    catalog_prior_source: str,
+    generation_catalog_scope: str,
+    candidate_prior_path: Path | None,
+) -> None:
+    if max_samples < 1 or batch_size < 1:
+        raise ValueError("max_samples and batch_size must be positive")
+    if reference_split not in {"val", "test"}:
+        raise ValueError("reference_split must be 'val' or 'test'")
+    if flow_trace_rows < 0:
+        raise ValueError("flow_trace_rows must be non-negative")
+    if flow_path_output is not None and flow_trace_rows == 0:
+        raise ValueError("flow_path_output requires flow_trace_rows > 0")
+    if catalog_prior_source not in {"target_train", "uniform"}:
+        raise ValueError(
+            "catalog_prior_source must be 'target_train' or 'uniform'"
+        )
+    if generation_catalog_scope not in {"full_city", "train_observed"}:
+        raise ValueError(
+            "generation_catalog_scope must be 'full_city' or 'train_observed'"
+        )
+    if generation_catalog_scope == "train_observed" and (
+        candidate_prior_path is None or catalog_prior_source != "target_train"
+    ):
+        raise ValueError(
+            "train_observed generation requires the train candidate prior "
+            "and target_train catalog prior source"
+        )
+
+
+def _generation_catalog(
+    model: PrefixTimeSuffixLatentFlowRealizer,
+    payload: dict[str, Any],
+    *,
+    bank_path: Path,
+    lookup_path: Path,
+    places_path: Path,
+    codebooks_path: Path,
+    expected_bundle: SIDCodebookBundle,
+    catalog_prior_source: str,
+    train_place_ids: set[int] | None,
+) -> tuple[PrefixTailCatalog, SIDCodebookBundle]:
+    """The legal SID catalog generation decodes into, and its codebooks.
+
+    ``train_place_ids`` restricts the catalog to train-observed SIDs.
+    """
+    catalog_codes = torch.from_numpy(load_lookup(lookup_path)).long()
+    observed_codes = None
+    if catalog_prior_source == "target_train":
+        offset, count = resolve_bank_split_window(
+            payload, "train", path=bank_path
+        )
+        rows = slice(offset, offset + count)
+        observed_codes = payload["sid_codes"][rows][
+            payload["valid_mask"][rows].bool()
+        ]
+    if train_place_ids is not None:
+        if observed_codes is None or observed_codes.numel() == 0:
+            raise ValueError("train-observed catalog requires train SID rows")
+        catalog_codes = torch.unique(observed_codes.long(), dim=0)
+    bundle = extract_codebook_bundle(
+        codebooks_path,
+        max_artifact_bytes=MAX_STANDALONE_CODEBOOK_ARTIFACT_BYTES,
+    )
+    validate_codebook_compatibility(
+        expected_bundle.codebooks,
+        expected_bundle.code_fields,
+        bundle,
+    )
+    catalog_city = (
+        _catalog_city_ids(
+            lookup_path,
+            places_path,
+            catalog_codes,
+            allowed_place_ids=train_place_ids,
+        )
+        if getattr(model, "city_vocab", 0) > 0
+        else None
+    )
+    catalog = PrefixTailCatalog.from_codes(
+        catalog_codes,
+        bundle.codebooks,
+        prefix_depth=model.prefix_depth,
+        observed_codes=observed_codes,
+        candidate_city=catalog_city,
+        target_level_start=model.target_level_start,
+    )
+    return catalog, bundle
+
+
+def _conditioning_arms(
+    model: PrefixTimeSuffixLatentFlowRealizer,
+    catalog: PrefixTailCatalog,
+    payload: dict[str, Any],
+    *,
+    real: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    sampled: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    bank_path: Path,
+    sampled_plan_path: Path,
+    lookup_path: Path,
+    places_path: Path,
+    reference_split: str,
+) -> tuple[_Arm, _Arm]:
+    """Gold reference prefixes and sampled plans, with their conditioning.
+
+    ``real`` and ``sampled`` are ``(codes, time_tokens, valid_mask)``.
+    """
+    real_codes, real_times, real_valid = real
+    sampled_prefix, sampled_times, sampled_valid = sampled
+    gold_prefix = real_codes[..., : model.prefix_depth]
+    gold_city = sampled_city = gold_hop = sampled_hop = None
+    if getattr(model, "city_vocab", 0) > 0:
+        gold_city = bank_split_city_ids(
+            payload,
+            bank_path,
+            split=reference_split,
+            valid_mask=real_valid,
+            time_tokens=real_times,
+        )
+        sampled_city = _sampled_plan_city_ids(
+            sampled_plan_path, sampled_prefix.shape[0]
+        )
+    if getattr(model, "spatial_conditioning", False):
+        centroids = prefix_centroid_table(
+            lookup_path, places_path, real_codes.shape[-1], model.prefix_depth
+        )
+        gold_hop = prefix_hop_distance_km(gold_prefix, real_valid, centroids)
+        sampled_hop = prefix_hop_distance_km(
+            sampled_prefix, sampled_valid, centroids
+        )
+    gold = _Arm(
+        name="gold_prefix",
+        prefix=gold_prefix,
+        times=real_times,
+        input_valid=real_valid,
+        supported=_catalog_supported_events(catalog, gold_prefix, real_valid),
+        seed=7000,
+        city_id=gold_city,
+        hop_distance_km=gold_hop,
+    )
+    planned = _Arm(
+        name="sampled_plan",
+        prefix=sampled_prefix,
+        times=sampled_times,
+        input_valid=sampled_valid,
+        supported=_catalog_supported_events(
+            catalog, sampled_prefix, sampled_valid
+        ),
+        seed=17000,
+        city_id=sampled_city,
+        hop_distance_km=sampled_hop,
+    )
+    return gold, planned
+
+
+def _city_constraint_report(
+    model: PrefixTimeSuffixLatentFlowRealizer,
+    samples: Mapping[str, PrefixTimeSuffixLatentFlowSample],
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "enabled": any(
+            sample.city_constrained_events for sample in samples.values()
+        ),
+        "requested": getattr(model, "city_vocab", 0) > 0,
+    }
+    for name, sample in samples.items():
+        report[f"{name}_constrained_events"] = sample.city_constrained_events
+        report[f"{name}_fallback_events"] = (
+            sample.city_constraint_fallback_events
+        )
+    return report
+
+
+def _gold_reconstruction_metrics(
+    sample: PrefixTimeSuffixLatentFlowSample,
+    real_codes: torch.Tensor,
+    supported: torch.Tensor,
+    *,
+    model: PrefixTimeSuffixLatentFlowRealizer,
+    codebooks: torch.Tensor,
+    tail_mean: torch.Tensor,
+    tail_std: torch.Tensor,
+    tail_whitener: torch.Tensor | None,
+) -> dict[str, Any]:
+    """Suffix accuracy and continuous tail error against the gold POIs."""
+    suffix_accuracy = accuracy(
+        sample.full_sids.cpu(), real_codes, supported, model.prefix_depth
+    )
+    if sample.tail_level_embeddings is None:
+        tail_error = compute_tail_error_metrics(
+            sample.tail_embeddings,
+            real_codes,
+            supported,
+            codebooks,
+            tail_mean,
+            tail_std,
+            tail_whitener=tail_whitener,
+            prefix_depth=model.target_level_start,
+        )
+    else:
+        tail_error = compute_tail_level_error_metrics(
+            sample.tail_level_embeddings,
+            real_codes,
+            supported,
+            codebooks,
+            tail_mean,
+            tail_std,
+            prefix_depth=model.prefix_depth,
+        )
+    return {"accuracy": suffix_accuracy, "tail_error": tail_error}
+
+
+_LIMITATIONS = (
+    "sampled_plan is unpaired with the validation reference; exact target-POI accuracy is not applicable",
+    "tail_error and suffix accuracy are reported only for the row-aligned gold-prefix condition",
+    "the model receives fixed planner lengths and does not generate an EOS or length distribution",
+    "the catalog decoder uses only catalog SIDs whose prefix exactly matches the input prefix",
+    "generated ambiguous SIDs use the grounding index canonical first-candidate policy; this is not a learned POI disambiguator",
+    "train_observed restricts generation candidates only; existing tokenizer and checkpoints may still have been built using the full city catalog",
+    "prefix events without a train-observed legal continuation are excluded from generated events and counted in generation_catalog_support",
+)
+
+
 def evaluate(
     *,
     checkpoint_path: Path,
@@ -465,29 +760,16 @@ def evaluate(
     flow_path_output: Path | None = None,
     brief_metrics: bool = False,
 ) -> dict[str, Any]:
-    if max_samples < 1 or batch_size < 1:
-        raise ValueError("max_samples and batch_size must be positive")
-    if reference_split not in {"val", "test"}:
-        raise ValueError("reference_split must be 'val' or 'test'")
-    if flow_trace_rows < 0:
-        raise ValueError("flow_trace_rows must be non-negative")
-    if flow_path_output is not None and flow_trace_rows == 0:
-        raise ValueError("flow_path_output requires flow_trace_rows > 0")
-    if catalog_prior_source not in {"target_train", "uniform"}:
-        raise ValueError(
-            "catalog_prior_source must be 'target_train' or 'uniform'"
-        )
-    if generation_catalog_scope not in {"full_city", "train_observed"}:
-        raise ValueError(
-            "generation_catalog_scope must be 'full_city' or 'train_observed'"
-        )
-    if generation_catalog_scope == "train_observed" and (
-        candidate_prior_path is None or catalog_prior_source != "target_train"
-    ):
-        raise ValueError(
-            "train_observed generation requires the train candidate prior "
-            "and target_train catalog prior source"
-        )
+    _check_options(
+        max_samples=max_samples,
+        batch_size=batch_size,
+        reference_split=reference_split,
+        flow_trace_rows=flow_trace_rows,
+        flow_path_output=flow_path_output,
+        catalog_prior_source=catalog_prior_source,
+        generation_catalog_scope=generation_catalog_scope,
+        candidate_prior_path=candidate_prior_path,
+    )
     candidate_weights: Mapping[int, float] | None = (
         load_candidate_prior(candidate_prior_path)
         if candidate_prior_path is not None
@@ -498,42 +780,12 @@ def evaluate(
     resolved_device = torch.device(device)
     if resolved_device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(f"requested CUDA device is unavailable: {device}")
-    model, tail_mean, tail_std, expected_bundle, checkpoint = _load_model(
-        checkpoint_path, resolved_device
+    model, tail_mean, tail_std, expected_bundle, checkpoint = (
+        load_realizer_checkpoint(checkpoint_path, resolved_device)
     )
-    tail_whitener = checkpoint.get("tail_whitener")
-    tail_dewhitener = checkpoint.get("tail_dewhitener")
-    if tail_whitener is not None:
-        tail_whitener = tail_whitener.float().to(resolved_device)
-    if tail_dewhitener is not None:
-        tail_dewhitener = tail_dewhitener.float().to(resolved_device)
-    checkpoint_config = checkpoint.get("config", {})
-    if not isinstance(checkpoint_config, dict):
-        raise ValueError("checkpoint config must be a dictionary")
-    catalog_prior_weight = float(
-        checkpoint_config.get("catalog_prior_weight", 0.25)
+    decoding = _decoding_settings(
+        checkpoint, model, catalog_temperature_override, resolved_device
     )
-    global_candidate_count = int(
-        checkpoint_config.get("catalog_candidate_count", 64)
-    )
-    checkpoint_catalog_temperature = float(
-        checkpoint_config.get("catalog_temperature", 1.0)
-    )
-    catalog_temperature = (
-        checkpoint_catalog_temperature
-        if catalog_temperature_override is None
-        else float(catalog_temperature_override)
-    )
-    if catalog_temperature <= 0.0:
-        raise ValueError("catalog temperature must be positive")
-    if (
-        catalog_temperature_override is not None
-        and model.catalog_decoder_mode != "calibrated"
-    ):
-        raise ValueError(
-            "--catalog-temperature applies only to the calibrated "
-            "legal-catalog posterior decoder"
-        )
     payload = load_bank_payload(bank_path)
     real_codes, real_times, real_valid, real_placekey_ids = load_reference(
         bank_path,
@@ -563,109 +815,44 @@ def evaluate(
         else None
     )
 
-    catalog_codes = torch.from_numpy(load_lookup(lookup_path)).long()
-    observed_codes = None
-    if catalog_prior_source == "target_train":
-        train_offset, train_count = resolve_bank_split_window(
-            payload, "train", path=bank_path
-        )
-        train_codes = payload["sid_codes"][
-            train_offset : train_offset + train_count
-        ]
-        train_valid = payload["valid_mask"][
-            train_offset : train_offset + train_count
-        ].bool()
-        observed_codes = train_codes[train_valid]
     train_place_ids = (
-        set(int(value) for value in candidate_weights)
+        {int(value) for value in candidate_weights}
         if generation_catalog_scope == "train_observed"
         and candidate_weights is not None
         else None
     )
-    if generation_catalog_scope == "train_observed":
-        if observed_codes is None or observed_codes.numel() == 0:
-            raise ValueError("train-observed catalog requires train SID rows")
-        catalog_codes = torch.unique(observed_codes.long(), dim=0)
-    bundle = extract_codebook_bundle(
-        codebooks_path,
-        max_artifact_bytes=MAX_STANDALONE_CODEBOOK_ARTIFACT_BYTES,
-    )
-    validate_codebook_compatibility(
-        expected_bundle.codebooks,
-        expected_bundle.code_fields,
-        bundle,
-    )
-    catalog_city = None
-    if getattr(model, "city_vocab", 0) > 0:
-        catalog_city = _catalog_city_ids(
-            lookup_path,
-            places_path,
-            catalog_codes,
-            allowed_place_ids=train_place_ids,
-        )
-    catalog = PrefixTailCatalog.from_codes(
-        catalog_codes,
-        bundle.codebooks,
-        prefix_depth=model.prefix_depth,
-        observed_codes=observed_codes,
-        candidate_city=catalog_city,
-        target_level_start=model.target_level_start,
-    )
-    gold_supported_valid = _catalog_supported_events(
-        catalog,
-        real_codes[..., : model.prefix_depth],
-        real_valid,
-    )
-    sampled_supported_valid = _catalog_supported_events(
-        catalog,
-        sampled_prefix,
-        sampled_valid,
-    )
-    catalog_support = _catalog_support(
-        real_valid,
-        gold_supported_valid,
-        sampled_valid,
-        sampled_supported_valid,
+    catalog, bundle = _generation_catalog(
+        model,
+        payload,
+        bank_path=bank_path,
+        lookup_path=lookup_path,
+        places_path=places_path,
+        codebooks_path=codebooks_path,
+        expected_bundle=expected_bundle,
+        catalog_prior_source=catalog_prior_source,
+        train_place_ids=train_place_ids,
     )
     grounding = SemanticIDGroundingIndex.load(grounding_path)
     generated_grounding = (
-        _train_catalog_grounding(grounding, train_place_ids)
-        if train_place_ids is not None
-        else grounding
+        grounding
+        if train_place_ids is None
+        else _train_catalog_grounding(grounding, train_place_ids)
     )
     coordinates, geohashes, placekey_vocab_size = load_places(places_path)
 
-    gold_city = None
-    sampled_city = None
-    if getattr(model, "city_vocab", 0) > 0:
-        gold_city = bank_split_city_ids(
-            payload,
-            bank_path,
-            split=reference_split,
-            valid_mask=real_valid,
-            time_tokens=real_times,
-        )
-        sampled_city = _sampled_plan_city_ids(
-            sampled_plan_path, sampled_prefix.shape[0]
-        )
-
-    gold_hop = None
-    sampled_hop = None
-    if getattr(model, "spatial_conditioning", False):
-        assert places_path is not None
-        assert lookup_path is not None
-        centroids = prefix_centroid_table(
-            lookup_path,
-            places_path,
-            real_codes.shape[-1],
-            model.prefix_depth,
-        )
-        gold_hop = prefix_hop_distance_km(
-            real_codes[..., : model.prefix_depth], real_valid, centroids
-        )
-        sampled_hop = prefix_hop_distance_km(
-            sampled_prefix, sampled_valid, centroids
-        )
+    gold, planned = _conditioning_arms(
+        model,
+        catalog,
+        payload,
+        real=(real_codes, real_times, real_valid),
+        sampled=(sampled_prefix, sampled_times, sampled_valid),
+        bank_path=bank_path,
+        sampled_plan_path=sampled_plan_path,
+        lookup_path=lookup_path,
+        places_path=places_path,
+        reference_split=reference_split,
+    )
+    arms = (gold, planned)
 
     sample_arm = functools.partial(
         _sample,
@@ -673,34 +860,28 @@ def evaluate(
         catalog=catalog,
         tail_mean=tail_mean,
         tail_std=tail_std,
-        tail_whitener=tail_whitener,
-        tail_dewhitener=tail_dewhitener,
-        catalog_prior_weight=catalog_prior_weight,
-        catalog_temperature=catalog_temperature,
-        global_candidate_count=global_candidate_count,
+        tail_whitener=decoding.tail_whitener,
+        tail_dewhitener=decoding.tail_dewhitener,
+        catalog_prior_weight=decoding.prior_weight,
+        catalog_temperature=decoding.temperature,
+        global_candidate_count=decoding.candidate_count,
         batch_size=batch_size,
         device=resolved_device,
         num_steps=num_steps,
         solver=solver,
     )
-    gold_sample = sample_arm(
-        real_codes[..., : model.prefix_depth],
-        real_times,
-        gold_supported_valid,
-        seed=7000,
-        city_id=gold_city,
-        hop_distance_km=gold_hop,
-    )
-    sampled_seed = 17000
-    sampled_sample = sample_arm(
-        sampled_prefix,
-        sampled_times,
-        sampled_supported_valid,
-        seed=sampled_seed,
-        city_id=sampled_city,
-        hop_distance_km=sampled_hop,
-        trace_indices=flow_trace_indices,
-    )
+    samples = {
+        arm.name: sample_arm(
+            arm.prefix,
+            arm.times,
+            arm.supported,
+            seed=arm.seed,
+            city_id=arm.city_id,
+            hop_distance_km=arm.hop_distance_km,
+            trace_indices=flow_trace_indices if arm is planned else None,
+        )
+        for arm in arms
+    }
 
     flow_path = None
     if flow_trace_indices is not None:
@@ -709,25 +890,25 @@ def evaluate(
         )
         _write_flow_trace(
             flow_path,
-            sampled_sample,
+            samples[planned.name],
             flow_trace_indices,
             model=model,
-            prefix=sampled_prefix,
-            times=sampled_times,
-            valid=sampled_valid,
+            prefix=planned.prefix,
+            times=planned.times,
+            valid=planned.input_valid,
             solver=solver,
             num_steps=num_steps,
-            seed=sampled_seed,
+            seed=planned.seed,
             checkpoint_path=checkpoint_path,
             sampled_plan_path=sampled_plan_path,
         )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "gold_prefix_full_sids": gold_sample.full_sids.cpu(),
-            "sampled_plan_full_sids": sampled_sample.full_sids.cpu(),
-            "sampled_plan_valid_mask": sampled_supported_valid,
-            "sampled_plan_input_valid_mask": sampled_valid,
+            "gold_prefix_full_sids": samples[gold.name].full_sids.cpu(),
+            "sampled_plan_full_sids": samples[planned.name].full_sids.cpu(),
+            "sampled_plan_valid_mask": planned.supported,
+            "sampled_plan_input_valid_mask": planned.input_valid,
             "decoder": (
                 "calibrated_legal_catalog_posterior"
                 if model.catalog_decoder_mode == "calibrated"
@@ -754,86 +935,51 @@ def evaluate(
         brief_metrics=brief_metrics,
     )
     evaluations: dict[str, dict[str, Any]] = {}
-    for arm, sample, supported, arm_times in (
-        ("gold_prefix", gold_sample, gold_supported_valid, real_times),
-        (
-            "sampled_plan",
-            sampled_sample,
-            sampled_supported_valid,
-            sampled_times,
-        ),
-    ):
+    for arm in arms:
+        label = arm.name.replace("_", "-")
         started_at = time.perf_counter()
         LOGGER.info(
             "computing %s metrics on %s rows using %s",
-            arm.replace("_", "-"),
+            label,
             len(real_codes),
             resolved_device,
         )
-        evaluations[arm] = arm_metrics(
-            sample.full_sids.cpu(),
-            supported,
-            motif_day_keys_generated=arm_times // 6,
+        evaluations[arm.name] = arm_metrics(
+            samples[arm.name].full_sids.cpu(),
+            arm.supported,
+            motif_day_keys_generated=arm.times // 6,
         )
         LOGGER.info(
             "%s metrics complete in %.1fs",
-            arm.replace("_", "-"),
+            label,
             time.perf_counter() - started_at,
         )
-    gold_metrics = evaluations["gold_prefix"]
-    sampled_metrics = evaluations["sampled_plan"]
     if not brief_metrics:
-        gold_metrics["accuracy"] = accuracy(
-            gold_sample.full_sids.cpu(),
-            real_codes,
-            gold_supported_valid,
-            model.prefix_depth,
+        evaluations[gold.name].update(
+            _gold_reconstruction_metrics(
+                samples[gold.name],
+                real_codes,
+                gold.supported,
+                model=model,
+                codebooks=bundle.codebooks,
+                tail_mean=tail_mean,
+                tail_std=tail_std,
+                tail_whitener=decoding.tail_whitener,
+            )
         )
-        sampled_metrics["accuracy"] = None
-        if gold_sample.tail_level_embeddings is None:
-            gold_metrics["tail_error"] = compute_tail_error_metrics(
-                gold_sample.tail_embeddings,
-                real_codes,
-                gold_supported_valid,
-                bundle.codebooks,
-                tail_mean,
-                tail_std,
-                tail_whitener=tail_whitener,
-                prefix_depth=model.target_level_start,
-            )
-        else:
-            gold_metrics["tail_error"] = compute_tail_level_error_metrics(
-                gold_sample.tail_level_embeddings,
-                real_codes,
-                gold_supported_valid,
-                bundle.codebooks,
-                tail_mean,
-                tail_std,
-                prefix_depth=model.prefix_depth,
-            )
-        sampled_metrics["tail_error"] = None
-        for metrics, generated, valid, input_events in (
-            (
-                gold_metrics,
-                gold_sample,
-                gold_supported_valid,
-                catalog_support["gold_prefix_input_events"],
-            ),
-            (
-                sampled_metrics,
-                sampled_sample,
-                sampled_supported_valid,
-                catalog_support["sampled_plan_input_events"],
-            ),
-        ):
-            metrics["sampling_dynamics"] = dynamics(
-                generated.full_sids.cpu(),
-                valid,
-                generated_grounding,
-            )
-            metrics["sampling_dynamics"]["catalog_validity_rate"] = float(
-                valid.sum().item() / max(int(input_events), 1)
-            )
+        evaluations[planned.name].update(accuracy=None, tail_error=None)
+        for arm in arms:
+            evaluations[arm.name]["sampling_dynamics"] = {
+                **dynamics(
+                    samples[arm.name].full_sids.cpu(),
+                    arm.supported,
+                    generated_grounding,
+                ),
+                "catalog_validity_rate": float(
+                    arm.supported.sum().item()
+                    / max(int(arm.input_valid.sum().item()), 1)
+                ),
+            }
 
     result: dict[str, Any] = {
         "model_type": model_type(model.latent_target_scope),
@@ -855,25 +1001,7 @@ def evaluate(
         "grounding_index": str(grounding_path),
         "rows": n_rows,
         "device": str(resolved_device),
-        "city_constraint": {
-            "enabled": bool(
-                gold_sample.city_constrained_events
-                or sampled_sample.city_constrained_events
-            ),
-            "requested": getattr(model, "city_vocab", 0) > 0,
-            "gold_prefix_constrained_events": (
-                gold_sample.city_constrained_events
-            ),
-            "gold_prefix_fallback_events": (
-                gold_sample.city_constraint_fallback_events
-            ),
-            "sampled_plan_constrained_events": (
-                sampled_sample.city_constrained_events
-            ),
-            "sampled_plan_fallback_events": (
-                sampled_sample.city_constraint_fallback_events
-            ),
-        },
+        "city_constraint": _city_constraint_report(model, samples),
         "sampling": {"solver": solver, "num_steps": num_steps},
         "flow_trace": {
             "enabled": flow_path is not None,
@@ -891,22 +1019,13 @@ def evaluate(
             None if train_place_ids is None else len(train_place_ids)
         ),
         "generation_candidate_sid_count": int(catalog.codes.shape[0]),
-        "generation_catalog_support": catalog_support,
+        "generation_catalog_support": _catalog_support(arms),
         "candidate_prior": (
             None if candidate_prior_path is None else str(candidate_prior_path)
         ),
-        "decoding": {
-            "nearest_legal_catalog_tail_embedding": model.catalog_decoder_mode
-            == "nearest",
-            "calibrated_legal_catalog_posterior": model.catalog_decoder_mode
-            == "calibrated",
-            "catalog_prior_weight": catalog_prior_weight,
-            "global_candidate_count": global_candidate_count,
-            "catalog_temperature": catalog_temperature,
-            "checkpoint_catalog_temperature": checkpoint_catalog_temperature,
-            "a4_quota_or_injective_assignment": False,
-        },
+        "decoding": decoding.report(model.catalog_decoder_mode),
         "metric_protocol": {
+            "undefined_metric_value": None,
             "brief_metrics": brief_metrics,
             "ground_before_poi_metrics": True,
             "reference_poi_source": (
@@ -923,18 +1042,11 @@ def evaluate(
         },
         "sampled_plan_protocol": sampled_protocol,
         "evaluations": evaluations,
-        "limitations": [
-            "sampled_plan is unpaired with the validation reference; exact target-POI accuracy is not applicable",
-            "tail_error and suffix accuracy are reported only for the row-aligned gold-prefix condition",
-            "the model receives fixed planner lengths and does not generate an EOS or length distribution",
-            "the catalog decoder uses only catalog SIDs whose prefix exactly matches the input prefix",
-            "generated ambiguous SIDs use the grounding index canonical first-candidate policy; this is not a learned POI disambiguator",
-            "train_observed restricts generation candidates only; existing tokenizer and checkpoints may still have been built using the full city catalog",
-            "prefix events without a train-observed legal continuation are excluded from generated events and counted in generation_catalog_support",
-        ],
+        "limitations": list(_LIMITATIONS),
     }
-    output_path.write_text(
-        json.dumps(result, indent=2, sort_keys=True, default=str) + "\n",
-        encoding="utf-8",
-    )
+    result = normalize_mapping(result)
+    write_json(output_path, result)
     return result
+
+
+__all__ = ["evaluate", "load_realizer_checkpoint"]

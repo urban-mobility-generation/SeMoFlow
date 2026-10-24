@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -11,6 +12,10 @@ import yaml
 
 
 def normalize_value(value: object) -> object:
+    # Sparse evaluation panels can have undefined metrics (e.g. no returns).
+    # JSON has no NaN/Infinity literals; preserve missingness with null.
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return normalize_mapping(dataclasses.asdict(value))
     if (
@@ -36,36 +41,35 @@ def normalize_mapping(mapping: Mapping[Any, Any]) -> dict[str, Any]:
     }
 
 
-def normalize_config(config: object) -> dict[str, Any]:
-    if dataclasses.is_dataclass(config) and not isinstance(config, type):
-        return normalize_mapping(dataclasses.asdict(config))
-    if (
-        not isinstance(config, type)
-        and hasattr(config, "to_dict")
-        and callable(config.to_dict)
-    ):
-        to_dict = cast(Callable[[], object], config.to_dict)
-        return normalize_config(to_dict())
-    if isinstance(config, Mapping):
-        return normalize_mapping(cast(Mapping[Any, Any], config))
-    return {"value": repr(config)}
-
-
-def to_serialisable_dict(obj: object) -> Any:
-    return normalize_value(obj)
-
-
 def to_yaml_string(obj: object) -> str:
     return yaml.dump(
-        to_serialisable_dict(obj),
+        normalize_value(obj),
         default_flow_style=False,
         allow_unicode=True,
         sort_keys=True,
     )
 
 
+def dump_json(payload: object, *, indent: int | None = 2) -> str:
+    """Strict, deterministic JSON: sorted keys, non-finite floats as null."""
+    return json.dumps(
+        normalize_value(payload),
+        indent=indent,
+        sort_keys=True,
+        default=str,
+        allow_nan=False,
+    )
+
+
+def write_json(path: str | Path, payload: object) -> Path:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(dump_json(payload) + "\n", encoding="utf-8")
+    return target
+
+
 def write_json_atomic(
-    path: str | Path, payload: dict[str, Any], *, force: bool
+    path: str | Path, payload: object, *, force: bool = True
 ) -> None:
     target = Path(path)
     if target.exists() and not force:
@@ -75,19 +79,17 @@ def write_json_atomic(
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(f"{target.name}.tmp-{os.getpid()}")
     try:
-        tmp.write_text(
-            json.dumps(payload, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
+        tmp.write_text(dump_json(payload) + "\n", encoding="utf-8")
         os.replace(tmp, target)
     finally:
         tmp.unlink(missing_ok=True)
 
 
 __all__ = [
-    "normalize_config",
+    "dump_json",
     "normalize_mapping",
     "normalize_value",
-    "to_serialisable_dict",
     "to_yaml_string",
+    "write_json",
+    "write_json_atomic",
 ]

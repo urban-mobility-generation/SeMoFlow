@@ -51,14 +51,11 @@ def init_worker(
     port: int,
     log_level: str,
     log_file: Path | None,
-    *,
-    log_all_ranks: bool = False,
 ) -> torch.device:
     from semoflow.logging.primitives import configure_logging
 
     configure_logging(
-        level=log_level,
-        log_file=log_file if (rank == 0 or log_all_ranks) else None,
+        level=log_level, log_file=log_file if rank == 0 else None
     )
     if rank == 0:
         logger.info(
@@ -92,17 +89,8 @@ def ddp_worker(
     port: int,
     log_level: str = "INFO",
     log_file: Path | None = None,
-    *,
-    log_all_ranks: bool = False,
 ) -> Generator[torch.device, None, None]:
-    device = init_worker(
-        rank,
-        device_ids,
-        port,
-        log_level,
-        log_file,
-        log_all_ranks=log_all_ranks,
-    )
+    device = init_worker(rank, device_ids, port, log_level, log_file)
     try:
         yield device
     finally:

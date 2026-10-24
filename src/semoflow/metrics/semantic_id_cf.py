@@ -7,15 +7,11 @@ import polars as pl
 import torch
 from scipy.stats import spearmanr
 
-from semoflow.metrics.semantic_id_trajectory import (
-    collapse_consecutive_pois,
-)
+from semoflow.metrics.semantic_id_trajectory import collapse_consecutive_pois
 from semoflow.tokenization.decoding.grounding_index import (
     SemanticIDGroundingIndex,
 )
-from semoflow.tokenization.token_space import (
-    sid_code_columns,
-)
+from semoflow.tokenization.token_space import sid_code_columns
 
 
 def empty_cf_alignment_metrics(k: int) -> dict[str, Any]:
@@ -61,11 +57,13 @@ def cf_alignment_metrics(
         and "placekey_id" in cf_index.columns
         else "placekey"
     )
-    joined = grounding_frame.join(cf_index, on=join_col, how="inner")
+    joined = grounding_frame.join(
+        cf_index, on=join_col, how="inner", maintain_order="right"
+    )
     if "embedding_row" not in joined.columns:
         return {**empty_cf_alignment_metrics(k)}
 
-    joined = joined.unique(subset=[join_col])
+    joined = joined.unique(subset=[join_col], maintain_order=True)
     n = joined.height
     if n < k + 1:
         result = empty_cf_alignment_metrics(k)
@@ -147,7 +145,8 @@ def cf_alignment_metrics(
         cf_index,
         on=join_col,
         how="inner",
-    ).unique(subset=[join_col])
+        maintain_order="right",
+    ).unique(subset=[join_col], maintain_order=True)
     transition_recall, transition_recall_by_prefix = (
         _cf_transition_recall(
             stays,
@@ -234,7 +233,7 @@ def _cf_transition_recall(
 
     identity = embedding_joined.select(
         [join_col, "embedding_row", *code_cols]
-    ).unique(subset=[join_col])
+    ).unique(subset=[join_col], maintain_order=True)
     identity_rows = identity["embedding_row"].cast(pl.Int64).to_numpy()
     valid_identity = (identity_rows >= 0) & (
         identity_rows < int(cf_embeddings.shape[0])

@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Hashable, Iterable
 from itertools import combinations
 from typing import Any, cast
 
 import numpy as np
 import polars as pl
 
-from semoflow.metrics.divergence import (
-    jensen_shannon_divergence,
-)
+from semoflow.metrics.divergence import jensen_shannon_divergence
 from semoflow.metrics.semantic_id_uncertainty import (
     bootstrap_difference_ci,
     bootstrap_mean_ci,
@@ -50,10 +49,6 @@ def sample_stays_for_trajectory_eval(
             sort_cols.append("timestamp")
         sampled = sampled.sort(sort_cols).head(max_events)
     return sampled
-
-
-def _jsd(p: np.ndarray, q: np.ndarray) -> float:
-    return jensen_shannon_divergence(p, q)
 
 
 def _hourly_distribution(hours: np.ndarray) -> np.ndarray:
@@ -180,19 +175,23 @@ def _prefix_key(
     return tuple(int(row[column]) for column in columns[:prefix])
 
 
+def _dense_ids(labels: Iterable[Hashable]) -> list[int]:
+    """Integer ids in first-occurrence order, independent of hash seeds."""
+    ids: dict[Hashable, int] = {}
+    return [ids.setdefault(label, len(ids)) for label in labels]
+
+
 def _prefix_transition_metrics(
     transitions: pl.DataFrame,
     code_cols: list[str],
     *,
     min_transitions: int,
-) -> tuple[
-    dict[int, float],
-    dict[int, float],
-    dict[int, float | None],
-]:
+) -> tuple[dict[int, float], dict[int, float], dict[int, float]]:
+    from sklearn.metrics import mutual_info_score
+
     entropy: dict[int, float] = {}
     prediction_accuracy: dict[int, float] = {}
-    next_poi_mi: dict[int, float | None] = {}
+    next_poi_mi: dict[int, float] = {}
     if transitions.is_empty():
         return entropy, prediction_accuracy, next_poi_mi
 
@@ -246,29 +245,17 @@ def _prefix_transition_metrics(
             correct / eligible_total if eligible_total else 0.0
         )
 
-        source_labels: list[tuple[int, ...]] = []
-        next_poi_labels: list[str] = []
-        for row in transition_rows:
-            source_labels.append(_prefix_key(row, code_cols, depth))
-            next_poi_labels.append(str(row["next_poi_str"]))
-        try:
-            from sklearn.metrics import mutual_info_score
-
-            source_ids = {
-                label: index for index, label in enumerate(set(source_labels))
-            }
-            poi_ids = {
-                label: index
-                for index, label in enumerate(set(next_poi_labels))
-            }
-            next_poi_mi[depth] = float(
-                mutual_info_score(
-                    [source_ids[label] for label in source_labels],
-                    [poi_ids[label] for label in next_poi_labels],
-                )
+        next_poi_mi[depth] = float(
+            mutual_info_score(
+                _dense_ids(
+                    _prefix_key(row, code_cols, depth)
+                    for row in transition_rows
+                ),
+                _dense_ids(
+                    str(row["next_poi_str"]) for row in transition_rows
+                ),
             )
-        except ImportError:
-            next_poi_mi[depth] = None
+        )
 
     return entropy, prediction_accuracy, next_poi_mi
 
@@ -287,7 +274,7 @@ def _profile_coherence_by_prefix(
     if hour_col is None or frame.is_empty():
         return {}, {}, {}
     grouped = (
-        frame.group_by("poi_str")
+        frame.group_by("poi_str", maintain_order=True)
         .agg(
             *[
                 pl.col(hour_col)
@@ -346,7 +333,9 @@ def _profile_coherence_by_prefix(
             if len(indices) > 50:
                 indices = list(rng.choice(indices, size=50, replace=False))
             within.extend(
-                _jsd(distributions[left], distributions[right])
+                jensen_shannon_divergence(
+                    distributions[left], distributions[right]
+                )
                 for left, right in combinations(indices, 2)
             )
         if within:
@@ -360,7 +349,9 @@ def _profile_coherence_by_prefix(
             valid = left != right
             if valid.any():
                 random_jsds = [
-                    _jsd(distributions[i], distributions[j])
+                    jensen_shannon_divergence(
+                        distributions[i], distributions[j]
+                    )
                     for i, j in zip(left[valid], right[valid], strict=True)
                 ]
                 baseline[depth] = float(np.mean(random_jsds))
@@ -434,7 +425,7 @@ def _prefix_sharing_bootstrap_cis(
             grouped = (
                 frame.select([group_column, "_prefix_match"])
                 .drop_nulls()
-                .group_by(group_column)
+                .group_by(group_column, maintain_order=True)
                 .agg(pl.col("_prefix_match").mean())
             )
             interval = bootstrap_mean_ci(
@@ -500,7 +491,7 @@ def trajectory_behavioral_metrics(
         if len(all_hours) > 0:
             global_dist = _hourly_distribution(all_hours)
             hour_hist = (
-                joined.group_by("sid_str")
+                joined.group_by("sid_str", maintain_order=True)
                 .agg(
                     *[
                         pl.col(hour_col)
@@ -525,7 +516,7 @@ def trajectory_behavioral_metrics(
                 result["temporal_distinctiveness"] = float(
                     np.mean(
                         [
-                            _jsd(row / total, global_dist)
+                            jensen_shannon_divergence(row / total, global_dist)
                             for row, total in zip(
                                 counts, totals[:, 0], strict=True
                             )

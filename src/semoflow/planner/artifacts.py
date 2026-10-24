@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import math
 import os
-from collections.abc import Iterator, Sequence
-from dataclasses import asdict, dataclass
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, cast, overload
 
 import torch
 
+from semoflow.config.schemas.planner_config import (
+    OccurrencePlannerTrainingOptions,
+)
 from semoflow.planner.config import (
     OccurrencePlannerConfig,
     validate_gap_duration_minutes,
 )
 from semoflow.planner.gap_codec import (
+    bucketize_gap_durations,
     validate_gap_codec_contract,
 )
 from semoflow.planner.legality import LegalPrefixIndex
@@ -27,52 +31,6 @@ CHECKPOINT_ARTIFACT_TYPE = "occurrence_planner_checkpoint"
 CONDITIONS_ARTIFACT_TYPE = "occurrence_planner_conditions"
 
 SAMPLES_ARTIFACT_TYPE = "occurrence_planner_samples"
-
-_CONFIG_FIELDS = {
-    "codebook_size",
-    "gap_vocab",
-    "prefix_depth",
-    "max_occurrences",
-    "model_dim",
-    "n_heads",
-    "n_layers",
-    "dropout",
-    "context_dim",
-    "context_schema",
-    "city_conditioning",
-    "prefix_decoder",
-    "mobility_router",
-    "mobility_gate_prior",
-    "use_tokenizer_latent",
-    "use_distance_prior",
-    "gap_codec_version",
-    "gap_bucket_edges_minutes",
-    "gap_duration_minutes",
-    "observation_window_minutes",
-}
-
-
-_TRAINING_OPTIONS_FIELDS = {
-    "epochs",
-    "batch_size",
-    "learning_rate",
-    "weight_decay",
-    "length_weight",
-    "gap_weight",
-    "prefix_weight",
-    "recurrence_weight",
-    "label_smoothing",
-    "device",
-    "lr_scheduler",
-    "warmup_steps",
-    "min_lr",
-    "num_workers",
-    "early_stopping_patience",
-    "distributed",
-    "compile_model",
-    "compile_backend",
-    "compile_mode",
-}
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,6 +285,129 @@ def _require_exact_keys(
     return mapping
 
 
+_SPLIT_KEYS = frozenset(
+    {
+        "prefix_codes",
+        "gap_tokens",
+        "lengths",
+        "context_features",
+        "event_time_minutes",
+        "city_ids",
+    }
+)
+_DATASET_KEYS = frozenset(
+    {
+        "artifact_type",
+        "data_config",
+        "legal_prefixes",
+        "prefix_codebooks",
+        "legal_prefix_centroids",
+        "legal_prefix_centroid_available",
+        "train",
+        "validation",
+    }
+)
+_CITY_LEGALITY_KEYS = frozenset({"catalog_city_ids", "city_legal_prefix_mask"})
+_DATA_CONFIG_KEYS = frozenset(
+    field.name for field in fields(OccurrencePlannerDataConfig)
+)
+_CONFIG_KEYS = frozenset(
+    field.name for field in fields(OccurrencePlannerConfig)
+)
+_OPTIONS_KEYS = frozenset(
+    field.name for field in fields(OccurrencePlannerTrainingOptions)
+)
+
+
+def _from_exact_mapping[T](
+    build: Callable[..., T],
+    value: object,
+    keys: frozenset[str],
+    *,
+    label: str,
+) -> T:
+    """``build(**value)`` for a mapping with exactly ``keys``; invalid
+    values surface as ValueError."""
+    mapping = _require_exact_keys(value, set(keys), label=label)
+    try:
+        return build(**mapping)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid {label}: {exc}") from exc
+
+
+def _load_context(
+    context: object,
+    *,
+    rows: int,
+    config: OccurrencePlannerDataConfig,
+    label: str,
+) -> torch.Tensor | None:
+    if config.context_dim == 0:
+        if context is not None:
+            raise ValueError(
+                f"{label} context must be absent when context_dim=0"
+            )
+        return None
+    if not isinstance(context, torch.Tensor):
+        raise ValueError(f"{label} context_features must be a tensor")
+    if context.device.type != "cpu":
+        raise ValueError(f"{label} context_features must be on CPU")
+    if context.dtype != torch.float32:
+        raise ValueError(f"{label} context_features must use torch.float32")
+    if context.shape != (rows, config.context_dim):
+        raise ValueError(f"{label} context_features have the wrong shape")
+    if not bool(torch.isfinite(context).all()):
+        raise ValueError(f"{label} context_features must be finite")
+    return context.clone()
+
+
+def _load_event_times(
+    event_time: object,
+    *,
+    gaps: torch.Tensor,
+    valid: torch.Tensor,
+    config: OccurrencePlannerDataConfig,
+    label: str,
+) -> torch.Tensor | None:
+    if not config.temporal_state_enabled:
+        if event_time is not None:
+            raise ValueError(
+                f"{label} event_time_minutes supplied without a time channel"
+            )
+        return None
+    if not isinstance(event_time, torch.Tensor):
+        raise ValueError(
+            f"{label} event_time_minutes is required by a time channel"
+        )
+    if event_time.device.type != "cpu":
+        raise ValueError(f"{label} event_time_minutes must be on CPU")
+    if event_time.dtype != torch.float32:
+        raise ValueError(f"{label} event_time_minutes must use torch.float32")
+    if event_time.shape != gaps.shape:
+        raise ValueError(f"{label} event_time_minutes have the wrong shape")
+    if not bool(torch.isfinite(event_time).all()):
+        raise ValueError(f"{label} event_time_minutes must be finite")
+    if bool((event_time < 0).any()):
+        raise ValueError(f"{label} event_time_minutes must be non-negative")
+    window = config.observation_window_minutes
+    edges = config.gap_bucket_edges_minutes
+    assert window is not None and edges is not None
+    if bool((event_time[valid] > window + 1e-3).any()):
+        raise ValueError(
+            f"{label} event_time_minutes exceeds the observation window"
+        )
+    durations = event_time.clone()
+    durations[:, 1:] -= event_time[:, :-1]
+    if bool(((durations[:, 1:] < 0) & valid[:, 1:]).any()):
+        raise ValueError(f"{label} event_time_minutes must be non-decreasing")
+    expected_gaps = bucketize_gap_durations(durations, edges)
+    if not torch.equal(gaps[valid], expected_gaps[valid]):
+        raise ValueError(
+            f"{label} gap_tokens disagree with event_time_minutes"
+        )
+    return event_time.clone()
+
+
 def _load_split(
     value: object,
     *,
@@ -334,23 +415,10 @@ def _load_split(
     config: OccurrencePlannerDataConfig,
     legality: LegalPrefixIndex,
 ) -> OccurrencePlannerSplit:
-    split = _require_exact_keys(
-        value,
-        {
-            "prefix_codes",
-            "gap_tokens",
-            "lengths",
-            "context_features",
-            "event_time_minutes",
-            "city_ids",
-        },
-        label=label,
-    )
+    split = _require_exact_keys(value, set(_SPLIT_KEYS), label=label)
     prefixes = split["prefix_codes"]
     gaps = split["gap_tokens"]
     lengths = split["lengths"]
-    context = split["context_features"]
-    event_time = split["event_time_minutes"]
     city_ids = split["city_ids"]
     if not (
         isinstance(prefixes, torch.Tensor)
@@ -358,17 +426,10 @@ def _load_split(
         and isinstance(lengths, torch.Tensor)
     ):
         raise ValueError(f"{label} sequence fields must be tensors")
-    if (
-        prefixes.device.type != "cpu"
-        or gaps.device.type != "cpu"
-        or lengths.device.type != "cpu"
-    ):
+    sequence = (prefixes, gaps, lengths)
+    if any(tensor.device.type != "cpu" for tensor in sequence):
         raise ValueError(f"{label} tensors must be on CPU")
-    if (
-        prefixes.dtype != torch.long
-        or gaps.dtype != torch.long
-        or lengths.dtype != torch.long
-    ):
+    if any(tensor.dtype != torch.long for tensor in sequence):
         raise ValueError(f"{label} sequence tensors must use torch.long")
     if prefixes.ndim != 3:
         raise ValueError(f"{label}.prefix_codes must have shape [N, S, P]")
@@ -404,218 +465,66 @@ def _load_split(
         raise ValueError(
             f"{label} city_ids must be a CPU long tensor with shape [N]"
         )
-    city_id_tensor = city_ids.clone()
-    if config.context_dim == 0:
-        if context is not None:
-            raise ValueError(
-                f"{label} context must be absent when context_dim=0"
-            )
-        context_tensor = None
-    else:
-        if not isinstance(context, torch.Tensor):
-            raise ValueError(f"{label} context_features must be a tensor")
-        context_tensor = context
-        if context_tensor.device.type != "cpu":
-            raise ValueError(f"{label} context_features must be on CPU")
-        if context_tensor.dtype != torch.float32:
-            raise ValueError(
-                f"{label} context_features must use torch.float32"
-            )
-        if context_tensor.shape != (rows, config.context_dim):
-            raise ValueError(f"{label} context_features have the wrong shape")
-        if not bool(torch.isfinite(context_tensor).all()):
-            raise ValueError(f"{label} context_features must be finite")
-        context_tensor = context_tensor.clone()
-    if not config.temporal_state_enabled:
-        if event_time is not None:
-            raise ValueError(
-                f"{label} event_time_minutes supplied without a time channel"
-            )
-        event_time_tensor = None
-    else:
-        if not isinstance(event_time, torch.Tensor):
-            raise ValueError(
-                f"{label} event_time_minutes is required by a time channel"
-            )
-        event_time_tensor = event_time
-        if event_time_tensor.device.type != "cpu":
-            raise ValueError(f"{label} event_time_minutes must be on CPU")
-        if event_time_tensor.dtype != torch.float32:
-            raise ValueError(
-                f"{label} event_time_minutes must use torch.float32"
-            )
-        if event_time_tensor.shape != (rows, steps):
-            raise ValueError(
-                f"{label} event_time_minutes have the wrong shape"
-            )
-        if not bool(torch.isfinite(event_time_tensor).all()):
-            raise ValueError(f"{label} event_time_minutes must be finite")
-        if bool((event_time_tensor < 0).any()):
-            raise ValueError(
-                f"{label} event_time_minutes must be non-negative"
-            )
-        window = config.observation_window_minutes
-        assert window is not None
-        if bool((event_time_tensor[valid] > window + 1e-3).any()):
-            raise ValueError(
-                f"{label} event_time_minutes exceeds the observation window"
-            )
-        non_decreasing = event_time_tensor[:, 1:] >= event_time_tensor[:, :-1]
-        if bool((~non_decreasing & valid[:, 1:]).any()):
-            raise ValueError(
-                f"{label} event_time_minutes must be non-decreasing"
-            )
-        edges = config.gap_bucket_edges_minutes
-        durations = torch.zeros_like(event_time_tensor)
-        durations[:, 0] = event_time_tensor[:, 0]
-        if steps > 1:
-            durations[:, 1:] = (
-                event_time_tensor[:, 1:] - event_time_tensor[:, :-1]
-            )
-        boundaries = torch.tensor(
-            edges,
-            dtype=event_time_tensor.dtype,
-            device=event_time_tensor.device,
-        )
-        expected_gaps = torch.bucketize(durations, boundaries, right=False).to(
-            torch.long
-        )
-        if not torch.equal(gaps[valid], expected_gaps[valid]):
-            raise ValueError(
-                f"{label} gap_tokens disagree with event_time_minutes"
-            )
-        event_time_tensor = event_time_tensor.clone()
-    prefix_tensor = prefixes.clone()
-    gap_tensor = gaps.clone()
-    length_tensor = lengths.clone()
-    sequences = _OccurrenceSequenceView(
-        prefix_tensor,
-        gap_tensor,
-        length_tensor,
-        event_time_tensor,
-        city_id_tensor,
+    context = _load_context(
+        split["context_features"], rows=rows, config=config, label=label
+    )
+    event_time = _load_event_times(
+        split["event_time_minutes"],
+        gaps=gaps,
+        valid=valid,
+        config=config,
+        label=label,
+    )
+    prefixes, gaps, lengths, city_ids = (
+        tensor.clone() for tensor in (prefixes, gaps, lengths, city_ids)
     )
     return OccurrencePlannerSplit(
-        sequences=sequences,
-        context_features=context_tensor,
-        prefix_codes=prefix_tensor,
-        gap_tokens=gap_tensor,
-        lengths=length_tensor,
-        event_time_minutes=event_time_tensor,
-        city_ids=city_id_tensor,
+        sequences=_OccurrenceSequenceView(
+            prefixes, gaps, lengths, event_time, city_ids
+        ),
+        context_features=context,
+        prefix_codes=prefixes,
+        gap_tokens=gaps,
+        lengths=lengths,
+        event_time_minutes=event_time,
+        city_ids=city_ids,
     )
 
 
-def load_occurrence_planner_dataset(path: Path) -> OccurrencePlannerDataset:
-    path = Path(path)
-    try:
-        raw = torch.load(path, map_location="cpu", weights_only=True)
-    except Exception as exc:
-        raise ValueError(f"could not load planner dataset: {path}") from exc
-    if not isinstance(raw, dict):
-        raise ValueError("planner dataset must be a dictionary")
-    raw = dict(raw)
-    raw.pop("format_version", None)
-    raw.setdefault("prefix_codebooks", None)
-    raw.setdefault("legal_prefix_centroids", None)
-    raw.setdefault("legal_prefix_centroid_available", None)
-    legacy_single_city = "catalog_city_ids" not in raw
-    if legacy_single_city:
-        expected_keys = {
-            "artifact_type",
-            "data_config",
-            "legal_prefixes",
-            "prefix_codebooks",
-            "legal_prefix_centroids",
-            "legal_prefix_centroid_available",
-            "train",
-            "validation",
-        }
-    else:
-        expected_keys = {
-            "artifact_type",
-            "data_config",
-            "legal_prefixes",
-            "prefix_codebooks",
-            "legal_prefix_centroids",
-            "legal_prefix_centroid_available",
-            "catalog_city_ids",
-            "city_legal_prefix_mask",
-            "train",
-            "validation",
-        }
-    payload = _require_exact_keys(
-        raw,
-        expected_keys,
-        label="planner dataset",
-    )
-    if payload["artifact_type"] != DATASET_ARTIFACT_TYPE:
-        raise ValueError("planner dataset artifact_type is unsupported")
-    data_config_payload = dict(payload["data_config"])
-    data_config_payload.setdefault("context_schema", ())
-    data_config_payload.setdefault("city_conditioning", False)
-    config_mapping = _require_exact_keys(
-        data_config_payload,
-        {
-            "codebook_size",
-            "gap_vocab",
-            "prefix_depth",
-            "max_occurrences",
-            "context_dim",
-            "context_schema",
-            "city_conditioning",
-            "gap_codec_version",
-            "gap_bucket_edges_minutes",
-            "gap_duration_minutes",
-            "observation_window_minutes",
-        },
+def _load_data_config(value: object) -> OccurrencePlannerDataConfig:
+    mapping = dict(cast("dict[str, Any]", value))
+    mapping.setdefault("context_schema", ())
+    mapping.setdefault("city_conditioning", False)
+    return _from_exact_mapping(
+        OccurrencePlannerDataConfig,
+        mapping,
+        _DATA_CONFIG_KEYS,
         label="planner dataset data_config",
     )
-    try:
-        config = OccurrencePlannerDataConfig(**config_mapping)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(
-            f"invalid planner dataset data_config: {exc}"
-        ) from exc
-    legal_prefixes = payload["legal_prefixes"]
-    if not isinstance(legal_prefixes, torch.Tensor):
+
+
+def _load_legal_prefixes(
+    value: object, config: OccurrencePlannerDataConfig
+) -> tuple[torch.Tensor, LegalPrefixIndex]:
+    if not isinstance(value, torch.Tensor):
         raise ValueError("planner dataset legal_prefixes must be a tensor")
-    if (
-        legal_prefixes.device.type != "cpu"
-        or legal_prefixes.dtype != torch.long
-    ):
+    if value.device.type != "cpu" or value.dtype != torch.long:
         raise ValueError(
             "planner dataset legal_prefixes must be a CPU long tensor"
         )
     legality = LegalPrefixIndex(
-        legal_prefixes,
+        value,
         codebook_size=config.codebook_size,
         prefix_depth=config.prefix_depth,
     )
-    dataset_codebooks, dataset_centroids, dataset_centroid_available = (
-        _validate_prefix_metadata(
-            prefix_codebooks=payload["prefix_codebooks"],
-            centroids=payload["legal_prefix_centroids"],
-            centroid_available=payload["legal_prefix_centroid_available"],
-            codebook_size=config.codebook_size,
-            prefix_depth=config.prefix_depth,
-            vocabulary=legality.vocabulary_size,
-            label="planner dataset",
-        )
-    )
-    if legacy_single_city:
-        catalog_city_ids = torch.tensor([0], dtype=torch.long)
-        city_legal_prefix_mask = torch.ones(
-            (1, legality.vocabulary_size), dtype=torch.bool
-        )
-        for split_name in ("train", "validation"):
-            if "city_ids" not in payload[split_name]:
-                payload[split_name]["city_ids"] = torch.zeros(
-                    payload[split_name]["lengths"].shape[0], dtype=torch.long
-                )
-    else:
-        catalog_city_ids = payload["catalog_city_ids"]
-        city_legal_prefix_mask = payload["city_legal_prefix_mask"]
+    return value, legality
+
+
+def _load_city_legality(
+    payload: dict[str, Any], vocabulary: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    catalog_city_ids = payload["catalog_city_ids"]
+    city_legal_prefix_mask = payload["city_legal_prefix_mask"]
     if not isinstance(catalog_city_ids, torch.Tensor) or not isinstance(
         city_legal_prefix_mask, torch.Tensor
     ):
@@ -635,7 +544,7 @@ def load_occurrence_planner_dataset(path: Path) -> OccurrencePlannerDataset:
         city_legal_prefix_mask.device.type != "cpu"
         or city_legal_prefix_mask.dtype != torch.bool
         or city_legal_prefix_mask.shape
-        != (catalog_city_ids.numel(), legality.vocabulary_size)
+        != (catalog_city_ids.numel(), vocabulary)
     ):
         raise ValueError(
             "city_legal_prefix_mask must have shape [cities, legal vocabulary]"
@@ -646,38 +555,99 @@ def load_occurrence_planner_dataset(path: Path) -> OccurrencePlannerDataset:
         raise ValueError("catalog_city_ids must be unique")
     if not torch.equal(catalog_city_ids, torch.sort(catalog_city_ids).values):
         raise ValueError("catalog_city_ids must be sorted")
-    train = _load_split(
-        payload["train"], label="train", config=config, legality=legality
-    )
-    validation = _load_split(
-        payload["validation"],
-        label="validation",
-        config=config,
-        legality=legality,
-    )
+    return catalog_city_ids, city_legal_prefix_mask
 
+
+def _check_split_cities(
+    split: OccurrencePlannerSplit,
+    *,
+    label: str,
+    catalog_city_ids: torch.Tensor,
+    city_legal_prefix_mask: torch.Tensor,
+    legality: LegalPrefixIndex,
+) -> None:
     city_to_row = {
         int(city_id): row
         for row, city_id in enumerate(catalog_city_ids.tolist())
     }
+    city_ids = split.city_ids.tolist()
+    unknown = sorted(set(city_ids) - set(city_to_row))
+    if unknown:
+        raise ValueError(f"{label} contains unknown city_ids: {unknown}")
+    steps = split.prefix_codes.shape[1]
+    valid = torch.arange(steps)[None, :] < split.lengths[:, None]
+    row_indices = torch.tensor(
+        [city_to_row[value] for value in city_ids], dtype=torch.long
+    )
+    target_ids = legality.token_ids(split.prefix_codes[valid])
+    event_rows = row_indices[:, None].expand(-1, steps)[valid]
+    if not bool(city_legal_prefix_mask[event_rows, target_ids].all()):
+        raise ValueError(f"{label} contains a prefix illegal for its city")
+
+
+def load_occurrence_planner_dataset(path: Path) -> OccurrencePlannerDataset:
+    path = Path(path)
+    try:
+        raw = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as exc:
+        raise ValueError(f"could not load planner dataset: {path}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("planner dataset must be a dictionary")
+    raw = dict(raw)
+    raw.pop("format_version", None)
+    raw.setdefault("prefix_codebooks", None)
+    raw.setdefault("legal_prefix_centroids", None)
+    raw.setdefault("legal_prefix_centroid_available", None)
+    legacy_single_city = "catalog_city_ids" not in raw
+    expected_keys = set(_DATASET_KEYS)
+    if not legacy_single_city:
+        expected_keys |= _CITY_LEGALITY_KEYS
+    payload = _require_exact_keys(raw, expected_keys, label="planner dataset")
+    if payload["artifact_type"] != DATASET_ARTIFACT_TYPE:
+        raise ValueError("planner dataset artifact_type is unsupported")
+    config = _load_data_config(payload["data_config"])
+    legal_prefixes, legality = _load_legal_prefixes(
+        payload["legal_prefixes"], config
+    )
+    dataset_codebooks, dataset_centroids, dataset_centroid_available = (
+        _validate_prefix_metadata(
+            prefix_codebooks=payload["prefix_codebooks"],
+            centroids=payload["legal_prefix_centroids"],
+            centroid_available=payload["legal_prefix_centroid_available"],
+            codebook_size=config.codebook_size,
+            prefix_depth=config.prefix_depth,
+            vocabulary=legality.vocabulary_size,
+            label="planner dataset",
+        )
+    )
+    if legacy_single_city:
+        payload["catalog_city_ids"] = torch.tensor([0], dtype=torch.long)
+        payload["city_legal_prefix_mask"] = torch.ones(
+            (1, legality.vocabulary_size), dtype=torch.bool
+        )
+        for split_name in ("train", "validation"):
+            split_payload = payload[split_name]
+            if "city_ids" not in split_payload:
+                split_payload["city_ids"] = torch.zeros(
+                    split_payload["lengths"].shape[0], dtype=torch.long
+                )
+    catalog_city_ids, city_legal_prefix_mask = _load_city_legality(
+        payload, legality.vocabulary_size
+    )
+    train, validation = (
+        _load_split(
+            payload[label], label=label, config=config, legality=legality
+        )
+        for label in ("train", "validation")
+    )
     for label, split in (("train", train), ("validation", validation)):
-        unknown = sorted(
-            set(int(value) for value in split.city_ids.tolist())
-            - set(city_to_row)
+        _check_split_cities(
+            split,
+            label=label,
+            catalog_city_ids=catalog_city_ids,
+            city_legal_prefix_mask=city_legal_prefix_mask,
+            legality=legality,
         )
-        if unknown:
-            raise ValueError(f"{label} contains unknown city_ids: {unknown}")
-        steps = split.prefix_codes.shape[1]
-        valid = torch.arange(steps)[None, :] < split.lengths[:, None]
-        row_indices = torch.tensor(
-            [city_to_row[int(value)] for value in split.city_ids.tolist()],
-            dtype=torch.long,
-        )
-        target_ids = legality.token_ids(split.prefix_codes[valid])
-        event_rows = row_indices[:, None].expand(-1, steps)[valid]
-        permitted = city_legal_prefix_mask[event_rows, target_ids]
-        if not bool(permitted.all()):
-            raise ValueError(f"{label} contains a prefix illegal for its city")
 
     return OccurrencePlannerDataset(
         config=config,
@@ -691,84 +661,6 @@ def load_occurrence_planner_dataset(path: Path) -> OccurrencePlannerDataset:
         validation=validation,
         source_path=path.resolve(),
     )
-
-
-@dataclass(frozen=True, slots=True)
-class OccurrencePlannerTrainingOptions:
-    epochs: int
-    batch_size: int
-    learning_rate: float
-    weight_decay: float
-    length_weight: float
-    gap_weight: float
-    prefix_weight: float
-    label_smoothing: float
-    device: str
-    recurrence_weight: float = 0.0
-    lr_scheduler: str = "constant"
-    warmup_steps: int = 0
-    min_lr: float = 0.0
-    num_workers: int = 0
-    early_stopping_patience: int = 0
-    distributed: bool = False
-    compile_model: bool = False
-    compile_backend: str = "inductor"
-    compile_mode: str = "default"
-
-    def __post_init__(self) -> None:
-        if self.epochs < 1 or self.batch_size < 1:
-            raise ValueError("epochs and batch_size must be positive")
-        for name, value in (
-            ("learning_rate", self.learning_rate),
-            ("weight_decay", self.weight_decay),
-            ("length_weight", self.length_weight),
-            ("gap_weight", self.gap_weight),
-            ("prefix_weight", self.prefix_weight),
-            ("recurrence_weight", self.recurrence_weight),
-        ):
-            if not math.isfinite(value) or value < 0:
-                raise ValueError(
-                    f"{name} must be a finite non-negative number"
-                )
-        if self.learning_rate <= 0:
-            raise ValueError("learning_rate must be positive")
-        if not 0.0 <= self.label_smoothing < 1.0:
-            raise ValueError("label_smoothing must be in [0, 1)")
-        if not self.device:
-            raise ValueError("device must not be empty")
-        if self.lr_scheduler not in {"constant", "cosine"}:
-            raise ValueError(
-                "lr_scheduler must be 'constant' or 'cosine', "
-                f"got {self.lr_scheduler!r}"
-            )
-        if self.warmup_steps < 0:
-            raise ValueError("warmup_steps must be non-negative")
-        if not math.isfinite(self.min_lr) or self.min_lr < 0:
-            raise ValueError("min_lr must be a finite non-negative number")
-        if self.min_lr > self.learning_rate:
-            raise ValueError("min_lr cannot exceed learning_rate")
-        if self.lr_scheduler == "constant" and self.min_lr != 0.0:
-            raise ValueError("min_lr requires the cosine scheduler")
-        if self.num_workers < 0:
-            raise ValueError("num_workers must be non-negative")
-        if self.early_stopping_patience < 0:
-            raise ValueError("early_stopping_patience must be non-negative")
-        if not isinstance(self.distributed, bool):
-            raise ValueError("distributed must be boolean")
-        if not isinstance(self.compile_model, bool):
-            raise ValueError("compile_model must be boolean")
-        if not self.compile_backend:
-            raise ValueError("compile_backend must not be empty")
-        if self.compile_mode not in {
-            "default",
-            "reduce-overhead",
-            "max-autotune",
-            "max-autotune-no-cudagraphs",
-        }:
-            raise ValueError(
-                "compile_mode must be one of default, reduce-overhead, "
-                "max-autotune, or max-autotune-no-cudagraphs"
-            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -878,15 +770,12 @@ def load_occurrence_planner_checkpoint(
     )
     if payload["artifact_type"] != CHECKPOINT_ARTIFACT_TYPE:
         raise ValueError("planner checkpoint artifact_type is unsupported")
-    config_mapping = _require_exact_keys(
+    config = _from_exact_mapping(
+        OccurrencePlannerConfig,
         payload["config"],
-        _CONFIG_FIELDS,
+        _CONFIG_KEYS,
         label="planner checkpoint config",
     )
-    try:
-        config = OccurrencePlannerConfig(**config_mapping)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"invalid planner checkpoint config: {exc}") from exc
     legal_prefixes = payload["legal_prefixes"]
     if not isinstance(legal_prefixes, torch.Tensor):
         raise ValueError("planner checkpoint legal_prefixes must be a tensor")
@@ -916,18 +805,12 @@ def load_occurrence_planner_checkpoint(
     raw_options = payload["options"]
     if not isinstance(raw_options, dict):
         raise ValueError("planner checkpoint options must be a mapping")
-    options_mapping = dict(raw_options)
-    if "recurrence_weight" not in options_mapping:
-        options_mapping["recurrence_weight"] = 0.0
-    options_mapping = _require_exact_keys(
-        options_mapping,
-        _TRAINING_OPTIONS_FIELDS,
+    options = _from_exact_mapping(
+        OccurrencePlannerTrainingOptions,
+        {"recurrence_weight": 0.0, **raw_options},
+        _OPTIONS_KEYS,
         label="planner checkpoint options",
     )
-    try:
-        options = OccurrencePlannerTrainingOptions(**options_mapping)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"invalid planner checkpoint options: {exc}") from exc
     catalog_city_ids = payload["catalog_city_ids"]
     city_legal_prefix_mask = payload["city_legal_prefix_mask"]
     if not isinstance(catalog_city_ids, torch.Tensor) or not isinstance(
@@ -1187,7 +1070,6 @@ __all__ = [
     "OccurrencePlannerDataConfig",
     "OccurrencePlannerDataset",
     "OccurrencePlannerSplit",
-    "OccurrencePlannerTrainingOptions",
     "load_occurrence_planner_checkpoint",
     "load_occurrence_planner_conditions",
     "load_occurrence_planner_dataset",

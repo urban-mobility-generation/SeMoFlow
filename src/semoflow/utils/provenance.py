@@ -22,11 +22,7 @@ class ClosureComponent:
     time_end: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        d = asdict(self)
-        for k in ("city_ids", "splits"):
-            if d[k] is not None:
-                d[k] = list(d[k])
-        return d
+        return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ClosureComponent:
@@ -99,7 +95,6 @@ def closure_from_stays(
     artifact: str,
     source: str,
     split_seed: int | None = None,
-    timestamp_column: str | None = None,
 ) -> ProvenanceClosure:
     city_ids: tuple[int, ...] | None = None
     if "city_id" in stays.columns:
@@ -112,20 +107,21 @@ def closure_from_stays(
             sorted(str(s) for s in stays["split"].unique().to_list())
         )
     time_start = time_end = None
-    ts_col = timestamp_column
-    if ts_col is None:
-        for candidate in ("stay_start_time", "local_ts", "timestamp"):
-            if candidate in stays.columns:
-                ts_col = candidate
-                break
-    if ts_col is not None and ts_col in stays.columns:
-        bounds = stays.select(
-            pl.col(ts_col).min().alias("lo"),
-            pl.col(ts_col).max().alias("hi"),
+    timestamp = next(
+        (
+            column
+            for column in ("stay_start_time", "local_ts", "timestamp")
+            if column in stays.columns
+        ),
+        None,
+    )
+    if timestamp is not None:
+        low, high = stays.select(
+            pl.col(timestamp).min().alias("low"),
+            pl.col(timestamp).max().alias("high"),
         ).row(0)
-        if bounds[0] is not None:
-            time_start = str(bounds[0])
-            time_end = str(bounds[1])
+        if low is not None:
+            time_start, time_end = str(low), str(high)
     return ProvenanceClosure(
         artifact=artifact,
         components=[

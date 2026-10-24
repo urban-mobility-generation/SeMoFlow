@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Annotated, Literal
@@ -15,11 +14,13 @@ from semoflow.cli.common import (
     LogLevelOpt,
     SetArgsOpt,
     bad_parameter_on,
+    cli_run,
     echo_json,
     resolve_cli_config,
     validate_device,
 )
 from semoflow.logging.primitives import configure_logging
+from semoflow.utils.serialization import write_json
 
 app = typer.Typer(
     help="Evaluate planner samples, compositions, and tokenizers.",
@@ -27,6 +28,58 @@ app = typer.Typer(
     add_completion=False,
 )
 logger = logging.getLogger(__name__)
+
+
+@app.command(
+    "evaluate",
+    help=(
+        "For each city in the config's evaluation section, sample plans, "
+        "compose them into POI trajectories, and score them against the "
+        "city's held-out weeks."
+    ),
+)
+def evaluate_cmd(
+    config: ConfigOpt = None,
+    set_args: SetArgsOpt = None,
+    force: ForceOpt = False,
+    log_level: LogLevelOpt = "INFO",
+    log_file: LogFileOpt = None,
+) -> None:
+    from semoflow.metrics.city_evaluation import evaluate_cities
+
+    cfg = resolve_cli_config(
+        config, set_args, log_level=log_level, log_file=log_file
+    )
+    settings = cfg.evaluation
+    if settings is None:
+        raise typer.BadParameter("--config must define an evaluation section")
+    validate_device(settings.device, name="evaluation.device")
+    # Before the run is recorded, so a refused run leaves the existing
+    # outputs and their manifest untouched.
+    existing = [
+        path
+        for name in settings.cities
+        if (path := settings.output_dir / name).exists()
+    ]
+    if existing and not force:
+        raise typer.BadParameter(
+            f"refusing to overwrite existing city outputs: {existing[0]} "
+            "(pass --force)"
+        )
+    with (
+        bad_parameter_on(FileExistsError, OSError, RuntimeError, ValueError),
+        cli_run(
+            cfg,
+            phase="evaluation",
+            output_dir=settings.output_dir,
+            device=settings.device,
+            seed=settings.seed,
+            log_level=log_level,
+            log_file=log_file,
+        ) as run,
+    ):
+        run.result = evaluate_cities(settings, force=force)
+    echo_json(run.result)
 
 
 @app.command(
@@ -93,9 +146,7 @@ def sample_plans_cmd(
         if value is not None and value <= 0:
             raise typer.BadParameter(f"{name} must be positive")
 
-    from semoflow.planner.sampling_run import (
-        sample_occurrence_planner,
-    )
+    from semoflow.planner.sampling_run import sample_occurrence_planner
 
     with bad_parameter_on(ValueError, FileExistsError):
         result = sample_occurrence_planner(
@@ -236,7 +287,7 @@ def eval_planner_samples_cmd(
 
 @app.command(
     "compose",
-    help=("Compose planner samples with the latent-flow suffix realizer."),
+    help="Compose planner samples with the latent-flow suffix realizer.",
 )
 def eval_compose_cmd(
     realizer_checkpoint: Annotated[
@@ -430,9 +481,7 @@ def eval_tokenizer_cmd(
     log_file: LogFileOpt = None,
 ) -> None:
     from semoflow.config.artifacts import TokenizerArtifacts
-    from semoflow.preprocess.places_index import (
-        load_places_index,
-    )
+    from semoflow.preprocess.places_index import load_places_index
 
     cfg = resolve_cli_config(
         config,
@@ -456,9 +505,7 @@ def eval_tokenizer_cmd(
             len(stays),
         )
 
-    from semoflow.training.tokenizer_publish import (
-        run_semantic_id_eval,
-    )
+    from semoflow.training.tokenizer_publish import run_semantic_id_eval
 
     run_semantic_id_eval(
         cfg=tcfg,
@@ -512,9 +559,7 @@ def eval_tokenizer_hierarchy_cmd(
     log_file: LogFileOpt = None,
 ) -> None:
     configure_logging(level=log_level, log_file=log_file)
-    from semoflow.metrics.semantic_id_hierarchy import (
-        audit_sid_hierarchy,
-    )
+    from semoflow.metrics.semantic_id_hierarchy import audit_sid_hierarchy
 
     report = audit_sid_hierarchy(
         grounding_index,
@@ -522,8 +567,7 @@ def eval_tokenizer_hierarchy_cmd(
         covisit_split=covisit_split,
         label=label,
     )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
+    write_json(output, report)
 
     logger.info(
         "POIs=%d  distinct full SIDs=%d  joint=%.2f bits  injectivity=%.4f",
@@ -604,9 +648,7 @@ def eval_encoder_embeddings_cmd(
 ) -> None:
     configure_logging(level=log_level, log_file=log_file)
 
-    from semoflow.metrics.encoder_embeddings import (
-        write_embedding_eval,
-    )
+    from semoflow.metrics.encoder_embeddings import write_embedding_eval
 
     write_embedding_eval(
         embeddings,

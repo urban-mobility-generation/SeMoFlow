@@ -48,6 +48,7 @@ def write_places_index(
         on="placekey",
         how="left",
         suffix="_event",
+        maintain_order="left",
     ).unique(subset=["placekey"], keep="first", maintain_order=True)
     if "city_id_event" in places_index.columns:
         places_index = places_index.with_columns(

@@ -22,7 +22,7 @@ class TokenizerConfig:
     mixed_precision: str = "bf16"
     num_workers: int = 0
     seed: int = 42
-    preprocessing_dir: str = "outputs/preprocessing/foursquare_five_city"
+    preprocessing_dir: str = "outputs/preprocessing"
     places_index_path: str | None = None
     processed_visits_path: str | None = None
     out_dir: str = "outputs/tokenization"
@@ -110,9 +110,7 @@ class TokenizerConfig:
     def places_index_output_path(self) -> Path:
         if self.places_index_path is not None:
             return Path(self.places_index_path)
-        from semoflow.config.artifacts import (
-            PreprocessingArtifacts,
-        )
+        from semoflow.config.artifacts import PreprocessingArtifacts
 
         return PreprocessingArtifacts.from_run_dir(
             Path(self.preprocessing_dir)
@@ -121,9 +119,7 @@ class TokenizerConfig:
     def processed_visits_output_path(self) -> Path:
         if self.processed_visits_path is not None:
             return Path(self.processed_visits_path)
-        from semoflow.config.artifacts import (
-            PreprocessingArtifacts,
-        )
+        from semoflow.config.artifacts import PreprocessingArtifacts
 
         return PreprocessingArtifacts.from_run_dir(
             Path(self.preprocessing_dir)

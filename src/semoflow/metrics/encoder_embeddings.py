@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +8,8 @@ from typing import Any, Literal
 import numpy as np
 import polars as pl
 import torch
+
+from semoflow.utils.serialization import write_json
 
 EmbeddingKind = Literal["text", "graph", "cf"]
 
@@ -129,9 +130,7 @@ def evaluate_encoder_embeddings(
             seed=seed,
         )
     )
-    from semoflow.metrics.tokenization import (
-        compute_cf_embedding_metrics,
-    )
+    from semoflow.metrics.tokenization import compute_cf_embedding_metrics
     from semoflow.metrics.tokenizer_diagnostics import (
         embedding_geometry_metrics,
         input_modality_alignment_metrics,
@@ -317,46 +316,36 @@ def _nearest_neighbor_category_purity(
 
 
 def write_embedding_eval(
-    embeddings: np.ndarray | torch.Tensor | str | Path,
+    embeddings: str | Path,
     *,
     out_dir: str | Path,
-    index: pl.DataFrame | None = None,
     index_path: str | Path | None = None,
-    paired_embeddings: np.ndarray | torch.Tensor | str | Path | None = None,
+    paired_embeddings: str | Path | None = None,
     paired_kind: EmbeddingKind | str | None = None,
-    stays: pl.DataFrame | None = None,
     processed_visits_path: str | Path | None = None,
     kind: EmbeddingKind | str | None = None,
-    **kwargs: Any,
 ) -> EmbeddingEvalPaths:
-    arr = (
-        load_embedding_matrix(embeddings)
-        if isinstance(embeddings, str | Path)
-        else embeddings
-    )
-    if index is None and index_path is not None:
-        index = pl.read_parquet(index_path)
-    paired_arr = (
-        load_embedding_matrix(paired_embeddings)
-        if isinstance(paired_embeddings, str | Path)
-        else paired_embeddings
-    )
-    if stays is None and processed_visits_path is not None:
-        stays = pl.read_parquet(processed_visits_path)
     result = evaluate_encoder_embeddings(
-        arr,
-        index=index,
-        paired_embeddings=paired_arr,
+        load_embedding_matrix(embeddings),
+        index=None if index_path is None else pl.read_parquet(index_path),
+        paired_embeddings=(
+            None
+            if paired_embeddings is None
+            else load_embedding_matrix(paired_embeddings)
+        ),
         paired_kind=paired_kind,
-        stays=stays,
+        stays=(
+            None
+            if processed_visits_path is None
+            else pl.read_parquet(processed_visits_path)
+        ),
         kind=kind,
-        **kwargs,
     )
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     json_path = out / "embedding_eval.json"
     md_path = out / "embedding_eval.md"
-    json_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    write_json(json_path, result)
     md_path.write_text(_render_markdown(result), encoding="utf-8")
     logger.info(
         "wrote embedding eval  json=%s  markdown=%s",

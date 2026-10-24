@@ -8,9 +8,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from semoflow.training.utils.mixed_precision import (
-    build_amp_context,
-)
+from semoflow.training.utils.mixed_precision import build_amp_context
 
 __all__ = ["TensorDictDataset", "train_tokenizer"]
 
@@ -91,12 +89,11 @@ def _log_epoch_metrics(
     epoch: int,
     epochs: int,
     metrics: dict[str, float],
-    prefix: str = "[tokenizer]",
 ) -> None:
     metric_text = "  ".join(
         f"{key}={value:.6g}" for key, value in metrics.items()
     )
-    logger.info("%s epoch %d/%d  %s", prefix, epoch, epochs, metric_text)
+    logger.info("[tokenizer] epoch %d/%d  %s", epoch, epochs, metric_text)
 
 
 def train_tokenizer(

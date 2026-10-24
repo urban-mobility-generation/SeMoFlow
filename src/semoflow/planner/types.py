@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+import dataclasses
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 
 if TYPE_CHECKING:
-    from semoflow.planner.config import (
-        OccurrencePlannerConfig,
-    )
+    from semoflow.planner.config import OccurrencePlannerConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,12 +69,16 @@ class OccurrenceBatch:
     target_event_time_minutes: torch.Tensor | None = None
     context_features: torch.Tensor | None = None
 
-    def validate(
-        self,
-        config: OccurrencePlannerConfig,
-        *,
-        validate_temporal_targets: bool = True,
-    ) -> None:
+    def validate(self, config: OccurrencePlannerConfig) -> None:
+        batch_size, steps = self._validate_layout(config)
+        self._validate_tokens(config, steps)
+        self._validate_context(config, batch_size)
+        self._validate_event_times(config, batch_size, steps)
+
+    def _validate_layout(
+        self, config: OccurrencePlannerConfig
+    ) -> tuple[int, int]:
+        """Shapes, dtypes and devices; returns ``(batch_size, steps)``."""
         prefixes = self.previous_prefix_codes
         if prefixes.ndim != 3:
             raise ValueError("previous prefixes must have shape [B, S, P]")
@@ -102,22 +106,20 @@ class OccurrenceBatch:
                 raise ValueError("city_ids must use torch.long")
         if self.valid_mask.dtype != torch.bool:
             raise ValueError("valid_mask must be boolean")
-        integer_tensors = {
-            "previous prefixes": prefixes,
-            "previous gaps": self.previous_gap_tokens,
-            "target prefixes": self.target_prefix_codes,
-            "target gaps": self.target_gap_tokens,
-            "lengths": self.lengths,
-        }
+        integer_tensors = [
+            prefixes,
+            self.previous_gap_tokens,
+            self.target_prefix_codes,
+            self.target_gap_tokens,
+            self.lengths,
+        ]
         if self.city_ids is not None:
-            integer_tensors["city_ids"] = self.city_ids
-        if any(
-            tensor.dtype != torch.long for tensor in integer_tensors.values()
-        ):
+            integer_tensors.append(self.city_ids)
+        if any(tensor.dtype != torch.long for tensor in integer_tensors):
             raise ValueError(
                 "occurrence tokens and lengths must use torch.long"
             )
-        devices = {tensor.device for tensor in integer_tensors.values()}
+        devices = {tensor.device for tensor in integer_tensors}
         devices.add(self.valid_mask.device)
         if self.context_features is not None:
             devices.add(self.context_features.device)
@@ -125,6 +127,12 @@ class OccurrenceBatch:
             raise ValueError(
                 "all occurrence batch tensors must share one device"
             )
+        return batch_size, steps
+
+    def _validate_tokens(
+        self, config: OccurrencePlannerConfig, steps: int
+    ) -> None:
+        """Lengths, vocabulary ranges and the BOS/padding sentinels."""
         if bool((self.lengths < 1).any()) or bool(
             (self.lengths > config.max_occurrences).any()
         ):
@@ -141,6 +149,7 @@ class OccurrenceBatch:
             raise ValueError(
                 "valid_mask must be left-contiguous and match lengths"
             )
+        prefixes = self.previous_prefix_codes
         previous_prefix_in_range = (prefixes >= 0) & (
             prefixes < config.codebook_size
         )
@@ -180,154 +189,127 @@ class OccurrenceBatch:
             raise ValueError("valid shifted history must not use the sentinel")
         if bool((~whole_tuple_sentinel[~self.valid_mask]).any()):
             raise ValueError("padded history must use the sentinel")
+
+    def _validate_context(
+        self, config: OccurrencePlannerConfig, batch_size: int
+    ) -> None:
+        context = self.context_features
         if config.context_dim == 0:
-            if self.context_features is not None:
+            if context is not None:
                 raise ValueError("context supplied to a context-free planner")
-        elif self.context_features is None:
+        elif context is None:
             raise ValueError("context_features are required")
-        elif self.context_features.shape != (batch_size, config.context_dim):
+        elif context.shape != (batch_size, config.context_dim):
             raise ValueError("context_features have the wrong shape")
-        elif not self.context_features.is_floating_point():
+        elif not context.is_floating_point():
             raise ValueError("context_features must use a floating dtype")
-        elif not bool(torch.isfinite(self.context_features).all()):
+        elif not bool(torch.isfinite(context).all()):
             raise ValueError("context_features must be finite")
-        if config.temporal_state_enabled:
-            previous_time = self.previous_event_time_minutes
-            target_time = self.target_event_time_minutes
-            if previous_time is None or target_time is None:
+
+    def _validate_event_times(
+        self, config: OccurrencePlannerConfig, batch_size: int, steps: int
+    ) -> None:
+        """Event-time state must replay the gap tokens inside the window."""
+        previous_time = self.previous_event_time_minutes
+        target_time = self.target_event_time_minutes
+        if not config.temporal_state_enabled:
+            if previous_time is not None or target_time is not None:
                 raise ValueError(
-                    "a planner with a time channel requires event-time tensors"
+                    "event-time tensors supplied to a planner without a time channel"
                 )
-            if previous_time.shape != (
-                batch_size,
-                steps,
-            ) or target_time.shape != (
-                batch_size,
-                steps,
-            ):
-                raise ValueError(
-                    "event-time tensors do not align with history"
-                )
-            if (
-                not previous_time.is_floating_point()
-                or not target_time.is_floating_point()
-            ):
-                raise ValueError(
-                    "event-time tensors must use a floating dtype"
-                )
-            if (
-                previous_time.device != prefixes.device
-                or target_time.device != prefixes.device
-            ):
-                raise ValueError(
-                    "all occurrence batch tensors must share one device"
-                )
-            if not bool(torch.isfinite(previous_time).all()) or not bool(
-                torch.isfinite(target_time).all()
-            ):
-                raise ValueError("event-time tensors must be finite")
-            if bool((previous_time < 0).any()) or bool(
-                (target_time < 0).any()
-            ):
-                raise ValueError("event-time tensors must be non-negative")
-            if not bool((previous_time[:, 0] == 0).all()):
-                raise ValueError(
-                    "previous event time must start at the observation window"
-                )
-            window = config.observation_window_minutes
-            assert window is not None
-            if bool((target_time[self.valid_mask] > window + 1e-3).any()):
-                raise ValueError(
-                    "target event time exceeds the observation window"
-                )
-            if bool(
-                (
-                    target_time[self.valid_mask] + 1e-6
-                    < previous_time[self.valid_mask]
-                ).any()
-            ):
-                raise ValueError(
-                    "target event time must not precede the previous event time"
-                )
-            if validate_temporal_targets:
-                representatives = config.gap_duration_minutes
-                assert representatives is not None
-                representative = torch.tensor(
-                    representatives,
-                    dtype=target_time.dtype,
-                    device=target_time.device,
-                )
-                expected_target = (
-                    previous_time + representative[self.target_gap_tokens]
-                )
-                expected_target = expected_target.clamp(max=window)
-                if not torch.allclose(
-                    target_time[self.valid_mask],
-                    expected_target[self.valid_mask],
-                    atol=1.0e-4,
-                    rtol=0.0,
-                ):
-                    raise ValueError(
-                        "event-time state disagrees with gap reconstruction"
-                    )
-                if steps > 1:
-                    shifted = self.valid_mask[:, 1:]
-                    if not torch.allclose(
-                        previous_time[:, 1:][shifted],
-                        target_time[:, :-1][shifted],
-                        atol=1.0e-4,
-                        rtol=0.0,
-                    ):
-                        raise ValueError(
-                            "previous event-time state must equal the prior target"
-                        )
-        elif (
-            self.previous_event_time_minutes is not None
-            or self.target_event_time_minutes is not None
+            return
+        if previous_time is None or target_time is None:
+            raise ValueError(
+                "a planner with a time channel requires event-time tensors"
+            )
+        expected_shape = (batch_size, steps)
+        if (
+            previous_time.shape != expected_shape
+            or target_time.shape != expected_shape
+        ):
+            raise ValueError("event-time tensors do not align with history")
+        if (
+            not previous_time.is_floating_point()
+            or not target_time.is_floating_point()
+        ):
+            raise ValueError("event-time tensors must use a floating dtype")
+        device = self.previous_prefix_codes.device
+        if previous_time.device != device or target_time.device != device:
+            raise ValueError(
+                "all occurrence batch tensors must share one device"
+            )
+        if not bool(torch.isfinite(previous_time).all()) or not bool(
+            torch.isfinite(target_time).all()
+        ):
+            raise ValueError("event-time tensors must be finite")
+        if bool((previous_time < 0).any()) or bool((target_time < 0).any()):
+            raise ValueError("event-time tensors must be non-negative")
+        if not bool((previous_time[:, 0] == 0).all()):
+            raise ValueError(
+                "previous event time must start at the observation window"
+            )
+        window = config.observation_window_minutes
+        assert window is not None
+        valid_target = target_time[self.valid_mask]
+        if bool((valid_target > window + 1e-3).any()):
+            raise ValueError(
+                "target event time exceeds the observation window"
+            )
+        if bool((valid_target + 1e-6 < previous_time[self.valid_mask]).any()):
+            raise ValueError(
+                "target event time must not precede the previous event time"
+            )
+        representatives = config.gap_duration_minutes
+        assert representatives is not None
+        representative = torch.tensor(
+            representatives, dtype=target_time.dtype, device=target_time.device
+        )
+        expected_target = (
+            previous_time + representative[self.target_gap_tokens]
+        ).clamp(max=window)
+        if not torch.allclose(
+            valid_target,
+            expected_target[self.valid_mask],
+            atol=1.0e-4,
+            rtol=0.0,
         ):
             raise ValueError(
-                "event-time tensors supplied to a planner without a time channel"
+                "event-time state disagrees with gap reconstruction"
             )
+        shifted = self.valid_mask[:, 1:]
+        if steps > 1 and not torch.allclose(
+            previous_time[:, 1:][shifted],
+            target_time[:, :-1][shifted],
+            atol=1.0e-4,
+            rtol=0.0,
+        ):
+            raise ValueError(
+                "previous event-time state must equal the prior target"
+            )
+
+    def _map_tensors(
+        self, transform: Callable[[torch.Tensor], torch.Tensor]
+    ) -> OccurrenceBatch:
+        values = {
+            field.name: getattr(self, field.name)
+            for field in dataclasses.fields(self)
+        }
+        return OccurrenceBatch(
+            **{
+                name: None if value is None else transform(value)
+                for name, value in values.items()
+            }
+        )
 
     def to(
         self, device: torch.device | str, *, non_blocking: bool = False
     ) -> OccurrenceBatch:
-        def move(tensor: torch.Tensor | None) -> torch.Tensor | None:
-            if tensor is None:
-                return None
-            return tensor.to(device, non_blocking=non_blocking)
-
-        return OccurrenceBatch(
-            previous_prefix_codes=move(self.previous_prefix_codes),
-            previous_gap_tokens=move(self.previous_gap_tokens),
-            target_prefix_codes=move(self.target_prefix_codes),
-            target_gap_tokens=move(self.target_gap_tokens),
-            valid_mask=move(self.valid_mask),
-            lengths=move(self.lengths),
-            city_ids=move(self.city_ids),
-            previous_event_time_minutes=move(self.previous_event_time_minutes),
-            target_event_time_minutes=move(self.target_event_time_minutes),
-            context_features=move(self.context_features),
+        return self._map_tensors(
+            lambda tensor: tensor.to(device, non_blocking=non_blocking)
         )
 
     def pin_memory(self) -> OccurrenceBatch:
-        def pin(tensor: torch.Tensor | None) -> torch.Tensor | None:
-            if tensor is None:
-                return None
-            return tensor.pin_memory()
-
-        return OccurrenceBatch(
-            previous_prefix_codes=pin(self.previous_prefix_codes),
-            previous_gap_tokens=pin(self.previous_gap_tokens),
-            target_prefix_codes=pin(self.target_prefix_codes),
-            target_gap_tokens=pin(self.target_gap_tokens),
-            valid_mask=pin(self.valid_mask),
-            lengths=pin(self.lengths),
-            city_ids=pin(self.city_ids),
-            previous_event_time_minutes=pin(self.previous_event_time_minutes),
-            target_event_time_minutes=pin(self.target_event_time_minutes),
-            context_features=pin(self.context_features),
-        )
+        return self._map_tensors(torch.Tensor.pin_memory)
 
 
 @dataclass(frozen=True, slots=True)

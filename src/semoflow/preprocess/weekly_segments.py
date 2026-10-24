@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
 
 import polars as pl
+
+from semoflow.utils.serialization import write_json
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,8 @@ def _segment_events(
 ) -> pl.DataFrame:
     window = ["device_key", "_week"]
     stays = (
+        # Equal timestamps keep polars' default sort order, which built
+        # the released segment caches; a stable sort would reorder them.
         stays.sort(["device_key", ts_col])
         .with_columns(pl.col(ts_col).dt.truncate("1w").alias("_week"))
         .with_columns(
@@ -127,7 +130,7 @@ def build_weekly_segment_cache(
     temporary = output.with_suffix(output.suffix + ".tmp")
     grouped.write_parquet(temporary)
     temporary.replace(output)
-    spec_path.write_text(json.dumps(spec, indent=2, sort_keys=True) + "\n")
+    write_json(spec_path, spec)
     split_counts = {
         str(row["_split"]): int(row["len"])
         for row in grouped.group_by("_split").len().iter_rows(named=True)

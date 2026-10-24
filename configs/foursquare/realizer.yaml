@@ -1,0 +1,55 @@
+# Suffix latent-flow realizer for the Foursquare five-city catalog. `build`
+# derives the bank from the planner stage's weekly segments; training reads
+# the codebooks and their size from configs/foursquare/tokenizer.yaml.
+#
+#   uv run semoflow-artifacts build --config configs/foursquare/realizer.yaml
+#   uv run semoflow-train realizer --config configs/foursquare/realizer.yaml
+#
+# For multi-GPU DDP, launch the same command under torchrun.
+
+experiment:
+  name: foursquare_realizer
+  phase: realizer
+
+realizer:
+  # Keep weeks of up to 128 visits.
+  data:
+    segments_path: outputs/segments.parquet
+    max_events: 128
+
+  bank_path: outputs/bank.pt
+  codebooks_path: outputs/tokenization/tokenizer_codebooks.pt
+  catalog_path: outputs/tokenization/placekey_lookup.parquet
+  output_dir: outputs/realizer
+  prefix_depth: 3
+  city_vocab: 12
+  device: cuda:0
+  seed: 0
+
+  # ── Architecture ─────────────────────────────────────────────
+  model_dim: 256
+  condition_depth: 4
+  depth: 6
+  num_heads: 8
+  dropout: 0.1
+  prefix_embedding_mode: hybrid_frozen_codebook
+  tail_normalization: whitened
+  tail_whitening_chunk_size: 16384
+  catalog_decoder_mode: calibrated
+
+  # ── Losses ───────────────────────────────────────────────────
+  catalog_loss_weight: 0.1
+  endpoint_loss_weight: 0.1
+  population_loss_weight: 0.05
+
+  # ── Optimization ─────────────────────────────────────────────
+  epochs: 300
+  batch_size: 512
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  lr_scheduler: cosine
+  min_lr: 0.00001
+  compile: true
+  mixed_precision: bf16
+  tf32: true
+  fused_optimizer: true
