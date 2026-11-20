@@ -14,12 +14,6 @@ from semoflow.planner.model import OccurrenceARPlanner
 class PlannerWarmStart:
     checkpoint: Path
 
-    def __post_init__(self) -> None:
-        if not Path(self.checkpoint).is_file():
-            raise ValueError(
-                f"warm-start planner checkpoint not found: {self.checkpoint}"
-            )
-
 
 @dataclass(frozen=True, slots=True)
 class PlannerWarmStartReport:
@@ -46,10 +40,6 @@ def _city_embedding_for_target(
     target_weight: torch.Tensor,
 ) -> tuple[torch.Tensor, tuple[int, ...], tuple[int, ...]]:
     source_weight = source_state["city_embedding.weight"]
-    if source_weight.shape[1:] != target_weight.shape[1:]:
-        raise ValueError(
-            "warm-start city embedding width does not match the target"
-        )
     source_row = {city_id: row for row, city_id in enumerate(source_city_ids)}
     transferred = torch.zeros_like(target_weight)
     inherited: list[int] = []
@@ -69,18 +59,13 @@ def apply_planner_warm_start(
 ) -> PlannerWarmStartReport:
     checkpoint_path = Path(warm_start.checkpoint)
     source = load_occurrence_planner_checkpoint(checkpoint_path)
-    if source.config != model.config:
-        raise ValueError(
-            "warm-start planner architecture is incompatible with the target"
-        )
     state = dict(source.model.state_dict())
     source_city_ids = [int(value) for value in source.catalog_city_ids]
     target_city_ids = [int(value) for value in model.catalog_city_ids]
 
     inherited: tuple[int, ...] = ()
     zeroed: tuple[int, ...] = ()
-    if model.config.city_conditioning:
-        assert model.city_embedding is not None
+    if model.city_embedding is not None:
         transferred, inherited, zeroed = _city_embedding_for_target(
             source_state=state,
             source_city_ids=source_city_ids,
@@ -89,17 +74,14 @@ def apply_planner_warm_start(
         )
         state["city_embedding.weight"] = transferred
 
-    source_metadata = state["_extra_state"]
-    target_metadata = model.get_extra_state()
-    catalog_changed = (
-        source_metadata["catalog_fingerprint"]
-        != target_metadata["catalog_fingerprint"]
-        or source_metadata["catalog_city_ids"]
-        != target_metadata["catalog_city_ids"]
-        or source_metadata["city_legality_fingerprint"]
-        != target_metadata["city_legality_fingerprint"]
+    catalog_changed = not (
+        torch.equal(source.legal_prefixes, model.legality.codes.cpu())
+        and torch.equal(
+            source.city_legal_prefix_mask, model.city_legal_prefix_mask.cpu()
+        )
+        and source_city_ids == target_city_ids
     )
-    model.load_neural_state_dict(state, allow_catalog_mismatch=True)
+    model.load_state_dict(state)
     return PlannerWarmStartReport(
         checkpoint=str(checkpoint_path),
         source_epoch=source.epoch,

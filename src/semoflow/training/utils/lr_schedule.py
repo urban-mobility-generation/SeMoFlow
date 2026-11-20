@@ -16,14 +16,8 @@ def build_lr_scheduler(
     base_lr: float,
     min_lr: float,
 ) -> optim.lr_scheduler.LRScheduler | None:
-    if schedule not in LR_SCHEDULES:
-        raise ValueError(f"lr schedule must be one of {LR_SCHEDULES}")
-    if schedule == "constant" and min_lr != 0.0:
-        raise ValueError("min_lr requires the cosine scheduler")
     if schedule == "constant" and warmup_steps == 0:
         return None
-    if total_updates < 1:
-        raise ValueError("total_updates must be positive")
     if schedule == "cosine" and warmup_steps >= total_updates:
         raise ValueError(
             "cosine warmup_steps must be smaller than total optimizer updates"

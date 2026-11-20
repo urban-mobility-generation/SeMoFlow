@@ -11,10 +11,7 @@ def build_id_embeddings(
     tables = nn.ModuleDict()
     if dim <= 0:
         return tables
-    if not counts:
-        raise ValueError(
-            "id_embedding_counts is required when id_embedding_dim is positive"
-        )
+    assert counts is not None
     for node_type, count in counts.items():
         table = nn.Embedding(int(count), dim)
         nn.init.normal_(table.weight, std=0.01)
@@ -48,17 +45,10 @@ def project_inputs(
 ) -> dict[str, torch.Tensor]:
     features = dict(x_dict)
     if id_embeddings:
-        if n_id_dict is None:
-            raise ValueError(
-                "n_id_dict is required when id_embedding_dim is positive"
-            )
+        assert n_id_dict is not None
         for node_type, table in id_embeddings.items():
             if node_type not in features:
                 continue
-            if node_type not in n_id_dict:
-                raise ValueError(
-                    f"n_id_dict is missing node type {node_type!r}"
-                )
             features[node_type] = torch.cat(
                 [features[node_type], table(n_id_dict[node_type])], dim=-1
             )

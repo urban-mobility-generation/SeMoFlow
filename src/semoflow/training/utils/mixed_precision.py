@@ -7,10 +7,6 @@ import torch
 
 
 def _normalize_mixed_precision(mixed_precision: str) -> str:
-    if mixed_precision not in {"none", "bf16", "fp16"}:
-        raise ValueError(
-            "mixed_precision must be one of 'none', 'bf16', or 'fp16'"
-        )
     return mixed_precision
 
 

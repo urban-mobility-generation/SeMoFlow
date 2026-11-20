@@ -21,7 +21,7 @@ planner:
     segments_path: outputs/segments.parquet
     min_active_days: 2
     max_occurrences: 128
-    context_mode: city
+    city_conditioning: true
 
   dataset_path: outputs/planner_dataset.pt
   output_dir: outputs/planner
@@ -32,8 +32,6 @@ planner:
     n_heads: 8
     n_layers: 6
     dropout: 0.2
-    prefix_decoder: hierarchical
-    mobility_router: explore_retrieve
     mobility_gate_prior: log_distinct
     use_distance_prior: true
 

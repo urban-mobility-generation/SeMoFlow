@@ -12,19 +12,6 @@ from semoflow.config import ExperimentConfig
 logger = logging.getLogger(__name__)
 
 
-def write_embedding_diagnostics(
-    embeddings_path: Path, index_path: Path | None, *, kind: str
-) -> None:
-    from semoflow.metrics.encoder_embeddings import write_embedding_eval
-
-    write_embedding_eval(
-        embeddings_path,
-        out_dir=embeddings_path.parent / "eval",
-        index_path=index_path if index_path and index_path.exists() else None,
-        kind=kind,
-    )
-
-
 def run_text_encoder(cfg: ExperimentConfig) -> None:
     text_cfg = cfg.encoder_pipeline.text
     if not text_cfg.enabled:
@@ -41,7 +28,6 @@ def run_text_encoder(cfg: ExperimentConfig) -> None:
     started = time.perf_counter()
     build_text_embeddings(pl.read_parquet(places_index_path), text_cfg)
     text_out = Path(text_cfg.out_path)
-    write_embedding_diagnostics(text_out, places_index_path, kind="text")
     logger.info(
         "text encoder done  path=%s  elapsed=%.1fs",
         text_out,
@@ -58,11 +44,6 @@ def run_graph_encoder(cfg: ExperimentConfig) -> dict[str, Any] | None:
 
     started = time.perf_counter()
     result = train_heterosage(cfg)
-    write_embedding_diagnostics(
-        Path(result["embedding_path"]),
-        Path(graph_cfg.out_dir) / "places_index.parquet",
-        kind="graph",
-    )
     logger.info(
         "graph encoder done  elapsed=%.1fs", time.perf_counter() - started
     )
@@ -85,5 +66,4 @@ __all__ = [
     "run_encoder_pipeline",
     "run_graph_encoder",
     "run_text_encoder",
-    "write_embedding_diagnostics",
 ]

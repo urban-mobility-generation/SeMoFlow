@@ -25,8 +25,6 @@ def _as_rows(values: Any, *, name: str) -> list[list[Any]]:
         ]
     except TypeError as exc:
         raise ValueError(f"{name} must be a two-dimensional sequence") from exc
-    if any(not isinstance(row, list) for row in rows):
-        raise ValueError(f"{name} must be a two-dimensional sequence")
     return rows
 
 
@@ -84,8 +82,6 @@ def daily_mobility_motifs(
     keys = (
         _as_rows(day_keys, name="day_keys") if day_keys is not None else None
     )
-    if keys is not None and len(keys) != len(locations):
-        raise ValueError("day_keys must have the same number of rows")
 
     motifs: list[MotifSignature] = []
     for row_index, row_locations in enumerate(locations):
@@ -95,10 +91,6 @@ def daily_mobility_motifs(
                 motifs.append(motif)
             continue
         row_keys = keys[row_index]
-        if len(row_keys) != len(row_locations):
-            raise ValueError(
-                "day_keys rows must align with location_sequences rows"
-            )
         grouped: dict[Hashable, list[Any]] = defaultdict(list)
         for location, raw_day in zip(row_locations, row_keys, strict=True):
             if _is_padding(location, pad_id):
@@ -137,12 +129,6 @@ def mobility_motif_metrics(
     frequency_threshold: float = 0.005,
     pad_id: Any = PAD_ID,
 ) -> dict[str, Any]:
-    if not 0.0 <= frequency_threshold <= 1.0:
-        raise ValueError("frequency_threshold must be in [0, 1]")
-    if (day_keys_real is None) != (day_keys_generated is None):
-        raise ValueError(
-            "day_keys_real and day_keys_generated must be provided together"
-        )
 
     real_motifs = daily_mobility_motifs(
         locations_real, day_keys_real, pad_id=pad_id

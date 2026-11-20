@@ -17,11 +17,7 @@ logger = logging.getLogger(__name__)
 
 class TensorDictDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]]):
     def __init__(self, tensors: dict[str, torch.Tensor]) -> None:
-        if not tensors:
-            raise ValueError("tensors must be non-empty")
         lengths = {tensor.shape[0] for tensor in tensors.values()}
-        if len(lengths) != 1:
-            raise ValueError(f"all tensors must share length, got {lengths}")
         self.tensors = tensors
         self.length = next(iter(lengths))
 
@@ -67,10 +63,6 @@ def _loss_metrics(
         for batch in dataloader:
             batch = _batch_to_device(batch, device)
             out = model(batch, return_loss=True)
-            if out.loss is None:
-                raise RuntimeError(
-                    "tokenizer returned no loss while return_loss=True"
-                )
             loss_map = out.losses or {"loss": out.loss}
             for key, value in loss_map.items():
                 detached = value.detach()
@@ -107,8 +99,6 @@ def train_tokenizer(
     mixed_precision: str = "bf16",
     checkpoint_dir: str | Path | None = None,
 ) -> list[dict[str, float]]:
-    if epochs <= 0:
-        raise ValueError("epochs must be positive")
 
     resolved_device = torch.device(device)
     model.to(resolved_device)
@@ -132,10 +122,6 @@ def train_tokenizer(
             batch = _batch_to_device(batch, resolved_device)
             with amp_ctx:
                 out = model(batch, return_loss=True)
-            if out.loss is None:
-                raise RuntimeError(
-                    "tokenizer returned no loss while return_loss=True"
-                )
             optimizer.zero_grad(set_to_none=True)
             if scaler is not None:
                 scaler.scale(out.loss).backward()

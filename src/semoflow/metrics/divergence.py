@@ -10,12 +10,6 @@ JSD_MAX_NATS = math.log(2.0)
 def jensen_shannon_divergence(left: np.ndarray, right: np.ndarray) -> float:
     left_array = np.asarray(left, dtype=np.float64)
     right_array = np.asarray(right, dtype=np.float64)
-    if left_array.shape != right_array.shape:
-        raise ValueError("JSD inputs must have the same shape")
-    if not np.isfinite(left_array).all() or not np.isfinite(right_array).all():
-        raise ValueError("JSD inputs must contain only finite values")
-    if np.any(left_array < 0.0) or np.any(right_array < 0.0):
-        raise ValueError("JSD inputs must be non-negative")
 
     left_total = float(left_array.sum())
     right_total = float(right_array.sum())

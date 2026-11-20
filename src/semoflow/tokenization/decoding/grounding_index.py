@@ -198,8 +198,6 @@ class SemanticIDGroundingIndex:
                 [],
             )
         key_rows = np.asarray(list(self._mapping), dtype=np.int64)
-        if key_rows.ndim != 2 or key_rows.shape[1] != len(self.key_columns):
-            raise ValueError("grounding index keys have inconsistent widths")
         if np.any((key_rows < 0) | (key_rows > 255)):
             raise ValueError(
                 "bulk grounding lookup supports code values in [0, 255]"
@@ -234,10 +232,6 @@ class SemanticIDGroundingIndex:
                 order_agnostic=self.order_agnostic,
             )
         if self.order_agnostic:
-            if len(code_values) != len(self.key_columns):
-                raise ValueError(
-                    "code_values length does not match grounding key columns"
-                )
             return tuple(sorted(int(value) for value in code_values))
         return tuple(int(v) for v in code_values)
 
@@ -318,10 +312,6 @@ class SemanticIDGroundingIndex:
     def load(cls, path: str | Path) -> SemanticIDGroundingIndex:
         with open(path, "rb") as f:
             obj = pickle.load(f)
-        if not isinstance(obj, cls):
-            raise TypeError(
-                f"expected {cls.__name__}, got {type(obj).__name__}"
-            )
         return obj
 
 

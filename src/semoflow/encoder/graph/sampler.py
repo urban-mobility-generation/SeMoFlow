@@ -74,14 +74,8 @@ def balance_positive_edges_by_city(
     *,
     seed: int = 0,
 ) -> torch.Tensor:
-    if positive_edges.ndim != 2 or positive_edges.shape[0] != 2:
-        raise ValueError("positive_edges must have shape [2, E]")
-    if city_ids.ndim != 1:
-        raise ValueError("city_ids must have shape [num_pois]")
     if positive_edges.numel() == 0:
         return positive_edges
-    if int(positive_edges.max()) >= city_ids.numel():
-        raise ValueError("positive_edges reference an unknown POI city")
 
     edge_cities = city_ids[positive_edges[0]]
     cities = torch.unique(edge_cities, sorted=True)
@@ -112,10 +106,6 @@ def build_graph_supervision(
     rank: int = 0,
     world_size: int = 1,
 ) -> GraphSupervision:
-    if positive_edges.ndim != 2 or positive_edges.shape[0] != 2:
-        raise ValueError("positive_edges must have shape [2, E]")
-    if world_size <= 0 or not 0 <= rank < world_size:
-        raise ValueError("rank must be in [0, world_size)")
     all_temporal = [
         data[edge_type].edge_index
         for edge_type in data.metadata()[1]

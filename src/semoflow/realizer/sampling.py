@@ -15,10 +15,9 @@ from semoflow.realizer.model import (
     PrefixTimeSuffixLatentFlowRealizer,
 )
 from semoflow.realizer.objective import (
-    check_tail_statistics,
     denormalize_tail,
     normalize_tail,
-    sid_level_embeddings,
+    suffix_tail_level_embeddings,
 )
 from semoflow.tokenization.decoding.codebooks import (
     codes_to_embeddings_from_codebooks,
@@ -33,10 +32,6 @@ def _packed_code_keys(
     codes: torch.Tensor, *, codebook_size: int
 ) -> torch.LongTensor:
     width = codes.shape[-1]
-    if codebook_size**width > torch.iinfo(torch.long).max:
-        raise ValueError(
-            "SID width and codebook size exceed int64 key capacity"
-        )
     powers = torch.tensor(
         [codebook_size**power for power in range(width - 1, -1, -1)],
         dtype=torch.long,
@@ -86,8 +81,6 @@ def _catalog_decode_query_chunks(
     start = 0
     while start < query_order.numel():
         max_width = int(widths[query_order[start]].item())
-        if max_width < 1:
-            raise ValueError("catalog query candidate width must be positive")
         pair_limited_rows = max(
             1, _CATALOG_DECODE_MAX_CANDIDATE_PAIRS // max_width
         )
@@ -128,7 +121,7 @@ def _padded_output(
     *,
     width: int,
     pad_id: int,
-    prefix_depth: int | None,
+    prefix_depth: int,
 ) -> torch.Tensor:
     """Pad-filled [B, L, width] codes, with valid prefixes copied in."""
     output = torch.full(
@@ -137,12 +130,11 @@ def _padded_output(
         dtype=torch.long,
         device=prefix_codes.device,
     )
-    if prefix_depth is not None:
-        output[..., :prefix_depth] = torch.where(
-            valid_mask[..., None],
-            prefix_codes.long(),
-            torch.full_like(prefix_codes, pad_id),
-        )
+    output[..., :prefix_depth] = torch.where(
+        valid_mask[..., None],
+        prefix_codes.long(),
+        torch.full_like(prefix_codes, pad_id),
+    )
     return output
 
 
@@ -206,7 +198,6 @@ class PrefixTailCatalog:
     prefix_keys: torch.LongTensor
     codebook_size: int
     prefix_depth: int
-    target_level_start: int
     codebooks: torch.Tensor
     log_prior: torch.Tensor
     candidate_city: torch.LongTensor | None = None
@@ -220,35 +211,14 @@ class PrefixTailCatalog:
         prefix_depth: int,
         observed_codes: torch.Tensor | None = None,
         candidate_city: torch.Tensor | None = None,
-        target_level_start: int | None = None,
     ) -> PrefixTailCatalog:
-        if catalog_codes.ndim != 2:
-            raise ValueError("catalog_codes must have shape [N, M]")
-        if catalog_codes.dtype.is_floating_point:
-            raise TypeError("catalog_codes must contain integer SID codes")
-        if codebooks.ndim != 3:
-            raise ValueError("codebooks must have shape [M, C, D]")
-        if catalog_codes.shape[1] != codebooks.shape[0]:
-            raise ValueError(
-                "catalog_codes and codebooks have different widths"
-            )
-        if not 0 < prefix_depth < catalog_codes.shape[1]:
-            raise ValueError("prefix_depth must be within the SID width")
-        if catalog_codes.numel() == 0:
-            raise ValueError("catalog_codes cannot be empty")
         codebook_size = int(codebooks.shape[1])
-        if catalog_codes.min() < 0 or catalog_codes.max() >= codebook_size:
-            raise ValueError("catalog_codes contain invalid code values")
         codes, unique_inverse = torch.unique(
             catalog_codes.long(), dim=0, return_inverse=True
         )
         codes = codes.contiguous()
         if candidate_city is not None:
             city_source = candidate_city.long().cpu()
-            if city_source.shape[0] != catalog_codes.shape[0]:
-                raise ValueError(
-                    "candidate_city must align with catalog_codes rows"
-                )
             mapped = torch.full((codes.shape[0],), -1, dtype=torch.long)
             reversed_index = torch.arange(
                 city_source.shape[0] - 1, -1, -1, dtype=torch.long
@@ -257,14 +227,9 @@ class PrefixTailCatalog:
                 reversed_index
             ]
             candidate_city = mapped
-        level_start = (
-            prefix_depth if target_level_start is None else target_level_start
-        )
-        if not 0 <= level_start < catalog_codes.shape[1]:
-            raise ValueError("target_level_start must be within the SID width")
         tail = codes_to_embeddings_from_codebooks(
-            codes[:, level_start:],
-            codebooks[level_start:],
+            codes[:, prefix_depth:],
+            codebooks[prefix_depth:],
         ).float()
         prefix = codes[:, :prefix_depth]
         powers = torch.tensor(
@@ -279,11 +244,6 @@ class PrefixTailCatalog:
         order = torch.argsort(keys, stable=True)
         log_prior = torch.zeros(codes.size(0), dtype=torch.float32)
         if observed_codes is not None:
-            if (
-                observed_codes.ndim != 2
-                or observed_codes.shape[1] != codes.shape[1]
-            ):
-                raise ValueError("observed_codes must have shape [N, M]")
             observed_keys = _packed_code_keys(
                 observed_codes.long(), codebook_size=codebook_size
             )
@@ -311,7 +271,6 @@ class PrefixTailCatalog:
             prefix_keys=keys[order],
             codebook_size=codebook_size,
             prefix_depth=int(prefix_depth),
-            target_level_start=int(level_start),
             codebooks=codebooks.float().cpu().contiguous(),
             log_prior=log_prior[order],
             candidate_city=(
@@ -347,164 +306,85 @@ class PrefixTailCatalog:
         )
         return (prefixes.long() * powers).sum(dim=-1)
 
-    def decode(
-        self,
-        prefix_codes: torch.Tensor,
-        tail_embeddings: torch.Tensor,
-        valid_mask: torch.BoolTensor,
-        *,
-        pad_id: int,
-        row_city: torch.Tensor | None = None,
-        stats: dict[str, int] | None = None,
-    ) -> torch.LongTensor:
-        if prefix_codes.ndim != 3:
-            raise ValueError("prefix_codes must have shape [B, L, P]")
-        if tail_embeddings.ndim != 3:
-            raise ValueError("tail_embeddings must have shape [B, L, D]")
-        if valid_mask.shape != prefix_codes.shape[:2]:
-            raise ValueError("valid_mask must align with prefix_codes")
-        if prefix_codes.shape[-1] != self.prefix_depth:
-            raise ValueError("prefix_codes width does not match the catalog")
-        if tail_embeddings.shape[:2] != valid_mask.shape:
-            raise ValueError("tail_embeddings and valid_mask must align")
-        output = _padded_output(
-            valid_mask,
-            prefix_codes,
-            width=self.codes.shape[-1],
-            pad_id=pad_id,
-            prefix_depth=self.prefix_depth,
-        )
-        if not valid_mask.any():
-            return output
-        if (
-            row_city is not None
-            and self.candidate_city is not None
-            and (
-                row_city.ndim != 1 or row_city.shape[0] != valid_mask.shape[0]
-            )
-        ):
-            raise ValueError("row_city must have shape [B]")
-        active_prefix = prefix_codes[valid_mask].long()
-        active_tail = tail_embeddings[valid_mask].float()
-        left, right = _catalog_query_ranges(self, active_prefix)
-        widths = right - left
-        query_order = torch.argsort(widths, descending=True, stable=True)
-        active_codes = output[valid_mask].clone()
-        city = _CityConstraint(
-            self.candidate_city, row_city, valid_mask, left.device
-        )
-        for query_rows in _catalog_decode_query_chunks(query_order, widths):
-            candidate_indices, legal = _candidate_index_block(
-                left, right, query_rows
-            )
-            candidates = self.tail_embeddings[candidate_indices].float()
-            distances = (
-                (active_tail[query_rows, None, :] - candidates)
-                .square()
-                .sum(dim=-1)
-            )
-            keep = city.keep(candidate_indices, query_rows, legal)
-            distances = distances.masked_fill(~keep, float("inf"))
-            nearest = distances.argmin(dim=-1)
-            selected = candidate_indices.gather(1, nearest[:, None]).squeeze(1)
-            active_codes[query_rows] = self.codes[selected]
-        city.record(stats)
-        output[valid_mask] = active_codes
-        return output
-
 
 @dataclass(frozen=True, slots=True)
 class PrefixTimeSuffixLatentFlowSample:
     full_sids: torch.LongTensor
     tail_embeddings: torch.Tensor
     valid_mask: torch.BoolTensor
-    tail_level_embeddings: torch.Tensor | None = None
     city_constrained_events: int = 0
     city_constraint_fallback_events: int = 0
-    normalized_flow_path: torch.Tensor | None = None
-    flow_times: torch.Tensor | None = None
 
 
-def _global_catalog_neighbors(
-    catalog_embeddings: torch.Tensor,
-    queries: torch.Tensor,
-    *,
-    count: int,
-) -> torch.LongTensor:
-    if count < 1:
-        raise ValueError("global candidate count must be positive")
-    count = min(count, int(catalog_embeddings.shape[0]))
-    if catalog_embeddings.ndim != 2 or queries.ndim != 2:
-        raise ValueError("catalog embeddings and queries must be matrices")
-    if catalog_embeddings.shape[1] != queries.shape[1]:
-        raise ValueError("catalog embeddings and queries must share width")
-    catalog = catalog_embeddings.to(queries.device).float()
-    query = queries.float()
-    catalog_norm = catalog.square().sum(dim=-1)
-    output: list[torch.Tensor] = []
-    query_chunk_size = 512
-    catalog_chunk_size = 16384
-    for query_start in range(0, query.size(0), query_chunk_size):
-        query_chunk = query[query_start : query_start + query_chunk_size]
-        query_norm = query_chunk.square().sum(dim=-1, keepdim=True)
-        best_distance = torch.full(
-            (query_chunk.size(0), count),
-            float("inf"),
-            device=query.device,
-        )
-        best_index = torch.zeros(
-            (query_chunk.size(0), count),
-            dtype=torch.long,
-            device=query.device,
-        )
-        for catalog_start in range(0, catalog.size(0), catalog_chunk_size):
-            catalog_end = min(
-                catalog_start + catalog_chunk_size, catalog.size(0)
-            )
-            catalog_chunk = catalog[catalog_start:catalog_end]
-            distance = (
-                query_norm
-                + catalog_norm[catalog_start:catalog_end][None, :]
-                - 2.0 * query_chunk @ catalog_chunk.transpose(0, 1)
-            ).clamp_min_(0.0)
-            local_count = min(count, catalog_chunk.size(0))
-            local_distance, local_index = distance.topk(
-                local_count, dim=-1, largest=False
-            )
-            local_index = local_index + catalog_start
-            merged_distance = torch.cat(
-                (best_distance, local_distance), dim=-1
-            )
-            merged_index = torch.cat((best_index, local_index), dim=-1)
-            best_distance, selection = merged_distance.topk(
-                count, dim=-1, largest=False
-            )
-            best_index = merged_index.gather(-1, selection)
-        output.append(best_index)
-    return torch.cat(output, dim=0)
+CATALOG_NOISE_COUPLINGS = ("independent", "trajectory_prefix")
+_UINT32_MASK = 0xFFFFFFFF
 
 
-def _decode_global_nearest_catalog(
-    catalog: PrefixTailCatalog,
-    target_embeddings: torch.Tensor,
+def _hashed_uniform(
+    keys: torch.Tensor, candidate_indices: torch.Tensor
+) -> torch.Tensor:
+    """Deterministic uniform(0, 1) noise per (key, catalog candidate) pair.
+
+    Every multiplier is below 2**31 and operands are masked to 32 bits first,
+    so no int64 product overflows on CPU or CUDA.
+    """
+    h = (keys.long() * 0x5BD1E995 + candidate_indices.long()) & _UINT32_MASK
+    for multiplier in (0x7FEB352D, 0x2C1B3C6D, 0x297A2D39):
+        h = h ^ (h >> 16)
+        h = (h * multiplier) & _UINT32_MASK
+    h = h ^ (h >> 15)
+    return (h.double() + 0.5) / float(2**32)
+
+
+def _trajectory_prefix_coupling_keys(
     valid_mask: torch.BoolTensor,
-    *,
-    pad_id: int,
+    active_prefix: torch.Tensor,
+    generator: torch.Generator,
 ) -> torch.LongTensor:
-    output = torch.full(
-        (*valid_mask.shape, catalog.codes.shape[-1]),
-        pad_id,
-        dtype=torch.long,
-        device=valid_mask.device,
+    """One random key per (trajectory row, planned prefix), per active event.
+
+    Events are ordered as ``valid_mask`` boolean indexing orders them.
+    """
+    rows = valid_mask.nonzero()[:, 0]
+    _, groups = torch.unique(
+        torch.cat([rows[:, None], active_prefix.long()], dim=1),
+        dim=0,
+        return_inverse=True,
     )
-    if valid_mask.any():
-        nearest = _global_catalog_neighbors(
-            catalog.tail_embeddings.float(),
-            target_embeddings[valid_mask].float(),
-            count=1,
+    keys = torch.randint(
+        0,
+        2**31 - 1,
+        (int(groups.max().item()) + 1,),
+        generator=generator,
+        device=active_prefix.device,
+    )
+    return keys[groups]
+
+
+def _sample_catalog_candidates(
+    logits: torch.Tensor,
+    candidate_indices: torch.Tensor,
+    *,
+    catalog_temperature: float,
+    generator: torch.Generator,
+    coupling_keys: torch.Tensor | None,
+) -> torch.LongTensor:
+    """Draw one candidate slot per query from ``softmax(logits / T)``.
+
+    Without coupling keys this is an independent multinomial draw.  With keys,
+    Gumbel-max noise is shared by every query carrying the same key for the
+    same catalog candidate: each query keeps exactly its softmax marginal, while
+    same-key queries with similar logits tend to choose the same candidate.
+    """
+    if coupling_keys is None:
+        probabilities = torch.softmax(logits / catalog_temperature, dim=-1)
+        return torch.multinomial(
+            probabilities, 1, generator=generator
         ).squeeze(-1)
-        output[valid_mask] = catalog.codes[nearest]
-    return output
+    uniform = _hashed_uniform(coupling_keys[:, None], candidate_indices)
+    gumbel = -torch.log(-torch.log(uniform))
+    scores = logits.double() / catalog_temperature + gumbel
+    return scores.argmax(dim=-1)
 
 
 def _decode_calibrated_catalog(
@@ -515,97 +395,67 @@ def _decode_calibrated_catalog(
     conditioning: LatentSuffixConditioning,
     valid_mask: torch.BoolTensor,
     tail_mean: torch.Tensor,
-    tail_std: torch.Tensor,
+    tail_whitener: torch.Tensor,
     *,
-    tail_whitener: torch.Tensor | None,
     catalog_prior_weight: float,
     catalog_temperature: float,
-    global_candidate_count: int,
     generator: torch.Generator,
     row_city: torch.Tensor | None = None,
     stats: dict[str, int] | None = None,
+    catalog_noise_coupling: str = "independent",
 ) -> torch.LongTensor:
-    if model.catalog_decoder_mode != "calibrated":
-        raise ValueError(
-            "calibrated catalog decoding requires the calibrated model"
-        )
-    if catalog_temperature <= 0.0 or catalog_prior_weight < 0.0:
-        raise ValueError("catalog calibration parameters are invalid")
-    suffix_scope = model.latent_target_scope == "suffix"
+    """Sample from a learned posterior over same-prefix catalog candidates.
+
+    ``catalog_noise_coupling="trajectory_prefix"`` shares the sampling noise
+    among a trajectory's events with the same planned prefix (see
+    ``_sample_catalog_candidates``); ``"independent"`` keeps per-event draws.
+    """
     output = _padded_output(
         valid_mask,
         prefix_codes,
         width=catalog.codes.shape[-1],
         pad_id=model.pad_id,
-        prefix_depth=model.prefix_depth if suffix_scope else None,
+        prefix_depth=model.prefix_depth,
     )
     if not valid_mask.any():
         return output
 
     active_tail = normalized_tail[valid_mask].float()
+    coupling_keys = (
+        _trajectory_prefix_coupling_keys(
+            valid_mask, prefix_codes[valid_mask].long(), generator
+        )
+        if catalog_noise_coupling == "trajectory_prefix"
+        else None
+    )
     active_codes = output[valid_mask].clone()
     city = _CityConstraint(
         catalog.candidate_city, row_city, valid_mask, active_tail.device
     )
     normalized_catalog_tail = normalize_tail(
-        catalog.tail_embeddings,
-        tail_mean,
-        tail_std,
-        tail_whitener=tail_whitener,
+        catalog.tail_embeddings, tail_mean, tail_whitener
     )
-    catalog_levels = sid_level_embeddings(
+    catalog_levels = suffix_tail_level_embeddings(
         catalog.codes.unsqueeze(1),
         catalog.codebooks,
-        level_start=model.target_level_start,
+        prefix_depth=model.prefix_depth,
     ).squeeze(1)
     catalog_features = _precompute_catalog_candidate_features(
         model, normalized_catalog_tail, catalog_levels
     )
     del catalog_levels
-    if suffix_scope:
-        left, right = _catalog_query_ranges(
-            catalog, prefix_codes[valid_mask].long()
-        )
-        widths = right - left
-        query_chunks = _catalog_decode_query_chunks(
-            torch.argsort(widths, stable=True), widths
-        )
-
-        def candidates(
-            query_rows: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            return _candidate_index_block(left, right, query_rows)
-
-    else:
-        if (
-            city.active_city is not None
-            and catalog.candidate_city is not None
-            and torch.unique(catalog.candidate_city).numel() > 1
-        ):
-            raise ValueError(
-                "global full-SID decoding currently requires a single-city "
-                "catalog"
-            )
-        global_indices = _global_catalog_neighbors(
-            normalized_catalog_tail,
-            active_tail,
-            count=global_candidate_count,
-        )
-        query_chunks = list(
-            torch.arange(active_tail.size(0), device=active_tail.device).split(
-                _CATALOG_DECODE_QUERY_CHUNK_SIZE
-            )
-        )
-
-        def candidates(
-            query_rows: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            indices = global_indices[query_rows]
-            return indices, torch.ones_like(indices, dtype=torch.bool)
-
+    left, right = _catalog_query_ranges(
+        catalog, prefix_codes[valid_mask].long()
+    )
+    widths = right - left
+    query_chunks = _catalog_decode_query_chunks(
+        torch.argsort(widths, stable=True), widths
+    )
     active_plan = conditioning.plan[valid_mask]
     for query_rows in query_chunks:
-        candidate_indices, legal = candidates(query_rows)
+        candidate_indices, legal = _candidate_index_block(
+            left, right, query_rows
+        )
         candidate_codes = catalog.codes[candidate_indices]
         candidate_tail_batch = normalized_catalog_tail[candidate_indices]
         candidate_feature_batch = catalog_features[candidate_indices]
@@ -637,41 +487,21 @@ def _decode_calibrated_catalog(
         )
         keep = city.keep(candidate_indices, query_rows, legal)
         logits = logits.masked_fill(~keep, float("-inf"))
-        probabilities = torch.softmax(logits / catalog_temperature, dim=-1)
-        sampled = torch.multinomial(
-            probabilities, 1, generator=generator
-        ).squeeze(-1)
+        sampled = _sample_catalog_candidates(
+            logits,
+            candidate_indices,
+            catalog_temperature=catalog_temperature,
+            generator=generator,
+            coupling_keys=(
+                None if coupling_keys is None else coupling_keys[query_rows]
+            ),
+        )
         active_codes[query_rows] = candidate_codes[
             torch.arange(query_rows.numel(), device=query_rows.device), sampled
         ]
     output[valid_mask] = active_codes
     city.record(stats)
     return output
-
-
-def _sorted_trace_rows(
-    trace_indices: torch.LongTensor | None,
-    batch_size: int,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-    """Traced rows in ascending order, and the permutation restoring the
-    caller's order (None when no reordering is needed)."""
-    if trace_indices is None:
-        return None, None
-    if trace_indices.ndim != 1 or trace_indices.dtype.is_floating_point:
-        raise ValueError(
-            "trace_indices must be a one-dimensional integer tensor"
-        )
-    rows = trace_indices.detach().to(device="cpu", dtype=torch.long)
-    if not rows.numel():
-        return rows, None
-    if int(rows.min()) < 0 or int(rows.max()) >= batch_size:
-        raise ValueError("trace_indices contain an out-of-range row")
-    if torch.unique(rows).numel() != rows.numel():
-        raise ValueError("trace_indices must contain unique rows")
-    sorted_rows, sort_order = torch.sort(rows)
-    restore = torch.empty_like(sort_order)
-    restore[sort_order] = torch.arange(sort_order.numel(), dtype=torch.long)
-    return sorted_rows, restore
 
 
 def _integrate_flow(
@@ -682,13 +512,8 @@ def _integrate_flow(
     times_grid: torch.Tensor,
     *,
     solver: str,
-    traced_rows: torch.Tensor | None,
-) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    """Solve the flow ODE from noise (t=1) to data (t=0).
-
-    Returns the final state and, for ``traced_rows``, the CPU state after
-    every step including the initial noise.
-    """
+) -> torch.Tensor:
+    """Solve the flow ODE from noise (t=1) to data (t=0)."""
     padding = ~valid[..., None]
     rows = state.shape[0]
     num_steps = times_grid.numel() - 1
@@ -697,13 +522,6 @@ def _integrate_flow(
         x0 = model(x, t, conditioning, valid_mask=valid)
         return velocity_from_x0(x, x0, t).masked_fill(padding, 0.0)
 
-    path: list[torch.Tensor] = []
-
-    def record(x: torch.Tensor) -> None:
-        if traced_rows is not None:
-            path.append(x.index_select(0, traced_rows).detach().cpu())
-
-    record(state)
     for step in range(num_steps):
         t = times_grid[step].expand(rows)
         v1 = velocity(state, t)
@@ -715,8 +533,7 @@ def _integrate_flow(
         else:
             state = euler_step(state, v1, dt)
         state = state.masked_fill(padding, 0.0)
-        record(state)
-    return state, path
+    return state
 
 
 def _integrate_chunks(
@@ -730,19 +547,14 @@ def _integrate_chunks(
     chunk_size: int,
     solver: str,
     city_id: torch.LongTensor | None,
-    hop_distance_km: torch.Tensor | None,
-    trace_rows: torch.Tensor | None,
-    trace_restore: torch.Tensor | None,
-) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Integrate the flow from ``noise`` in row chunks, in eval mode.
 
-    Returns the normalized endpoints, the per-chunk conditioning plans and,
-    when tracing, the traced rows' flow path in the caller's order.
+    Returns the normalized endpoints and the conditioning plans.
     """
     batch_size = valid.size(0)
     normalized_chunks: list[torch.Tensor] = []
     conditioning_chunks: list[torch.Tensor] = []
-    flow_path_chunks: list[torch.Tensor] = []
     was_training = model.training
     model.eval()
     try:
@@ -753,77 +565,23 @@ def _integrate_chunks(
                 times[rows],
                 valid[rows],
                 city_id=None if city_id is None else city_id[rows],
-                hop_distance_km=(
-                    None if hop_distance_km is None else hop_distance_km[rows]
-                ),
             )
             conditioning_chunks.append(conditioning.plan.detach())
-            local_trace = None
-            if trace_rows is not None and trace_rows.numel():
-                in_chunk = (trace_rows >= rows.start) & (
-                    trace_rows < rows.stop
+            normalized_chunks.append(
+                _integrate_flow(
+                    model,
+                    noise[rows].clone(),
+                    conditioning,
+                    valid[rows],
+                    times_grid,
+                    solver=solver,
                 )
-                local_trace = (trace_rows[in_chunk] - rows.start).to(
-                    valid.device
-                )
-            state, path = _integrate_flow(
-                model,
-                noise[rows].clone(),
-                conditioning,
-                valid[rows],
-                times_grid,
-                solver=solver,
-                traced_rows=local_trace,
             )
-            normalized_chunks.append(state)
-            if path:
-                flow_path_chunks.append(torch.stack(path, dim=0))
     finally:
         model.train(was_training)
-
-    normalized = torch.cat(normalized_chunks, dim=0)
-    if trace_rows is None:
-        return normalized, conditioning_chunks, None
-    if not trace_rows.numel():
-        empty = (times_grid.numel(), 0, *noise.shape[1:])
-        return (
-            normalized,
-            conditioning_chunks,
-            torch.empty(empty, dtype=normalized.dtype),
-        )
-    flow_path = torch.cat(flow_path_chunks, dim=1)
-    if trace_restore is not None:
-        flow_path = flow_path.index_select(1, trace_restore)
-    return normalized, conditioning_chunks, flow_path
-
-
-def _denormalized_tail(
-    model: PrefixTimeSuffixLatentFlowRealizer,
-    normalized: torch.Tensor,
-    valid: torch.Tensor,
-    mean: torch.Tensor,
-    std: torch.Tensor,
-    tail_dewhitener: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Summed tail embeddings and, for factorized tails, the per-level ones."""
-    tail_level_embeddings = None
-    if model.tail_representation == "factorized":
-        tail_level_embeddings = (
-            normalized.reshape(
-                *valid.shape, model.suffix_depth, model.latent_dim
-            )
-            * std
-            + mean
-        )
-        tail = tail_level_embeddings.sum(dim=2)
-        tail_level_embeddings = tail_level_embeddings.masked_fill(
-            ~valid[..., None, None], 0.0
-        )
-    else:
-        tail = denormalize_tail(
-            normalized, mean, std, tail_dewhitener=tail_dewhitener
-        )
-    return tail.masked_fill(~valid[..., None], 0.0), tail_level_embeddings
+    return torch.cat(normalized_chunks, dim=0), torch.cat(
+        conditioning_chunks, dim=0
+    )
 
 
 @torch.inference_mode()
@@ -835,76 +593,48 @@ def sample_prefix_time_suffix_latent_flow(
     *,
     catalog: PrefixTailCatalog,
     tail_mean: torch.Tensor,
-    tail_std: torch.Tensor,
+    tail_whitener: torch.Tensor,
+    tail_dewhitener: torch.Tensor,
     num_steps: int = 32,
     solver: str = "heun",
     device: torch.device | str | None = None,
     generator: torch.Generator | None = None,
     max_batch_size: int | None = None,
-    tail_whitener: torch.Tensor | None = None,
-    tail_dewhitener: torch.Tensor | None = None,
     catalog_prior_weight: float = 0.25,
     catalog_temperature: float = 1.0,
-    global_candidate_count: int = 64,
     city_id: torch.LongTensor | None = None,
-    hop_distance_km: torch.Tensor | None = None,
-    trace_indices: torch.LongTensor | None = None,
+    catalog_noise_coupling: str = "independent",
 ) -> PrefixTimeSuffixLatentFlowSample:
-    if num_steps <= 0:
-        raise ValueError("num_steps must be positive")
-    if global_candidate_count < 1:
-        raise ValueError("global_candidate_count must be positive")
     if solver not in {"euler", "heun"}:
         raise ValueError("solver must be 'euler' or 'heun'")
-    if prefix_codes.ndim != 3 or time_tokens.shape != valid_mask.shape:
-        raise ValueError("prefix/time/mask shapes are inconsistent")
-    if prefix_codes.shape[:2] != valid_mask.shape:
-        raise ValueError("prefix_codes and valid_mask must align")
-    if not valid_mask.any(dim=1).all():
-        raise ValueError("each batch row must contain a valid event")
-    check_tail_statistics(
-        model, tail_mean, tail_std, tail_whitener, tail_dewhitener
-    )
 
     model_device = next(model.parameters()).device
     resolved_device = model_device if device is None else torch.device(device)
-    if resolved_device != model_device:
-        raise ValueError(
-            f"model is on {model_device}, but sampler requested {resolved_device}"
-        )
     prefix = prefix_codes.to(resolved_device, dtype=torch.long)
     times = time_tokens.to(resolved_device, dtype=torch.long)
     valid = valid_mask.to(resolved_device, dtype=torch.bool)
     mean = tail_mean.to(resolved_device).float()
-    std = tail_std.to(resolved_device).float()
-    if tail_whitener is not None:
-        tail_whitener = tail_whitener.to(resolved_device).float()
-    if tail_dewhitener is not None:
-        tail_dewhitener = tail_dewhitener.to(resolved_device).float()
+    tail_whitener = tail_whitener.to(resolved_device).float()
+    tail_dewhitener = tail_dewhitener.to(resolved_device).float()
     catalog = catalog.to(resolved_device)
 
     if generator is None:
         generator = torch.Generator(device=resolved_device)
         generator.manual_seed(torch.seed())
-    if torch.device(generator.device) != resolved_device:
-        raise ValueError("generator and model must be on the same device")
 
     batch_size, seq_len = valid.shape
     chunk_size = batch_size if max_batch_size is None else max_batch_size
-    if chunk_size <= 0:
-        raise ValueError("max_batch_size must be positive when supplied")
-    trace_rows, trace_restore = _sorted_trace_rows(trace_indices, batch_size)
     times_grid = torch.linspace(
         1.0, 0.0, num_steps + 1, device=resolved_device
     )
     initial_noise = torch.randn(
         batch_size,
         seq_len,
-        model.flow_latent_dim,
+        model.latent_dim,
         device=resolved_device,
         generator=generator,
     ).masked_fill(~valid[..., None], 0.0)
-    normalized, conditioning_chunks, normalized_flow_path = _integrate_chunks(
+    normalized, plan = _integrate_chunks(
         model,
         initial_noise,
         prefix,
@@ -914,64 +644,40 @@ def sample_prefix_time_suffix_latent_flow(
         chunk_size=chunk_size,
         solver=solver,
         city_id=city_id,
-        hop_distance_km=hop_distance_km,
-        trace_rows=trace_rows,
-        trace_restore=trace_restore,
     )
-    tail, tail_level_embeddings = _denormalized_tail(
-        model, normalized, valid, mean, std, tail_dewhitener
+    tail = denormalize_tail(normalized, mean, tail_dewhitener).masked_fill(
+        ~valid[..., None], 0.0
     )
     decode_stats: dict[str, int] = {}
-    if model.catalog_decoder_mode == "calibrated":
-        full_sids = _decode_calibrated_catalog(
-            model,
-            catalog,
-            prefix,
-            normalized,
-            LatentSuffixConditioning(
-                plan=torch.cat(conditioning_chunks, dim=0),
-                valid_mask=valid,
-            ),
-            valid,
-            mean,
-            std,
-            tail_whitener=tail_whitener,
-            catalog_prior_weight=catalog_prior_weight,
-            catalog_temperature=catalog_temperature,
-            global_candidate_count=global_candidate_count,
-            generator=generator,
-            row_city=city_id,
-            stats=decode_stats,
-        )
-    elif model.latent_target_scope == "full_sid":
-        full_sids = _decode_global_nearest_catalog(
-            catalog, tail, valid, pad_id=model.pad_id
-        )
-    else:
-        full_sids = catalog.decode(
-            prefix,
-            tail,
-            valid,
-            pad_id=model.pad_id,
-            row_city=city_id,
-            stats=decode_stats,
-        )
-
+    full_sids = _decode_calibrated_catalog(
+        model,
+        catalog,
+        prefix,
+        normalized,
+        LatentSuffixConditioning(plan=plan, valid_mask=valid),
+        valid,
+        mean,
+        tail_whitener,
+        catalog_prior_weight=catalog_prior_weight,
+        catalog_temperature=catalog_temperature,
+        generator=generator,
+        row_city=city_id,
+        stats=decode_stats,
+        catalog_noise_coupling=catalog_noise_coupling,
+    )
     return PrefixTimeSuffixLatentFlowSample(
         full_sids=full_sids,
         tail_embeddings=tail,
         valid_mask=valid,
-        tail_level_embeddings=tail_level_embeddings,
         city_constrained_events=decode_stats.get("city_constrained_events", 0),
         city_constraint_fallback_events=decode_stats.get(
             "city_constraint_fallback_events", 0
         ),
-        normalized_flow_path=normalized_flow_path,
-        flow_times=None if trace_rows is None else times_grid.detach().cpu(),
     )
 
 
 __all__ = [
+    "CATALOG_NOISE_COUPLINGS",
     "PrefixTailCatalog",
     "PrefixTimeSuffixLatentFlowSample",
     "sample_prefix_time_suffix_latent_flow",

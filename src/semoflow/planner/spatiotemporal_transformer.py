@@ -146,19 +146,18 @@ class SpatioTemporalRelationBias(nn.Module):
         position_bucket: torch.Tensor,
         lcp: torch.Tensor,
         spatial_valid: torch.Tensor,
-        time_bucket: torch.Tensor | None,
+        time_bucket: torch.Tensor,
     ) -> torch.Tensor:
         spatial = self.lcp_bias(lcp)
         spatial = spatial * spatial_valid.unsqueeze(-1).to(spatial.dtype)
         bias = self.position_bias(position_bucket) + spatial
-        if time_bucket is not None:
-            bias = bias + self.time_bias(time_bucket)
+        bias = bias + self.time_bias(time_bucket)
         return bias.permute(0, 3, 1, 2).contiguous()
 
     def forward(
         self,
         prefixes: torch.Tensor,
-        times: torch.Tensor | None,
+        times: torch.Tensor,
     ) -> torch.Tensor:
         batch, steps, _ = prefixes.shape
         positions = torch.arange(steps, device=prefixes.device)
@@ -166,20 +165,17 @@ class SpatioTemporalRelationBias(nn.Module):
         position_bucket = _relative_position_bucket(delta)
         position_bucket = position_bucket.expand(batch, -1, -1)
         lcp, spatial_valid = self._lcp(prefixes, prefixes)
-        time_bucket = (
-            None if times is None else self._time_bucket(times, times)
-        )
         return self._combine(
             position_bucket,
             lcp,
             spatial_valid,
-            time_bucket,
+            self._time_bucket(times, times),
         )
 
     def step(
         self,
         prefixes: torch.Tensor,
-        times: torch.Tensor | None,
+        times: torch.Tensor,
         *,
         step: int,
     ) -> torch.Tensor:
@@ -192,12 +188,9 @@ class SpatioTemporalRelationBias(nn.Module):
             prefixes.shape[0], 1, -1
         )
         lcp, spatial_valid = self._lcp(query, keys)
-        time_bucket = None
-        if times is not None:
-            time_bucket = self._time_bucket(
-                times[:, step : step + 1],
-                times[:, : step + 1],
-            )
+        time_bucket = self._time_bucket(
+            times[:, step : step + 1], times[:, : step + 1]
+        )
         return self._combine(
             position_bucket,
             lcp,

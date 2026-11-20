@@ -31,8 +31,6 @@ def feature_columns(frame: pl.DataFrame) -> list[str]:
 
 
 def frame_to_numpy(frame: pl.DataFrame, columns: list[str]) -> np.ndarray:
-    if not columns:
-        raise ValueError("feature columns must be non-empty")
     values = frame.select(columns).to_numpy().astype("float32", copy=False)
     return np.nan_to_num(values, copy=True).astype("float32", copy=False)
 
@@ -142,17 +140,6 @@ def _pca_apply(
         )
     mean = np.asarray(parameters.get("mean"), dtype=np.float32)
     components = np.asarray(parameters.get("components"), dtype=np.float32)
-    if mean.shape != (len(src_cols),):
-        raise ValueError(
-            "frozen PCA mean has the wrong shape: "
-            f"expected {(len(src_cols),)}, got {mean.shape}"
-        )
-    if components.shape != (n_components, len(src_cols)):
-        raise ValueError(
-            "frozen PCA components have the wrong shape: "
-            f"expected {(n_components, len(src_cols))}, got "
-            f"{components.shape}"
-        )
     values = frame.select(src_cols).to_numpy().astype(np.float32, copy=False)
     reduced = (values - mean) @ components.T
     return _with_block(frame.drop(src_cols), dst_prefix, reduced)

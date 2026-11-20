@@ -15,30 +15,19 @@ _N_RETRIEVAL_EXPERTS = 3
 @dataclass(frozen=True, slots=True)
 class ExploreRetrieveRoutingOutput:
     retrieve_logit: torch.Tensor
-    retrieve_probability: torch.Tensor
-    mechanism_weights: torch.Tensor
     retrieval_log_probability: torch.Tensor
     history_mask: torch.Tensor
-    distinct_prefix_count: torch.Tensor
 
 
 def _inverse_softplus(value: float) -> float:
-    if value <= 0.0:
-        raise ValueError("inverse softplus requires a positive value")
     return math.log(math.expm1(value))
 
 
 def _masked_log_softmax(
     scores: torch.Tensor, mask: torch.Tensor
 ) -> torch.Tensor:
-    if scores.shape != mask.shape:
-        raise ValueError("scores and mask must have identical shapes")
-    if mask.dtype != torch.bool:
-        raise ValueError("mask must be boolean")
     any_valid = mask.any(dim=-1, keepdim=True)
     safe_mask = mask.clone()
-    if scores.shape[-1] < 1:
-        raise ValueError("scores must have a non-empty final dimension")
     safe_mask[..., 0] |= ~any_valid.squeeze(-1)
     safe_scores = scores.masked_fill(~safe_mask, _NEG_INF)
     result = F.log_softmax(safe_scores.float(), dim=-1)
@@ -47,8 +36,6 @@ def _masked_log_softmax(
 
 
 def _causal_history_mask(prefix_codes: torch.Tensor) -> torch.Tensor:
-    if prefix_codes.ndim != 3:
-        raise ValueError("prefix_codes must have shape [B, S, P]")
     valid_memory = (prefix_codes >= 0).all(dim=-1)
     steps = prefix_codes.shape[1]
     indices = torch.arange(steps, device=prefix_codes.device)
@@ -88,8 +75,6 @@ def _prefix_statistics(
 def _step_prefix_statistics(
     prefix_codes: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if prefix_codes.ndim != 3:
-        raise ValueError("prefix_codes must have shape [B, M, P]")
     valid = (prefix_codes >= 0).all(dim=-1)
     safe = torch.where(
         valid[..., None],
@@ -115,8 +100,6 @@ def _mix_expert_log_probabilities(
     history_mask: torch.Tensor,
     history_available: torch.Tensor,
 ) -> torch.Tensor:
-    if not expert_log_probabilities:
-        raise ValueError("at least one retrieval expert is required")
     mixed: torch.Tensor | None = None
     for index, expert in enumerate(expert_log_probabilities):
         term = expert.masked_fill(~history_available[..., None], 0.0)
@@ -165,24 +148,9 @@ class _LogDistinctGatePrior(nn.Module):
 
 
 class ExploreRetrieveRouter(nn.Module):
-    expert_names = ("neural", "frequency", "last")
-    gate_priors = ("log_distinct", "epr", "none")
-
-    def __init__(
-        self,
-        *,
-        model_dim: int,
-        gate_prior: str = "log_distinct",
-    ) -> None:
+    def __init__(self, *, model_dim: int, gate_prior: str) -> None:
         super().__init__()
-        if model_dim < 1:
-            raise ValueError("model_dim must be positive")
-        if gate_prior not in self.gate_priors:
-            raise ValueError(
-                "gate_prior must be one of " + ", ".join(self.gate_priors)
-            )
         self.model_dim = int(model_dim)
-        self.gate_prior = gate_prior
 
         self.query_projection = nn.Linear(model_dim, model_dim, bias=False)
         self.key_projection = nn.Linear(model_dim, model_dim, bias=False)
@@ -200,13 +168,9 @@ class ExploreRetrieveRouter(nn.Module):
 
         self.frequency_log_exponent = nn.Parameter(torch.zeros(()))
 
-        self.gate_prior_module: nn.Module | None
-        if gate_prior == "epr":
-            self.gate_prior_module = _EprGatePrior()
-        elif gate_prior == "log_distinct":
-            self.gate_prior_module = _LogDistinctGatePrior()
-        else:
-            self.gate_prior_module = None
+        self.gate_prior_module = (
+            _EprGatePrior() if gate_prior == "epr" else _LogDistinctGatePrior()
+        )
 
     @property
     def frequency_exponent(self) -> torch.Tensor:
@@ -279,8 +243,7 @@ class ExploreRetrieveRouter(nn.Module):
             dim=-1,
         )
         residual = self.router_residual(residual_features).squeeze(-1).float()
-        if self.gate_prior_module is not None:
-            residual = residual + self.gate_prior_module(distinct_prefix_count)
+        residual = residual + self.gate_prior_module(distinct_prefix_count)
         return residual.masked_fill(~history_available, _NEG_INF)
 
     def _route(
@@ -310,16 +273,10 @@ class ExploreRetrieveRouter(nn.Module):
             distinct_prefix_count,
             history_available,
         )
-        retrieve_probability = torch.sigmoid(retrieve_logit).masked_fill(
-            ~history_available, 0.0
-        )
         return ExploreRetrieveRoutingOutput(
             retrieve_logit=retrieve_logit,
-            retrieve_probability=retrieve_probability,
-            mechanism_weights=mechanism_log_weights.exp(),
             retrieval_log_probability=retrieval_log_probability,
             history_mask=history_mask,
-            distinct_prefix_count=distinct_prefix_count,
         )
 
     def forward_step(
@@ -328,19 +285,6 @@ class ExploreRetrieveRouter(nn.Module):
         memory_states: torch.Tensor,
         memory_prefix_codes: torch.Tensor,
     ) -> ExploreRetrieveRoutingOutput:
-        if query_state.ndim != 2:
-            raise ValueError("query_state must have shape [B, D]")
-        if memory_states.ndim != 3:
-            raise ValueError("memory_states must have shape [B, M, D]")
-        batch_size, memory_steps, model_dim = memory_states.shape
-        if query_state.shape != (batch_size, model_dim):
-            raise ValueError("query_state does not align with memory_states")
-        if model_dim != self.model_dim:
-            raise ValueError("state dimension differs from router model_dim")
-        if memory_prefix_codes.ndim != 3:
-            raise ValueError("memory_prefix_codes must have shape [B, M, P]")
-        if memory_prefix_codes.shape[:2] != (batch_size, memory_steps):
-            raise ValueError("memory prefixes do not align with memory states")
 
         frequency_count, history_mask, distinct_prefix_count = (
             _step_prefix_statistics(memory_prefix_codes)
@@ -366,20 +310,6 @@ class ExploreRetrieveRouter(nn.Module):
         memory_states: torch.Tensor,
         memory_prefix_codes: torch.Tensor,
     ) -> ExploreRetrieveRoutingOutput:
-        if query_states.ndim != 3 or memory_states.ndim != 3:
-            raise ValueError(
-                "query and memory states must have shape [B, S, D]"
-            )
-        if query_states.shape != memory_states.shape:
-            raise ValueError(
-                "query and memory states must have identical shape"
-            )
-        if query_states.shape[-1] != self.model_dim:
-            raise ValueError("state dimension differs from router model_dim")
-        if memory_prefix_codes.shape[:2] != query_states.shape[:2]:
-            raise ValueError(
-                "memory prefixes do not align with state sequence"
-            )
 
         causal_history_mask = _causal_history_mask(memory_prefix_codes)
         (
@@ -405,21 +335,6 @@ def retrieval_target_log_probability(
     memory_prefix_codes: torch.Tensor,
     target_prefix_codes: torch.Tensor,
 ) -> torch.Tensor:
-    if memory_prefix_codes.ndim != 3 or target_prefix_codes.ndim != 3:
-        raise ValueError("prefix tensors must have shape [B, S, P]")
-    if (
-        memory_prefix_codes.shape[0] != target_prefix_codes.shape[0]
-        or memory_prefix_codes.shape[2] != target_prefix_codes.shape[2]
-    ):
-        raise ValueError(
-            "memory and target prefixes must align in batch/depth"
-        )
-    if routing.retrieval_log_probability.shape != (
-        target_prefix_codes.shape[0],
-        target_prefix_codes.shape[1],
-        memory_prefix_codes.shape[1],
-    ):
-        raise ValueError("routing output does not align with prefix tensors")
     matches = (
         target_prefix_codes[:, :, None, :]
         == memory_prefix_codes[:, None, :, :]
@@ -444,10 +359,6 @@ def explore_retrieve_target_log_probability(
     routing: ExploreRetrieveRoutingOutput,
     retrieval_target_log_probability: torch.Tensor,
 ) -> torch.Tensor:
-    if explore_target_log_probability.shape != routing.retrieve_logit.shape:
-        raise ValueError("explore log probability must align with router")
-    if retrieval_target_log_probability.shape != routing.retrieve_logit.shape:
-        raise ValueError("retrieval target probability must align with router")
     log_retrieve = F.logsigmoid(routing.retrieve_logit)
     log_explore = F.logsigmoid(-routing.retrieve_logit)
     no_history = ~routing.history_mask.any(dim=-1)
@@ -469,23 +380,10 @@ def prefix_target_log_probability(
     prefix_logits: torch.Tensor,
     prefix_targets: torch.Tensor,
 ) -> torch.Tensor:
-    if prefix_logits.ndim == 4:
-        if prefix_targets.shape != prefix_logits.shape[:3]:
-            raise ValueError("hierarchical prefix targets do not align")
-        selected = (
-            F.log_softmax(prefix_logits.float(), dim=-1)
-            .gather(-1, prefix_targets[..., None])
-            .squeeze(-1)
-        )
-        return selected.sum(dim=-1)
-    if prefix_logits.ndim == 3:
-        if prefix_targets.shape != prefix_logits.shape[:2]:
-            raise ValueError("flat prefix targets do not align")
-        return (
-            F.log_softmax(prefix_logits.float(), dim=-1)
-            .gather(-1, prefix_targets[..., None])
-            .squeeze(-1)
-        )
-    raise ValueError(
-        "prefix logits must be flat [B,S,V] or hierarchical [B,S,P,V]"
+    """Hierarchical log-probability of ``prefix_targets`` ([..., P])."""
+    selected = (
+        F.log_softmax(prefix_logits.float(), dim=-1)
+        .gather(-1, prefix_targets[..., None])
+        .squeeze(-1)
     )
+    return selected.sum(dim=-1)

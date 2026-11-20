@@ -6,8 +6,6 @@ import logging
 from pathlib import Path
 from typing import Any, cast
 
-import polars as pl
-
 from semoflow.config.artifacts import TokenizerArtifacts
 from semoflow.config.schemas.evaluation_config import EvaluationConfig
 from semoflow.metrics.city_inputs import (
@@ -20,9 +18,6 @@ from semoflow.metrics.grounding_candidate_prior import build_prior
 from semoflow.metrics.planner_realizer_composition import (
     evaluate_planner_realizer,
     realizer_contract,
-)
-from semoflow.planner.conditions_build import (
-    build_occurrence_planner_conditions,
 )
 from semoflow.planner.sampling_run import sample_occurrence_planner
 from semoflow.realizer.bank import build_bank
@@ -90,21 +85,14 @@ def _evaluate_city(
 
     # One plan per reference week.
     num_samples = row_counts[settings.reference_split]
-    conditions = output_dir / "conditions.pt"
-    build_occurrence_planner_conditions(
-        checkpoint_path=settings.planner_checkpoint,
-        rows=pl.DataFrame({"city_id": [city_id] * num_samples}),
-        output_path=conditions,
-        force=force,
-    )
     plans = output_dir / "plans.pt"
     sampling = settings.sampling
     sample_occurrence_planner(
         checkpoint_path=settings.planner_checkpoint,
         output_path=plans,
         num_samples=num_samples,
+        city_id=city_id,
         batch_size=sampling.batch_size,
-        conditions_path=conditions,
         device=settings.device,
         seed=settings.seed,
         temperature=sampling.temperature,
@@ -132,6 +120,7 @@ def _evaluate_city(
         candidate_prior=prior,
         catalog_temperature=composition.catalog_temperature,
         brief_metrics=composition.brief_metrics,
+        catalog_noise_coupling=composition.catalog_noise_coupling,
     )
     return {"output": output, "samples": num_samples, **report["summary"]}
 

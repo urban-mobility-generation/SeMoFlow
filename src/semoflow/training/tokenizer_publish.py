@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
-import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -11,7 +9,6 @@ import polars as pl
 
 from semoflow.config import ExperimentConfig
 from semoflow.config.artifacts import TokenizerArtifacts
-from semoflow.tokenization.features import load_graph_embeddings
 from semoflow.tokenization.shared_local import (
     semantic_id_lookup_fingerprint,
     shared_codebook_fingerprint,
@@ -22,7 +19,6 @@ from semoflow.utils.provenance import (
     load_closure,
     write_closure,
 )
-from semoflow.utils.run_metadata import write_run_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -146,17 +142,6 @@ def publish_tokenizer_artifacts(
             artifacts.tokenizer_codebooks,
         )
         write_tokenizer_provenance(tcfg, artifacts)
-        if tcfg.skip_semantic_id_eval:
-            logger.info(
-                "skip_semantic_id_eval=true; skipping semantic-ID report"
-            )
-        else:
-            run_semantic_id_eval(
-                cfg=tcfg,
-                artifacts=artifacts,
-                places_index=prepared.places_index,
-                stays=stays,
-            )
         required = (
             "augmented_processed_visits",
             "placekey_lookup",
@@ -219,229 +204,6 @@ def write_tokenizer_provenance(
     write_closure(closure, artifacts.run_dir)
 
 
-def run_semantic_id_eval(
-    *,
-    cfg: Any,
-    artifacts: TokenizerArtifacts,
-    places_index: pl.DataFrame,
-    stays: pl.DataFrame | None = None,
-) -> None:
-    from semoflow.metrics.semantic_id_baselines import (
-        build_simple_baseline_lookups,
-        select_baseline_metrics,
-    )
-    from semoflow.metrics.semantic_id_eval import evaluate_semantic_id_families
-    from semoflow.metrics.tokenization import (
-        SemanticIDGroundingIndex,
-        evaluate_semantic_ids,
-        write_semantic_id_eval_report,
-    )
-    from semoflow.tokenization.decoding.codebooks import (
-        extract_codebook_bundle,
-    )
-
-    lookup_df = _enrich_sid_lookup_for_eval(
-        pl.read_parquet(artifacts.placekey_lookup), places_index
-    )
-    grounding_idx = SemanticIDGroundingIndex.load(artifacts.grounding_index)
-    codebooks = extract_codebook_bundle(
-        artifacts.tokenizer_codebooks
-    ).codebooks
-
-    cf_embeddings = None
-    cf_index = None
-    if cfg.graphsage_artifact_dir:
-        cf_index, cf_embeddings = load_graph_embeddings(
-            Path(cfg.graphsage_artifact_dir)
-        )
-
-    latlon_map: dict[str, tuple[float, float]] | None = None
-    if {"placekey", "latitude", "longitude"} <= set(places_index.columns):
-        latlon_map = {
-            str(row["placekey"]): (
-                float(row["latitude"]),
-                float(row["longitude"]),
-            )
-            for row in places_index.select(
-                ["placekey", "latitude", "longitude"]
-            )
-            .drop_nulls()
-            .iter_rows(named=True)
-        }
-
-    result = evaluate_semantic_ids(
-        grounding_idx,
-        placekey_lookup=lookup_df,
-        stays=stays,
-        cf_embeddings=cf_embeddings,
-        cf_index=cf_index,
-        latlon_map=latlon_map,
-        codebooks=codebooks,
-        codebook_size=cfg.codebook_size,
-        k=cfg.eval_k,
-        sample_size=cfg.eval_sample_size,
-        pair_sample_size=cfg.eval_pair_sample_size,
-        geometry_sample_size=cfg.eval_geometry_sample_size,
-        geometry_lcp_pair_sample_size=cfg.eval_geometry_lcp_pair_sample_size,
-        seed=cfg.seed,
-        bootstrap_resamples=cfg.eval_bootstrap_resamples,
-        bootstrap_confidence=cfg.eval_bootstrap_confidence,
-    )
-
-    baseline_metrics: dict[str, Any] = {}
-    baseline_catalog = _enrich_sid_lookup_for_eval(
-        grounding_idx.to_frame(), places_index
-    )
-    text_embeddings = _load_optional_text_embeddings(
-        Path(cfg.text_embeddings_path)
-    )
-    catalog_id = (
-        "placekey_id"
-        if "placekey_id" in baseline_catalog.columns
-        else "placekey"
-    )
-    catalog_embedding_index = places_index.select(catalog_id).with_row_index(
-        "embedding_row"
-    )
-    graph_embeddings_np = (
-        cf_embeddings.detach().cpu().numpy()
-        if cf_embeddings is not None
-        else None
-    )
-    simple_lookups = build_simple_baseline_lookups(
-        baseline_catalog,
-        n_codebooks=result.n_codebooks,
-        codebook_size=result.codebook_size,
-        seed=cfg.seed,
-        text_embeddings=text_embeddings,
-        graph_embeddings=graph_embeddings_np,
-        text_embedding_index=catalog_embedding_index,
-        graph_embedding_index=cf_index,
-    )
-
-    def evaluate_baseline(name: str, lookup: pl.DataFrame) -> None:
-        enriched = _enrich_sid_lookup_for_eval(lookup, places_index)
-        baseline_grounding = _grounding_for_eval_lookup(enriched)
-        metrics = evaluate_semantic_id_families(
-            baseline_grounding,
-            placekey_lookup=enriched,
-            stays=stays,
-            cf_embeddings=cf_embeddings,
-            cf_index=cf_index,
-            latlon_map=latlon_map,
-            codebook_size=result.codebook_size,
-            k=cfg.eval_k,
-            sample_size=cfg.eval_sample_size,
-            pair_sample_size=cfg.eval_pair_sample_size,
-            seed=cfg.seed,
-            bootstrap_resamples=cfg.eval_bootstrap_resamples,
-            bootstrap_confidence=cfg.eval_bootstrap_confidence,
-        )
-        baseline_metrics[name] = select_baseline_metrics(metrics)
-
-    for name, baseline_lookup in simple_lookups.items():
-        evaluate_baseline(name, baseline_lookup)
-
-    result = dataclasses.replace(result, baseline_metrics=baseline_metrics)
-
-    eval_dir = artifacts.eval_dir
-    eval_dir.mkdir(parents=True, exist_ok=True)
-    (eval_dir / "semantic_id_eval.json").write_text(
-        json.dumps(result.to_dict(), indent=2), encoding="utf-8"
-    )
-    write_semantic_id_eval_report(result, eval_dir / "semantic_id_eval.md")
-    write_run_manifest(
-        eval_dir,
-        inputs={
-            "run_dir": artifacts.run_dir,
-            "placekey_lookup": artifacts.placekey_lookup,
-            "grounding_index": artifacts.grounding_index,
-            "tokenizer_codebooks": artifacts.tokenizer_codebooks,
-            "graphsage_artifact_dir": cfg.graphsage_artifact_dir,
-        },
-        outputs={
-            "semantic_id_eval": eval_dir / "semantic_id_eval.json",
-            "semantic_id_report": eval_dir / "semantic_id_eval.md",
-        },
-    )
-
-
-def _enrich_sid_lookup_for_eval(
-    lookup: pl.DataFrame,
-    places_index: pl.DataFrame,
-) -> pl.DataFrame:
-    id_column = (
-        "placekey_id" if "placekey_id" in lookup.columns else "placekey"
-    )
-    if id_column not in places_index.columns:
-        return lookup
-    metadata_columns = [
-        column
-        for column in (
-            "placekey",
-            "top_category",
-            "top_cat",
-            "geohash_5",
-            "latitude",
-            "longitude",
-            "naics_code",
-        )
-        if column in places_index.columns and column not in lookup.columns
-    ]
-    if not metadata_columns:
-        return lookup
-    return lookup.join(
-        places_index.select([id_column, *metadata_columns]).unique(
-            subset=[id_column], keep="first"
-        ),
-        on=id_column,
-        how="left",
-        maintain_order="left",
-    )
-
-
-def _grounding_for_eval_lookup(lookup: pl.DataFrame) -> Any:
-    from semoflow.metrics.tokenization import SemanticIDGroundingIndex
-    from semoflow.tokenization.token_space import sid_code_columns
-
-    id_column = (
-        "placekey_id" if "placekey_id" in lookup.columns else "placekey"
-    )
-    code_cols = list(sid_code_columns(lookup.columns))
-    payload_columns = [
-        column
-        for column in (
-            "placekey",
-            "placekey_id",
-            "top_category",
-            "top_cat",
-            "geohash_5",
-            "latitude",
-            "longitude",
-            "naics_code",
-        )
-        if column in lookup.columns
-    ]
-    return SemanticIDGroundingIndex.from_frame(
-        lookup,
-        key_columns=code_cols,
-        id_column=id_column,
-        payload_columns=payload_columns,
-    )
-
-
-def _load_optional_text_embeddings(path: Path) -> np.ndarray | None:
-    if not path.exists():
-        return None
-    values = np.load(path, mmap_mode="r")
-    if values.ndim != 2:
-        logger.warning(
-            "skipping text K-means baseline: expected 2D embeddings"
-        )
-        return None
-    return np.asarray(values)
-
-
 def encode_feature_tensors(
     model: Any,
     tensors: dict[str, Any],
@@ -471,7 +233,9 @@ def write_grounding_artifacts(
     code_cols: list[str],
     grounding_index_path: Path,
 ) -> Any:
-    from semoflow.metrics.tokenization import SemanticIDGroundingIndex
+    from semoflow.tokenization.decoding.grounding_index import (
+        SemanticIDGroundingIndex,
+    )
 
     payload_cols = [
         c

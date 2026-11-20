@@ -7,6 +7,9 @@ import numpy as np
 
 N_PART_OF_DAY_BINS = 6
 N_TIME_TOKENS = 42
+# Start minute of each unequal circadian part-of-day bin:
+# [0,6), [6,10), [10,14), [14,18), [18,22), [22,24) hours.
+PART_OF_DAY_START_MINUTES: tuple[int, ...] = (0, 360, 600, 840, 1080, 1320)
 
 
 def _coerce_datetime(value: Any) -> datetime:
@@ -22,18 +25,9 @@ def _coerce_datetime(value: Any) -> datetime:
 
 
 def part_of_day_bin(value: Any) -> int:
-    hour = _coerce_datetime(value).hour
-    if hour < 6:
-        return 0
-    if hour < 10:
-        return 1
-    if hour < 14:
-        return 2
-    if hour < 18:
-        return 3
-    if hour < 22:
-        return 4
-    return 5
+    stamp = _coerce_datetime(value)
+    minute = stamp.hour * 60 + stamp.minute
+    return sum(minute >= start for start in PART_OF_DAY_START_MINUTES[1:])
 
 
 def time_token(value: Any) -> int:

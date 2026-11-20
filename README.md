@@ -133,7 +133,34 @@ Results are saved under `outputs/evaluation/<city>/`:
 | --- | --- |
 | `plans.pt` | Sampled lengths, visit times, and SID prefixes |
 | `generated_full_sids.pt` | Completed SID trajectories |
-| `composition.json` | Fidelity metrics, including the six JSD scores; lower is better |
+| `composition.json` | Fidelity metrics, including the ten JSD scores; lower is better |
+
+The `summary` block of `composition.json` reports, for the gold-prefix and
+sampled-plan arms:
+
+| Key | Measures |
+| --- | --- |
+| `poi_frequency_jsd`, `geohash_jsd` | POI and geohash visit frequencies |
+| `travel_jsd`, `radius_jsd` | Step distance and radius of gyration |
+| `mobility_motif_jsd` | Daily mobility motifs |
+| `mobility_recurrence_pattern_jsd` | Return gaps, in visit indices |
+| `time_location_joint_jsd` | Weekly time token × geohash-5 cell of each visit |
+| `gap_distance_joint_jsd` | Time gap × distance of consecutive visits |
+| `inter_return_time_jsd` | Elapsed hours between returns to a POI |
+| `return_index_time_joint_jsd` | Return index × elapsed return time |
+
+The two elapsed-time metrics need continuous event clocks: observed
+timestamps for the reference and the planner's sampled times for generated
+plans. A plan without a clock reports them as unavailable.
+
+**Catalog noise coupling.** By default each visit draws its POI
+independently from the realizer's catalog posterior. Setting
+`composition.catalog_noise_coupling: trajectory_prefix` (or
+`--catalog-noise-coupling trajectory_prefix` on `semoflow-eval compose`)
+shares the sampling noise among a trajectory's visits with the same planned
+prefix. Each visit keeps its own probabilities, but repeated visits to an area
+tend to return to the same place. It applies only to the calibrated catalog
+decoder.
 
 To run one city, append `--set "evaluation.cities={atlanta: 9}"`.
 See [city IDs](src/semoflow/config/constants.py) and

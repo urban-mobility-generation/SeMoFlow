@@ -4,12 +4,16 @@ import itertools
 import json
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import polars as pl
 import torch
 
+from semoflow.metrics.trajectory.elapsed_recurrence import (
+    ReturnEvents,
+    elapsed_recurrence_jsd,
+)
 from semoflow.metrics.trajectory.grounding import (
     compute_decoded_sid_poi_metrics,
     ground_sid_tokens_to_poi_tokens,
@@ -18,14 +22,16 @@ from semoflow.metrics.trajectory.scoring import (
     compute_trajectory_metrics,
     summarize_mobility_metrics,
 )
+from semoflow.metrics.trajectory.temporal_spatial import (
+    events_from_place_ids,
+    temporal_spatial_jsd,
+)
 from semoflow.realizer.bank import (
     load_bank_payload,
     resolve_bank_split_window,
 )
-from semoflow.realizer.objective import (
-    normalize_tail,
-    suffix_tail_level_embeddings,
-)
+from semoflow.realizer.objective import normalize_tail
+from semoflow.realizer.time_tokens import N_PART_OF_DAY_BINS
 from semoflow.tokenization.decoding.codebooks import (
     codes_to_embeddings_from_codebooks,
 )
@@ -82,11 +88,6 @@ def coordinate_less_selection_metrics(
     valid: torch.BoolTensor,
     coordinates: Mapping[int, tuple[float, float]],
 ) -> dict[str, float | int]:
-    if selected_placekey_ids.shape != valid.shape:
-        raise ValueError(
-            "selected_placekey_ids and valid must have the same shape; got "
-            f"{tuple(selected_placekey_ids.shape)} and {tuple(valid.shape)}"
-        )
     selected = selected_placekey_ids.long().reshape(-1).cpu().tolist()
     available = torch.tensor(
         [int(placekey_id) in coordinates for placekey_id in selected],
@@ -123,8 +124,6 @@ def load_reference(
     if split not in {"val", "test"}:
         raise ValueError("reference split must be 'val' or 'test'")
     offset, count = resolve_bank_split_window(payload, split, path=bank_path)
-    if max_samples < 1:
-        raise ValueError("max_samples must be positive")
     selected_count = min(int(count), max_samples)
     if selected_count == 0:
         raise ValueError("reference selection is empty")
@@ -133,15 +132,8 @@ def load_reference(
     time_tokens = payload["time_tokens"][rows].long()
     valid_mask = payload["valid_mask"][rows].bool()
 
-    source = payload.get("source")
-    if not isinstance(source, dict):
-        raise ValueError("realizer bank is missing source metadata")
+    source = payload["source"]
     segments_value = source.get("segments_path")
-    if not isinstance(segments_value, str):
-        raise ValueError(
-            "realizer bank source metadata is missing segments_path; "
-            "cannot ground reference POIs"
-        )
     segments_path = Path(segments_value)
     skipped = source.get("skipped_missing_sid", {})
     if isinstance(skipped, dict) and int(skipped.get(split, 0)):
@@ -178,6 +170,105 @@ def load_reference(
     return sid_codes, time_tokens, valid_mask, placekey_ids
 
 
+def aligned_reference_event_hours(
+    payload: dict[str, Any],
+    *,
+    split: str,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Observed event times in nominal local hours from each row's week start.
+
+    Segments are naive local timestamps grouped into Monday-truncated weeks,
+    so each row's origin is Monday 00:00 of its first event's week and its
+    times lie in [0, 168) h. Rows are the first ``valid_mask.size(0)`` rows of
+    the split, selected exactly as :func:`load_reference` selects them.
+    Inactive positions are NaN.
+    """
+    source = payload["source"]
+    max_events = int(source.get("max_events", valid_mask.size(1)))
+    min_length = int(source.get("min_length", 1))
+    frame = cast(
+        pl.DataFrame,
+        pl.scan_parquet(Path(source["segments_path"]))
+        .filter(pl.col("_split") == split)
+        .filter(
+            pl.col("placekey_id").list.len().is_between(min_length, max_events)
+        )
+        .head(int(valid_mask.size(0)))
+        .select("_timestamps")
+        .collect(),
+    )
+    lengths = torch.from_numpy(
+        frame["_timestamps"].list.len().to_numpy().astype(np.int64)
+    )
+    if not torch.equal(lengths, valid_mask.sum(dim=1).long()):
+        raise ValueError("reference timestamps do not align with bank rows")
+    exploded = frame.with_columns(
+        pl.col("_timestamps").list.first().dt.truncate("1w").alias("week")
+    ).explode("_timestamps")
+    hours = (
+        exploded["_timestamps"] - exploded["week"]
+    ).dt.total_microseconds().to_numpy() / 3.6e9
+    out = torch.full(valid_mask.shape, float("nan"), dtype=torch.float64)
+    rows = torch.repeat_interleave(torch.arange(len(lengths)), lengths)
+    starts = torch.cumsum(lengths, 0) - lengths
+    columns = torch.arange(int(lengths.sum())) - torch.repeat_interleave(
+        starts, lengths
+    )
+    out[rows, columns] = torch.from_numpy(hours).double()
+    return out
+
+
+def sampled_plan_event_hours(
+    path: Path, *, max_samples: int
+) -> torch.Tensor | None:
+    """The plan's continuous event hours, or ``None`` for a token-only plan."""
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    hours = payload.get("event_hours") if isinstance(payload, dict) else None
+    return None if hours is None else hours[:max_samples].double()
+
+
+def elapsed_recurrence_block(
+    real_poi: torch.Tensor,
+    real_valid: torch.Tensor,
+    real_hours: torch.Tensor | None,
+    generated_poi: torch.Tensor,
+    generated_valid: torch.Tensor,
+    generated_hours: torch.Tensor | None,
+) -> dict[str, Any]:
+    """Elapsed-time recurrence on grounded POIs, or why it is unavailable.
+
+    Events that ground to no POI (ID 0) are dropped, as the index
+    recurrence metric drops them.
+    """
+    missing = [
+        side
+        for side, hours in (
+            ("real", real_hours),
+            ("generated", generated_hours),
+        )
+        if hours is None
+    ]
+    if missing:
+        return {"unavailable": f"no continuous clock: {', '.join(missing)}"}
+    assert real_hours is not None and generated_hours is not None
+
+    def events(poi, valid, hours) -> ReturnEvents:
+        if hours.shape != valid.shape:
+            raise ValueError("event hours do not align with the valid mask")
+        poi = poi.cpu().numpy()
+        return ReturnEvents(
+            place_ids=poi,
+            hours=hours.cpu().double().numpy(),
+            valid=valid.cpu().numpy().astype(bool) & (poi != 0),
+        )
+
+    return elapsed_recurrence_jsd(
+        events(real_poi, real_valid, real_hours),
+        events(generated_poi, generated_valid, generated_hours),
+    )
+
+
 def load_sampled_plan(
     path: Path,
     *,
@@ -186,15 +277,9 @@ def load_sampled_plan(
     prefix_depth: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.BoolTensor, dict[str, Any]]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict):
-        raise ValueError("sampled plan artifact must be a dictionary")
     prefix = payload["prefix_codes"].long()
     times = payload["time_tokens"].long()
     valid = payload["valid_mask"].bool()
-    if prefix.ndim != 3 or prefix.shape[-1] != prefix_depth:
-        raise ValueError("sampled prefix artifact has an invalid prefix shape")
-    if times.shape != valid.shape or prefix.shape[:2] != valid.shape:
-        raise ValueError("sampled prefix artifact tensors are misaligned")
     if prefix.size(1) != expected_width:
         raise ValueError(
             f"sampled plan width {prefix.size(1)} does not match model width "
@@ -203,8 +288,6 @@ def load_sampled_plan(
     if prefix.size(0) < max_samples:
         raise ValueError("sampled plan artifact has too few rows")
     protocol = payload.get("protocol")
-    if not isinstance(protocol, dict):
-        raise ValueError("sampled plan artifact is missing protocol metadata")
     if protocol.get("reference_row_alignment") is not False:
         raise ValueError("sampled plan must declare unpaired evaluation")
     return (
@@ -288,24 +371,10 @@ def compute_tail_error_metrics(
     target_codes: torch.Tensor,
     valid: torch.BoolTensor,
     codebooks: torch.Tensor,
-    tail_mean: torch.Tensor,
-    tail_std: torch.Tensor,
+    tail_whitener: torch.Tensor,
     *,
-    tail_whitener: torch.Tensor | None = None,
     prefix_depth: int,
 ) -> dict[str, float]:
-    if generated_tail.ndim != 3 or target_codes.ndim != 3:
-        raise ValueError("tail and target codes must be rank-3 tensors")
-    if generated_tail.shape[:2] != target_codes.shape[:2]:
-        raise ValueError("tail and target rows are not aligned")
-    if valid.shape != target_codes.shape[:2]:
-        raise ValueError("valid mask does not align with target codes")
-    if not 0 < prefix_depth < target_codes.shape[-1]:
-        raise ValueError("prefix_depth must be within the SID width")
-    if tail_mean.shape != tail_std.shape or tail_mean.ndim != 1:
-        raise ValueError("tail statistics must have shape [latent_dim]")
-    if (tail_std <= 0).any() or not torch.isfinite(tail_std).all():
-        raise ValueError("tail_std must be finite and strictly positive")
 
     device = generated_tail.device
     valid = valid.to(device=device, dtype=torch.bool)
@@ -317,15 +386,11 @@ def compute_tail_error_metrics(
         codebooks[prefix_depth:],
     )
     raw_error = generated_tail.float() - target_tail.float()
-    if tail_whitener is None:
-        normalized_error = raw_error / tail_std.to(device=device).float()
-    else:
-        normalized_error = normalize_tail(
-            raw_error,
-            torch.zeros_like(tail_mean, device=device),
-            torch.ones_like(tail_std, device=device),
-            tail_whitener=tail_whitener.to(device=device).float(),
-        )
+    normalized_error = normalize_tail(
+        raw_error,
+        torch.zeros(raw_error.shape[-1], device=device),
+        tail_whitener.to(device=device).float(),
+    )
     active_raw = raw_error[valid]
     active_normalized = normalized_error[valid]
     events = int(valid.sum().item())
@@ -348,78 +413,6 @@ def compute_tail_error_metrics(
     }
 
 
-def compute_tail_level_error_metrics(
-    generated_tail_levels: torch.Tensor,
-    target_codes: torch.Tensor,
-    valid: torch.BoolTensor,
-    codebooks: torch.Tensor,
-    tail_mean: torch.Tensor,
-    tail_std: torch.Tensor,
-    *,
-    prefix_depth: int,
-) -> dict[str, Any]:
-    if generated_tail_levels.ndim != 4 or target_codes.ndim != 3:
-        raise ValueError("factorized tail and target codes have invalid ranks")
-    if generated_tail_levels.shape[:2] != target_codes.shape[:2]:
-        raise ValueError("factorized tail and target rows are not aligned")
-    if valid.shape != target_codes.shape[:2]:
-        raise ValueError("valid mask does not align with target codes")
-    if tail_mean.shape != tail_std.shape or tail_mean.ndim != 2:
-        raise ValueError("factorized tail statistics must have shape [R, D]")
-    if generated_tail_levels.shape[-2:] != tuple(tail_mean.shape):
-        raise ValueError(
-            "factorized tail and statistics have incompatible shapes"
-        )
-    if (tail_std <= 0).any() or not torch.isfinite(tail_std).all():
-        raise ValueError("tail_std must be finite and strictly positive")
-
-    device = generated_tail_levels.device
-    valid = valid.to(device=device, dtype=torch.bool)
-    target_codes = target_codes.to(device=device, dtype=torch.long).clone()
-    target_codes[~valid] = 0
-    target_levels = suffix_tail_level_embeddings(
-        target_codes,
-        codebooks.to(device=device).float(),
-        prefix_depth=prefix_depth,
-    ).float()
-    raw_error = generated_tail_levels.float() - target_levels
-    normalized_error = raw_error / tail_std.to(device=device).float()
-    active_raw = raw_error[valid]
-    active_normalized = normalized_error[valid]
-    events = int(valid.sum().item())
-    if events == 0:
-        return {
-            "events": 0.0,
-            "tail_rmse": 0.0,
-            "tail_mae": 0.0,
-            "normalized_tail_rmse": 0.0,
-            "normalized_tail_mae": 0.0,
-            "per_level": [],
-        }
-
-    def _summary(
-        raw: torch.Tensor, normalized: torch.Tensor
-    ) -> dict[str, float]:
-        return {
-            "tail_rmse": float(raw.square().mean().sqrt().item()),
-            "tail_mae": float(raw.abs().mean().item()),
-            "normalized_tail_rmse": float(
-                normalized.square().mean().sqrt().item()
-            ),
-            "normalized_tail_mae": float(normalized.abs().mean().item()),
-        }
-
-    per_level = [
-        _summary(active_raw[:, level], active_normalized[:, level])
-        for level in range(generated_tail_levels.size(-2))
-    ]
-    return {
-        "events": float(events),
-        **_summary(active_raw, active_normalized),
-        "per_level": per_level,
-    }
-
-
 CANDIDATE_PRIOR_FORMAT = "grounding_candidate_prior_v1"
 
 
@@ -436,8 +429,6 @@ def load_candidate_prior(path: Path) -> dict[int, float]:
             f"{path} declares {payload.get('split')!r}"
         )
     counts = payload.get("counts")
-    if not isinstance(counts, dict) or not counts:
-        raise ValueError(f"{path} has no candidate counts")
     return {int(key): float(value) for key, value in counts.items()}
 
 
@@ -448,20 +439,31 @@ def metric_block(
     generated_valid: torch.BoolTensor,
     *,
     grounding: SemanticIDGroundingIndex,
-    generated_grounding: SemanticIDGroundingIndex | None = None,
     coordinates: dict[int, tuple[float, float]],
     geohashes: dict[int, str],
     placekey_vocab_size: int,
+    real_time_tokens: torch.Tensor,
+    generated_time_tokens: torch.Tensor,
     reference_placekey_ids: torch.Tensor | None = None,
     cluster_ids: list[str] | None = None,
     candidate_selection: str = "first",
     candidate_weights: Mapping[int, float] | None = None,
-    motif_day_keys_real: torch.Tensor | None = None,
-    motif_day_keys_generated: torch.Tensor | None = None,
     compute_device: torch.device | str | None = None,
     brief_metrics: bool = False,
+    real_event_hours: torch.Tensor | None = None,
+    generated_event_hours: torch.Tensor | None = None,
 ) -> dict[str, Any]:
-    generated_grounding = generated_grounding or grounding
+    """Compute the grounding-first metric block for one arm.
+
+    ``real_time_tokens``/``generated_time_tokens`` are the 42 weekly time
+    tokens aligned with the codes. They give the motif day keys and the joint
+    temporal-spatial JSDs. ``real_event_hours``/``generated_event_hours`` are
+    continuous event times in hours; when both are given the elapsed-time
+    recurrence JSDs are scored, otherwise that section records why it is
+    unavailable. Times are never derived from tokens.
+    """
+    motif_day_keys_real = real_time_tokens // N_PART_OF_DAY_BINS
+    motif_day_keys_generated = generated_time_tokens // N_PART_OF_DAY_BINS
     fields = [f"sem_code_{level}" for level in range(real_codes.size(-1))]
     real_tokens = apply_trajectory_valid_mask(
         to_token_fields(real_codes, fields), real_valid
@@ -480,7 +482,7 @@ def metric_block(
     )
     generated_poi, generated_stats = ground_sid_tokens_to_poi_tokens(
         generated_tokens,
-        generated_grounding,
+        grounding,
         category_string_vocab=category_string_vocab,
         naics_string_vocab=naics_string_vocab,
         candidate_selection=candidate_selection,
@@ -520,6 +522,30 @@ def metric_block(
         compute_device=compute_device,
         brief_metrics=brief_metrics,
     )
+    grounded["temporal_spatial"] = temporal_spatial_jsd(
+        events_from_place_ids(
+            real_poi["placekey_id"].cpu().numpy(),
+            real_time_tokens.cpu().numpy(),
+            real_valid.cpu().numpy(),
+            coordinates=coordinates,
+            geohashes=geohashes,
+        ),
+        events_from_place_ids(
+            generated_poi["placekey_id"].cpu().numpy(),
+            generated_time_tokens.cpu().numpy(),
+            generated_valid.cpu().numpy(),
+            coordinates=coordinates,
+            geohashes=geohashes,
+        ),
+    )
+    grounded["elapsed_recurrence"] = elapsed_recurrence_block(
+        real_poi["placekey_id"],
+        real_valid,
+        real_event_hours,
+        generated_poi["placekey_id"],
+        generated_valid,
+        generated_event_hours,
+    )
     result: dict[str, Any] = {"decoded_poi_metrics": grounded}
     if sid_metrics is not None:
         result.update(
@@ -538,13 +564,15 @@ def metric_block(
 
 __all__ = [
     "accuracy",
+    "aligned_reference_event_hours",
     "compute_tail_error_metrics",
-    "compute_tail_level_error_metrics",
     "coordinate_less_selection_metrics",
     "dynamics",
+    "elapsed_recurrence_block",
     "load_lookup",
     "load_places",
     "load_reference",
     "load_sampled_plan",
     "metric_block",
+    "sampled_plan_event_hours",
 ]

@@ -51,12 +51,6 @@ class ResidualVQ(nn.Module):
         sk_epsilons: list[float] | None = None,
     ) -> None:
         super().__init__()
-        if num_codebooks <= 0:
-            raise ValueError("num_codebooks must be positive")
-        if codebook_size <= 0:
-            raise ValueError("codebook_size must be positive")
-        if dim <= 0:
-            raise ValueError("dim must be positive")
 
         self.num_codebooks = num_codebooks
         self.codebook_size = codebook_size

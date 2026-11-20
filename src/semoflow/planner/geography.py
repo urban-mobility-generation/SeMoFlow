@@ -34,30 +34,8 @@ class PrefixDistancePrior(nn.Module):
         centroid_available: torch.Tensor,
     ) -> None:
         super().__init__()
-        vocabulary = legality.vocabulary_size
         coordinates = torch.as_tensor(centroids, dtype=torch.float32)
         available = torch.as_tensor(centroid_available, dtype=torch.bool)
-        if coordinates.shape != (vocabulary, 2):
-            raise ValueError(
-                "prefix centroids must have shape [vocabulary, 2]"
-            )
-        if available.shape != (vocabulary,):
-            raise ValueError(
-                "centroid availability must have shape [vocabulary]"
-            )
-        if not bool(torch.isfinite(coordinates).all()):
-            raise ValueError("prefix centroids must be finite")
-        covered = coordinates[available]
-        if covered.numel() and (
-            bool((covered[:, 0].abs() > 90.0).any())
-            or bool((covered[:, 1].abs() > 180.0).any())
-        ):
-            raise ValueError("prefix centroids are outside WGS84")
-        if not bool(available.any()):
-            raise ValueError(
-                "distance prior requires at least one prefix centroid"
-            )
-
         object.__setattr__(self, "legality", legality)
         self.codebook_size = legality.codebook_size
         self.prefix_depth = legality.prefix_depth
@@ -186,16 +164,6 @@ class PrefixDistancePrior(nn.Module):
         return self._bias(
             units[rows],
             covered[rows] & found[..., None],
-            source_units,
-            source_valid,
-        )
-
-    def flat_bias(
-        self, source_units: torch.Tensor, source_valid: torch.Tensor
-    ) -> torch.Tensor:
-        return self._bias(
-            self.leaf_units,
-            self.leaf_available.expand(*source_valid.shape, -1),
             source_units,
             source_valid,
         )

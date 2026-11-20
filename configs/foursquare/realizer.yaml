@@ -32,10 +32,7 @@ realizer:
   depth: 6
   num_heads: 8
   dropout: 0.1
-  prefix_embedding_mode: hybrid_frozen_codebook
-  tail_normalization: whitened
   tail_whitening_chunk_size: 16384
-  catalog_decoder_mode: calibrated
 
   # ── Losses ───────────────────────────────────────────────────
   catalog_loss_weight: 0.1

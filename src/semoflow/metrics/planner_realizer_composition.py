@@ -9,49 +9,29 @@ from typing import Any, cast
 
 import torch
 
+from semoflow.realizer.model import MODEL_TYPE
+from semoflow.realizer.time_tokens import (
+    N_PART_OF_DAY_BINS,
+    PART_OF_DAY_START_MINUTES,
+)
 from semoflow.utils.serialization import normalize_mapping, write_json
 
 logger = logging.getLogger(__name__)
 
 
-def _require_tensor(
-    payload: Mapping[str, object], key: str, *, ndim: int
-) -> torch.Tensor:
-    value = payload.get(key)
-    if not isinstance(value, torch.Tensor) or value.ndim != ndim:
-        raise ValueError(f"planner samples {key} must be a rank-{ndim} tensor")
-    return value.detach().cpu()
+def _require_tensor(payload: Mapping[str, object], key: str) -> torch.Tensor:
+    return cast(torch.Tensor, payload[key]).detach().cpu()
 
 
 def realizer_contract(checkpoint: Path) -> dict[str, int]:
     logger.info("loading realizer contract checkpoint=%s", checkpoint)
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    if not isinstance(payload, dict):
-        raise ValueError("realizer checkpoint must be a dictionary")
-    supported = {
-        "prefix_time_suffix_latent_flow_realizer",
-        "prefix_time_full_sid_latent_flow_realizer",
-    }
-    if payload.get("model_type") not in supported:
+    if payload.get("model_type") != MODEL_TYPE:
         raise ValueError(
-            "compose currently supports the latent-flow suffix/full-SID "
-            "realizers; "
+            f"compose needs a {MODEL_TYPE} checkpoint; "
             f"got {payload.get('model_type')!r}"
         )
-    config = payload.get("config")
-    state = payload.get("model_state_dict")
-    if not isinstance(config, dict) or not isinstance(state, dict):
-        raise ValueError(
-            "realizer checkpoint is missing config or model state"
-        )
-    position = state.get("event_position_embedding.weight")
-    if not isinstance(position, torch.Tensor) or position.ndim != 2:
-        raise ValueError(
-            "realizer checkpoint is missing event position embeddings"
-        )
-    required = ("prefix_depth", "codebook_size", "time_vocab")
-    if any(key not in payload for key in required):
-        raise ValueError("realizer checkpoint is missing model dimensions")
+    position = payload["model_state_dict"]["event_position_embedding.weight"]
     contract = {
         "max_seq_len": int(position.shape[0]),
         "prefix_depth": int(payload["prefix_depth"]),
@@ -76,28 +56,13 @@ def _verify_planner_checkpoint(
     checkpoint = torch.load(
         planner_checkpoint, map_location="cpu", weights_only=False
     )
-    if not isinstance(checkpoint, dict):
-        raise ValueError("planner checkpoint must be a dictionary")
     config = checkpoint.get("config")
-    if not isinstance(config, dict):
-        raise ValueError("planner checkpoint is missing config")
-    prefix_codes = _require_tensor(samples, "prefix_codes", ndim=3)
+    prefix_codes = _require_tensor(samples, "prefix_codes")
     if prefix_codes.shape[-1] != int(config["prefix_depth"]):
         raise ValueError(
             "planner sample prefix depth disagrees with checkpoint"
         )
     max_occurrences = int(config["max_occurrences"])
-    if prefix_codes.size(1) > max_occurrences:
-        raise ValueError(
-            "planner sample width exceeds the planner checkpoint "
-            "max_occurrences"
-        )
-    lengths = _require_tensor(samples, "lengths", ndim=1)
-    if bool((lengths > max_occurrences).any()):
-        raise ValueError(
-            "planner sample length exceeds the planner checkpoint "
-            "max_occurrences"
-        )
     logger.info(
         "planner checkpoint verified prefix_depth=%d max_occurrences=%d "
         "sample_width=%d",
@@ -113,8 +78,8 @@ def _convert_occurrence_samples(
     contract: Mapping[str, int],
     max_samples: int,
 ) -> dict[str, object]:
-    prefix_codes = _require_tensor(samples, "prefix_codes", ndim=3).long()
-    lengths = _require_tensor(samples, "lengths", ndim=1).long()
+    prefix_codes = _require_tensor(samples, "prefix_codes").long()
+    lengths = _require_tensor(samples, "lengths").long()
     event_time = samples.get("event_time_minutes")
     if not isinstance(event_time, torch.Tensor):
         raise ValueError(
@@ -122,42 +87,21 @@ def _convert_occurrence_samples(
             "time-conditioned realizer"
         )
     event_time = event_time.detach().cpu().float()
-    if event_time.shape != prefix_codes.shape[:2]:
-        raise ValueError("planner sample event times are misaligned")
-    if lengths.shape != (prefix_codes.size(0),):
-        raise ValueError("planner sample lengths are misaligned")
     city_ids = samples.get("city_ids")
     if city_ids is not None:
-        if not isinstance(city_ids, torch.Tensor) or city_ids.ndim != 1:
-            raise ValueError(
-                "planner samples city_ids must be a rank-1 tensor"
-            )
-        city_ids = city_ids.detach().cpu().long()
-        if city_ids.shape != lengths.shape:
-            raise ValueError("planner sample city_ids are misaligned")
+        city_ids = cast(torch.Tensor, city_ids).detach().cpu().long()
     if prefix_codes.size(0) < max_samples:
         raise ValueError(
             f"planner samples contain {prefix_codes.size(0)} rows, "
             f"but --max-samples={max_samples}"
         )
-    if bool((lengths < 1).any()) or bool(
-        (lengths > prefix_codes.size(1)).any()
-    ):
-        raise ValueError("planner sample lengths are outside the sample width")
     max_seq_len = contract["max_seq_len"]
     if bool((lengths[:max_samples] > max_seq_len).any()):
         raise ValueError(
             "planner samples contain a trajectory longer than the realizer "
             f"max_seq_len={max_seq_len}; use a matching realizer checkpoint"
         )
-    if not bool(torch.isfinite(event_time[:max_samples]).all()):
-        raise ValueError("planner sample event times must be finite")
     valid = torch.arange(prefix_codes.size(1))[None, :] < lengths[:, None]
-    active_times = event_time[:max_samples][valid[:max_samples]]
-    if bool((active_times < 0).any()) or bool((active_times > 10080.0).any()):
-        raise ValueError(
-            "planner sample event times must be in [0, 10080] minutes"
-        )
     if bool(
         (prefix_codes[:max_samples][valid[:max_samples]] < 0).any()
     ) or bool(
@@ -190,8 +134,22 @@ def _convert_occurrence_samples(
     valid = valid[:max_samples]
     clamped = event_time.clamp(0.0, 10079.999)
     day = (clamped / 1440.0).long()
-    part_of_day = ((clamped % 1440.0) / 240.0).long().clamp(0, 5)
-    time_tokens = (day * 6 + part_of_day).long().masked_fill(~valid, -1)
+    # The realizer and reference bank use the unequal circadian bins of
+    # realizer/time_tokens.py, so the adapter must bucket by the same starts.
+    part_of_day = torch.bucketize(
+        clamped % 1440.0,
+        torch.tensor(PART_OF_DAY_START_MINUTES[1:], dtype=clamped.dtype),
+        right=True,
+    )
+    time_tokens = (
+        (day * N_PART_OF_DAY_BINS + part_of_day).long().masked_fill(~valid, -1)
+    )
+    # Continuous planner clock for elapsed-time recurrence, unclamped and
+    # untokenized; NaN marks inactive positions.
+    event_hours = (event_time.double() / 60.0).masked_fill(
+        ~valid, float("nan")
+    )
+    event_hours = event_hours[:, : contract["max_seq_len"]]
     time_tokens = time_tokens[:, : contract["max_seq_len"]]
     prefix_codes = prefix_codes[:, : contract["max_seq_len"]]
     valid = valid[:, : contract["max_seq_len"]]
@@ -204,17 +162,21 @@ def _convert_occurrence_samples(
         time_tokens = torch.nn.functional.pad(
             time_tokens, (0, padding), value=-1
         )
+        event_hours = torch.nn.functional.pad(
+            event_hours, (0, padding), value=float("nan")
+        )
         valid = torch.nn.functional.pad(valid, (0, padding), value=False)
     adapted: dict[str, object] = {
         "schema_version": 2,
         "artifact_type": "sampled_prefix_time_plan",
         "prefix_codes": prefix_codes,
         "time_tokens": time_tokens,
+        "event_hours": event_hours,
         "valid_mask": valid,
         "row_lengths": lengths,
         "protocol": {
             "planner_source": "occurrence_planner_samples",
-            "time_source": "event_time_minutes_to_weekly_time_token",
+            "time_source": "event_time_minutes_to_circadian_weekly_time_token",
             "time_is_reference_copied": False,
             "prefix_depth": contract["prefix_depth"],
             "max_events": contract["max_seq_len"],
@@ -237,8 +199,6 @@ def _prepare_sampled_plan(
     payload = torch.load(
         planner_samples, map_location="cpu", weights_only=False
     )
-    if not isinstance(payload, dict):
-        raise ValueError("planner samples artifact must be a dictionary")
     contract = realizer_contract(realizer_checkpoint)
     artifact_type = payload.get("artifact_type")
     logger.info(
@@ -288,7 +248,7 @@ def _prepare_sampled_plan(
     )
 
 
-def _six_key_summary(metrics: Mapping[str, object]) -> dict[str, object]:
+def _comparison_summary(metrics: Mapping[str, object]) -> dict[str, object]:
     decoded = metrics.get("decoded_poi_metrics")
     if not isinstance(decoded, dict):
         return {}
@@ -363,11 +323,41 @@ def _six_key_summary(metrics: Mapping[str, object]) -> dict[str, object]:
             if recurrence_metric is not None
             else None
         ),
+        "multiplicity_jsd": _decoded_lookup(
+            metrics,
+            "identity_dynamics",
+            "poi",
+            "distribution_distances",
+            "multiplicity_distribution_jsd",
+            "point_estimate",
+        ),
+        "time_location_joint_jsd": _decoded_lookup(
+            metrics, "temporal_spatial", "time_location", "joint_jsd"
+        ),
+        "gap_distance_joint_jsd": _decoded_lookup(
+            metrics, "temporal_spatial", "gap_distance", "joint_jsd"
+        ),
+        "inter_return_time_jsd": _decoded_lookup(
+            metrics, "elapsed_recurrence", "inter_return_time_jsd"
+        ),
+        "return_index_time_joint_jsd": _decoded_lookup(
+            metrics, "elapsed_recurrence", "return_index_time_joint_jsd"
+        ),
     }
 
 
+def _decoded_lookup(metrics: Mapping[str, object], *path: str) -> object:
+    """Nested value under ``decoded_poi_metrics``, or ``None`` if absent."""
+    node: object = metrics.get("decoded_poi_metrics")
+    for key in path:
+        if not isinstance(node, dict):
+            return None
+        node = cast(Mapping[str, object], node).get(key)
+    return node
+
+
 def brief_summary(metrics: Mapping[str, object]) -> dict[str, object]:
-    summary = _six_key_summary(metrics)
+    summary = _comparison_summary(metrics)
     decoded = metrics.get("decoded_poi_metrics")
     decoded_map = (
         cast(Mapping[str, object], decoded)
@@ -407,12 +397,9 @@ def evaluate_planner_realizer(
     candidate_selection: str,
     candidate_prior: Path | None = None,
     catalog_temperature: float | None = None,
-    catalog_prior_source: str = "target_train",
     reference_split: str = "val",
-    generation_catalog_scope: str = "full_city",
-    flow_trace_rows: int = 0,
-    flow_path_output: Path | None = None,
     brief_metrics: bool = False,
+    catalog_noise_coupling: str = "independent",
 ) -> dict[str, Any]:
     started = time.perf_counter()
     logger.info(
@@ -427,35 +414,8 @@ def evaluate_planner_realizer(
         solver,
         num_steps,
     )
-    if max_samples < 1 or batch_size < 1 or num_steps < 1:
-        raise ValueError(
-            "max_samples, batch_size, and num_steps must be positive"
-        )
     if reference_split not in {"val", "test"}:
         raise ValueError("reference_split must be 'val' or 'test'")
-    if not planner_samples.is_file():
-        raise ValueError(
-            f"planner samples artifact does not exist: {planner_samples}"
-        )
-    if not realizer_checkpoint.is_file():
-        raise ValueError(
-            f"realizer checkpoint does not exist: {realizer_checkpoint}"
-        )
-    if planner_checkpoint is not None and not planner_checkpoint.is_file():
-        raise ValueError(
-            f"planner checkpoint does not exist: {planner_checkpoint}"
-        )
-    for label, path in (
-        ("realizer bank", bank),
-        ("codebook bundle", codebooks),
-        ("semantic-ID lookup", lookup),
-        ("grounding index", grounding_index),
-        ("places artifact", places),
-    ):
-        if not path.is_file():
-            raise ValueError(f"{label} does not exist: {path}")
-    if candidate_prior is not None and not candidate_prior.is_file():
-        raise ValueError(f"candidate prior does not exist: {candidate_prior}")
     logger.info(
         "composition inputs validated bank=%s codebooks=%s lookup=%s "
         "grounding_index=%s places=%s",
@@ -494,11 +454,8 @@ def evaluate_planner_realizer(
             candidate_selection=candidate_selection,
             candidate_prior_path=candidate_prior,
             catalog_temperature_override=catalog_temperature,
-            catalog_prior_source=catalog_prior_source,
-            generation_catalog_scope=generation_catalog_scope,
-            flow_trace_rows=flow_trace_rows,
-            flow_path_output=flow_path_output,
             brief_metrics=brief_metrics,
+            catalog_noise_coupling=catalog_noise_coupling,
         )
         logger.info(
             "latent-flow evaluator finished rows=%s elapsed_seconds=%.1f",
@@ -511,18 +468,6 @@ def evaluate_planner_realizer(
     finally:
         if temporary is not None:
             temporary.cleanup()
-
-    if adapter["adapted"] and flow_trace_rows:
-        trace_path = flow_path_output or output.with_name(
-            "sampled_plan_flow_path.pt"
-        )
-        if trace_path.is_file():
-            trace = torch.load(
-                trace_path, map_location="cpu", weights_only=False
-            )
-            if isinstance(trace, dict):
-                trace["sampled_plan"] = str(planner_samples)
-                torch.save(trace, trace_path)
 
     result["planner_samples"] = str(planner_samples)
     result["sampled_plan"] = str(planner_samples)
@@ -540,7 +485,7 @@ def evaluate_planner_realizer(
         arm: (
             brief_summary(metrics)
             if brief_metrics
-            else _six_key_summary(metrics)
+            else _comparison_summary(metrics)
         )
         for arm, metrics in result.get("evaluations", {}).items()
         if isinstance(metrics, dict)

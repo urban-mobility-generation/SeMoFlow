@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 import torch
@@ -24,9 +23,6 @@ class PrefixDistanceContext:
             level, parents, self.source_units, self.source_valid
         )
 
-    def flat_bias(self) -> torch.Tensor:
-        return self.prior.flat_bias(self.source_units, self.source_valid)
-
     def flatten(self) -> PrefixDistanceContext:
         return PrefixDistanceContext(
             prior=self.prior,
@@ -35,65 +31,16 @@ class PrefixDistanceContext:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class CategoricalSample:
-    choices: torch.Tensor
-    model_log_probability: torch.Tensor
-    sampling_log_probability: torch.Tensor
-
-
 def sample_categorical_logits(
     logits: torch.Tensor,
     *,
     temperature: float,
     generator: torch.Generator | None,
-) -> CategoricalSample:
-    if temperature <= 0:
-        raise ValueError("temperature must be positive")
-    score_logits = logits.float()
-    model_log_probabilities = torch.log_softmax(score_logits, dim=-1)
-    sampling_log_probabilities = torch.log_softmax(
-        score_logits / temperature, dim=-1
-    )
-    choices = torch.multinomial(
-        sampling_log_probabilities.exp(), 1, generator=generator
+) -> torch.Tensor:
+    probabilities = torch.log_softmax(logits.float() / temperature, dim=-1)
+    return torch.multinomial(
+        probabilities.exp(), 1, generator=generator
     ).squeeze(-1)
-    model_selected = model_log_probabilities.gather(
-        -1, choices[:, None]
-    ).squeeze(-1)
-    sampling_selected = sampling_log_probabilities.gather(
-        -1, choices[:, None]
-    ).squeeze(-1)
-    return CategoricalSample(
-        choices=choices,
-        model_log_probability=model_selected,
-        sampling_log_probability=sampling_selected,
-    )
-
-
-class PrefixDecoder(nn.Module, ABC):
-    @abstractmethod
-    def forward(
-        self,
-        hidden: torch.Tensor,
-        target_codes: torch.Tensor,
-        *,
-        catalog_rows: torch.Tensor | None = None,
-        distance: PrefixDistanceContext | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        pass
-
-    @abstractmethod
-    def sample(
-        self,
-        hidden: torch.Tensor,
-        *,
-        temperature: float,
-        generator: torch.Generator | None,
-        catalog_rows: torch.Tensor | None = None,
-        distance: PrefixDistanceContext | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        pass
 
 
 class _CompileSafeGRUCell(nn.GRUCell):
@@ -128,7 +75,7 @@ class _CompileSafeGRUCell(nn.GRUCell):
         return output if is_batched else output.squeeze(0)
 
 
-class HierarchicalPrefixDecoder(PrefixDecoder):
+class HierarchicalPrefixDecoder(nn.Module):
     def __init__(
         self,
         *,
@@ -155,7 +102,7 @@ class HierarchicalPrefixDecoder(PrefixDecoder):
         state: torch.Tensor,
         level: int,
         parents: torch.Tensor,
-        catalog_rows: torch.Tensor | None,
+        catalog_rows: torch.Tensor,
         distance: PrefixDistanceContext | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Advance the GRU past ``parents``; legal logits for ``level``."""
@@ -167,13 +114,7 @@ class HierarchicalPrefixDecoder(PrefixDecoder):
         decoder_input = decoder_input + self.level_embedding.weight[level]
         state = self.cell(decoder_input, state)
         logits = self.heads[level](state)
-        valid = (
-            self.legality.next_mask(level, parents)
-            if catalog_rows is None
-            else self.legality.next_mask_for_catalog_rows(
-                level, parents, catalog_rows
-            )
-        )
+        valid = self.legality.next_mask(level, parents, catalog_rows)
         if distance is not None:
             logits = logits + distance.level_bias(level, parents)
         return state, logits.masked_fill(~valid, _ILLEGAL_LOGIT)
@@ -183,20 +124,17 @@ class HierarchicalPrefixDecoder(PrefixDecoder):
         hidden: torch.Tensor,
         target_codes: torch.Tensor,
         *,
-        catalog_rows: torch.Tensor | None = None,
+        catalog_rows: torch.Tensor,
         distance: PrefixDistanceContext | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         shape = hidden.shape[:-1]
         flat_hidden = hidden.reshape(-1, hidden.shape[-1])
         flat_targets = target_codes.reshape(-1, self.prefix_depth)
-        flat_catalog_rows: torch.Tensor | None = None
-        if catalog_rows is not None:
-            if catalog_rows.shape != shape[:1]:
-                raise ValueError("catalog_rows must have shape [batch]")
-            expanded_rows = catalog_rows.reshape(
-                shape[0], *([1] * (len(shape) - 1))
-            ).expand(*shape)
-            flat_catalog_rows = expanded_rows.reshape(-1)
+        flat_catalog_rows = (
+            catalog_rows.reshape(shape[0], *([1] * (len(shape) - 1)))
+            .expand(*shape)
+            .reshape(-1)
+        )
         flat_distance = None if distance is None else distance.flatten()
         state = self.context(flat_hidden)
         logits: list[torch.Tensor] = []
@@ -220,102 +158,19 @@ class HierarchicalPrefixDecoder(PrefixDecoder):
         *,
         temperature: float,
         generator: torch.Generator | None,
-        catalog_rows: torch.Tensor | None = None,
+        catalog_rows: torch.Tensor,
         distance: PrefixDistanceContext | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if catalog_rows is not None and catalog_rows.shape != hidden.shape[:1]:
-            raise ValueError("catalog_rows must have shape [batch]")
+    ) -> torch.Tensor:
         state = self.context(hidden)
-        codes: list[torch.Tensor] = []
-        model_log_probability = torch.zeros(
-            hidden.shape[0], dtype=torch.float32, device=hidden.device
-        )
-        sampling_log_probability = torch.zeros(
-            hidden.shape[0], dtype=torch.float32, device=hidden.device
+        codes = torch.empty(
+            (hidden.shape[0], 0), dtype=torch.long, device=hidden.device
         )
         for level in range(self.prefix_depth):
-            parents = (
-                torch.stack(codes, dim=-1)
-                if codes
-                else torch.empty(
-                    (hidden.shape[0], 0),
-                    dtype=torch.long,
-                    device=hidden.device,
-                )
-            )
             state, logits = self._level_logits(
-                state, level, parents, catalog_rows, distance
+                state, level, codes, catalog_rows, distance
             )
-            sampled = sample_categorical_logits(
+            choice = sample_categorical_logits(
                 logits, temperature=temperature, generator=generator
             )
-            codes.append(sampled.choices)
-            model_log_probability = (
-                model_log_probability + sampled.model_log_probability
-            )
-            sampling_log_probability = (
-                sampling_log_probability + sampled.sampling_log_probability
-            )
-        return (
-            torch.stack(codes, dim=-1),
-            model_log_probability,
-            sampling_log_probability,
-        )
-
-
-class FlatLegalPrefixDecoder(PrefixDecoder):
-    def __init__(self, *, model_dim: int, legality: LegalPrefixIndex) -> None:
-        super().__init__()
-        object.__setattr__(self, "legality", legality)
-        self.head = nn.Linear(model_dim, legality.vocabulary_size)
-
-    def _logits(
-        self,
-        hidden: torch.Tensor,
-        catalog_rows: torch.Tensor | None,
-        distance: PrefixDistanceContext | None,
-    ) -> torch.Tensor:
-        logits = self.head(hidden)
-        if distance is not None:
-            logits = logits + distance.flat_bias()
-        if catalog_rows is None:
-            return logits
-        if catalog_rows.shape != hidden.shape[:1]:
-            raise ValueError("catalog_rows must have shape [batch]")
-        catalog_mask = self.legality.city_legal_prefix_mask[catalog_rows]
-        if logits.ndim > 2:
-            catalog_mask = catalog_mask[:, None, :]
-        return logits.masked_fill(~catalog_mask, _ILLEGAL_LOGIT)
-
-    def forward(
-        self,
-        hidden: torch.Tensor,
-        target_codes: torch.Tensor,
-        *,
-        catalog_rows: torch.Tensor | None = None,
-        distance: PrefixDistanceContext | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return (
-            self._logits(hidden, catalog_rows, distance),
-            self.legality.token_ids(target_codes),
-        )
-
-    def sample(
-        self,
-        hidden: torch.Tensor,
-        *,
-        temperature: float,
-        generator: torch.Generator | None,
-        catalog_rows: torch.Tensor | None = None,
-        distance: PrefixDistanceContext | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        sampled = sample_categorical_logits(
-            self._logits(hidden, catalog_rows, distance),
-            temperature=temperature,
-            generator=generator,
-        )
-        return (
-            self.legality.codes[sampled.choices],
-            sampled.model_log_probability,
-            sampled.sampling_log_probability,
-        )
+            codes = torch.cat((codes, choice[:, None]), dim=-1)
+        return codes

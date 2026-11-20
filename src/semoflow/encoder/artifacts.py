@@ -33,35 +33,7 @@ class POIEmbeddingArtifact:
             "embedding index must contain placekey_id or placekey"
         )
 
-    def validate(self) -> POIEmbeddingArtifact:
-        if self.embeddings.ndim != 2:
-            raise ValueError(
-                "POI embeddings must be a 2-D matrix, got "
-                f"{tuple(self.embeddings.shape)}"
-            )
-        key = self.identity_column
-        if self.index.height != int(self.embeddings.shape[0]):
-            raise ValueError(
-                "embedding rows and identity index disagree: "
-                f"rows={self.embeddings.shape[0]} index={self.index.height}"
-            )
-        if self.index[key].null_count():
-            raise ValueError(f"embedding identity index has null {key} values")
-        if self.index[key].n_unique() != self.index.height:
-            raise ValueError(
-                f"embedding identity index has duplicate {key} values"
-            )
-        if "embedding_row" in self.index.columns:
-            expected = list(range(self.index.height))
-            actual = [int(value) for value in self.index["embedding_row"]]
-            if actual != expected:
-                raise ValueError(
-                    "embedding_row must be a contiguous artifact order"
-                )
-        return self
-
     def align_to(self, places_index: pl.DataFrame) -> torch.Tensor:
-        self.validate()
         key = self.identity_column
         if key not in places_index.columns:
             raise ValueError(
@@ -105,7 +77,6 @@ def write_poi_embedding_artifact(
     artifact = POIEmbeddingArtifact(
         embeddings.detach().cpu().float(), index, kind, metadata
     )
-    artifact.validate()
     output.parent.mkdir(parents=True, exist_ok=True)
     if output.suffix == ".npy":
         np.save(output, artifact.embeddings.numpy())
@@ -169,7 +140,7 @@ def load_poi_embedding_artifact(
         if metadata_path.exists()
         else None
     )
-    return POIEmbeddingArtifact(embeddings, index, kind, metadata).validate()
+    return POIEmbeddingArtifact(embeddings, index, kind, metadata)
 
 
 __all__ = [

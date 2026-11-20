@@ -301,8 +301,6 @@ def _scalar_histogram_contributions(
     real_values: torch.Tensor, generated_values: torch.Tensor
 ) -> tuple[np.ndarray, np.ndarray]:
     """One-hot distance-bin row per trajectory, for cluster bootstrapping."""
-    if real_values.shape != generated_values.shape:
-        raise ValueError("paired scalar distributions must align by row")
     one_hot = np.eye(_DISTANCE_BINS, dtype=np.int32)
     if real_values.numel() == 0:
         return one_hot[:0], one_hot[:0]
@@ -344,8 +342,6 @@ def spatial_guardrail_uncertainty(
     pad_id: int = PAD_ID,
     compute_device: torch.device | str | None = None,
 ) -> dict[str, Any]:
-    if tokens_real.shape != tokens_gen.shape:
-        raise ValueError("paired spatial trajectories must have equal shape")
     bootstrap = functools.partial(
         cluster_histogram_jsd_bootstrap,
         cluster_ids=cluster_ids,

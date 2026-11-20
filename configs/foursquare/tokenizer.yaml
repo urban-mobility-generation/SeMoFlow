@@ -36,6 +36,3 @@ tokenizer_config:
   device: cuda:0
   seed: 42
   skip_artifact_export: false
-  skip_semantic_id_eval: false
-  eval_sample_size: 50000
-  eval_pair_sample_size: 2000000

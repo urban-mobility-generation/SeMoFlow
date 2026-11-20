@@ -40,7 +40,7 @@ from semoflow.tokenization import token_space
 from semoflow.tokenization.decoding.grounding_index import pack_code_rows
 
 _CANDIDATE_SELECTION_POLICIES = frozenset(
-    {"first", "train_prior_argmax", "train_prior_sample", "a4_support"}
+    {"first", "train_prior_argmax", "train_prior_sample"}
 )
 _CANDIDATE_SELECTION_SEED = 20260830
 _CANDIDATE_WEIGHT_SMOOTHING = 1.0
@@ -148,34 +148,6 @@ def _candidate_probabilities(
     return raw / total
 
 
-def _a4_support_picks(
-    encoded: np.ndarray,
-    probabilities: np.ndarray,
-    count: int,
-    emitted: set[int],
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Give each occurrence an unemitted candidate, most probable first."""
-    unused = sorted(
-        (
-            index
-            for index in range(len(encoded))
-            if int(encoded[index, _PLACEKEY]) not in emitted
-        ),
-        key=lambda index: -probabilities[index],
-    )
-    picks = unused[:count]
-    emitted.update(int(encoded[index, _PLACEKEY]) for index in picks)
-    if len(picks) < count:
-        picks.extend(
-            int(value)
-            for value in rng.choice(
-                len(encoded), size=count - len(picks), p=probabilities
-            )
-        )
-    return np.asarray(picks, dtype=np.int64)
-
-
 def _sid_code_rows(
     sid_tokens: Mapping[str, torch.Tensor], key_columns: Sequence[str]
 ) -> tuple[torch.Size, np.ndarray]:
@@ -183,12 +155,6 @@ def _sid_code_rows(
     if missing:
         raise KeyError(f"missing SID token fields for grounding: {missing}")
     shape = sid_tokens[key_columns[0]].shape
-    for field in key_columns[1:]:
-        if sid_tokens[field].shape != shape:
-            raise ValueError(
-                f"SID field {field!r} shape {tuple(sid_tokens[field].shape)} "
-                f"does not match {tuple(shape)}"
-            )
     codes = np.stack(
         [
             sid_tokens[field].long().reshape(-1).cpu().numpy()
@@ -288,8 +254,8 @@ def ground_sid_tokens_to_poi_tokens(
     """Ground SID tokens to placekey/top_cat/naics4 tokens.
 
     Each SID resolves to the grounding index's first candidate, or to a
-    train-prior choice under ``candidate_selection``; ``a4_support`` and
-    ``train_prior_sample`` choose per occurrence. ``preferred_placekey_ids``
+    train-prior choice under ``candidate_selection``;
+    ``train_prior_sample`` chooses per occurrence. ``preferred_placekey_ids``
     pins every position to a known POI of its SID instead.
     """
     if candidate_selection not in _CANDIDATE_SELECTION_POLICIES:
@@ -307,11 +273,6 @@ def ground_sid_tokens_to_poi_tokens(
     active_codes = codes[active]
     preferred: list[Mapping[str, Any]] | None = None
     if preferred_placekey_ids is not None:
-        if preferred_placekey_ids.shape != shape:
-            raise ValueError(
-                "preferred_placekey_ids shape must match SID tokens; got "
-                f"{tuple(preferred_placekey_ids.shape)} and {tuple(shape)}"
-            )
         preferred = _preferred_payloads(
             preferred_placekey_ids.long().reshape(-1).cpu().numpy()[active],
             active_codes,
@@ -348,45 +309,24 @@ def ground_sid_tokens_to_poi_tokens(
     encoded = np.tile(invalid_row, (len(codes), 1))
     encoded[active] = unique_encoded[inverse]
     has_labels = unique_encoded[:, _HAS_LABELS].any(axis=0)
-    if (
-        groups is not None
-        and candidate_selection in ("a4_support", "train_prior_sample")
-        and hit.size
-    ):
+    if groups is not None and candidate_selection == "train_prior_sample":
         assert candidate_weights is not None
         rng = np.random.default_rng(_CANDIDATE_SELECTION_SEED)
         order = np.argsort(inverse, kind="stable")
         starts = np.searchsorted(inverse[order], hit, side="left")
         ends = np.searchsorted(inverse[order], hit, side="right")
-        emitted: set[int] = set()
         for row, start, end in zip(hit, starts, ends, strict=True):
             group = groups[int(payload_indices[row])]
-            if candidate_selection == "a4_support":
-                group_encoded = np.array(
-                    [encode(payload) for payload in group], dtype=np.int64
-                )
-                if len(group) < 2:
-                    emitted.add(int(group_encoded[0, _PLACEKEY]))
-                    continue
-                picks = _a4_support_picks(
-                    group_encoded,
-                    _candidate_probabilities(group, candidate_weights),
-                    int(end - start),
-                    emitted,
-                    rng,
-                )
-            else:
-                if len(group) < 2:
-                    continue
-                probabilities = _candidate_probabilities(
-                    group, candidate_weights
-                )
-                group_encoded = np.array(
-                    [encode(payload) for payload in group], dtype=np.int64
-                )
-                picks = rng.choice(
-                    len(group), size=int(end - start), p=probabilities
-                )
+            if len(group) < 2:
+                continue
+            group_encoded = np.array(
+                [encode(payload) for payload in group], dtype=np.int64
+            )
+            picks = rng.choice(
+                len(group),
+                size=int(end - start),
+                p=_candidate_probabilities(group, candidate_weights),
+            )
             encoded[active[order[start:end]]] = group_encoded[picks]
             has_labels |= group_encoded[picks][:, _HAS_LABELS].any(axis=0)
     if preferred:
@@ -458,12 +398,17 @@ def _brief_poi_metrics(
     poi_values = (
         poi_distribution.to_dict() if poi_distribution is not None else {}
     )
-    return_gaps = [
-        identity_histogram_contributions(tokens["placekey_id"], pad_id=PAD_ID)[
-            "return_gap_distribution_jsd"
-        ].sum(axis=0, keepdims=True)
+    real_hist, gen_hist = (
+        identity_histogram_contributions(tokens["placekey_id"], pad_id=PAD_ID)
         for tokens in (real_poi, gen_poi)
-    ]
+    )
+
+    def histogram_jsd(name: str) -> dict[str, float]:
+        pair = (
+            h[name].sum(axis=0, keepdims=True) for h in (real_hist, gen_hist)
+        )
+        return {"point_estimate": float(rowwise_jsd_counts(*pair)[0])}
+
     with_coordinates = placekey_latlon is not None
     return {
         "trajectory_metrics": {
@@ -514,11 +459,11 @@ def _brief_poi_metrics(
         "identity_dynamics": {
             "poi": {
                 "distribution_distances": {
-                    "return_gap_distribution_jsd": {
-                        "point_estimate": float(
-                            rowwise_jsd_counts(*return_gaps)[0]
-                        ),
-                    }
+                    name: histogram_jsd(name)
+                    for name in (
+                        "return_gap_distribution_jsd",
+                        "multiplicity_distribution_jsd",
+                    )
                 }
             }
         },

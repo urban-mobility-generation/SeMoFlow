@@ -102,11 +102,6 @@ def _resolve_distributed_context(
             )
         device_count = torch.cuda.device_count()
         if device_ids:
-            if not 0 <= local_rank < len(device_ids):
-                raise ValueError(
-                    f"LOCAL_RANK={local_rank} is outside the requested "
-                    f"device list of length {len(device_ids)}"
-                )
             device_index = device_ids[local_rank]
         else:
             if primary_device.index is not None:
@@ -167,20 +162,17 @@ def _broadcast_metrics(
     metrics: _NLLMetrics | None,
     context: _DistributedContext,
 ) -> _NLLMetrics:
-    values = torch.zeros(9, dtype=torch.float64, device=context.device)
+    values = torch.zeros(7, dtype=torch.float64, device=context.device)
     if context.is_primary:
-        if metrics is None:
-            raise RuntimeError("primary rank has no metrics to broadcast")
+        assert metrics is not None
         values[:] = torch.tensor(
             [
                 metrics.total,
                 metrics.length,
                 metrics.gap,
-                metrics.duration,
                 metrics.prefix,
                 metrics.total_per_event,
                 metrics.gap_per_event,
-                metrics.duration_per_event,
                 metrics.prefix_per_event,
             ],
             dtype=torch.float64,
@@ -199,7 +191,6 @@ class OccurrencePlannerTrainResult:
     metrics_path: Path
     best_epoch: int
     best_validation_nll: float
-    final_train_objective: float
     final_train_nll: float
     final_validation_nll: float
 
@@ -209,11 +200,9 @@ class _NLLMetrics:
     total: float
     length: float
     gap: float
-    duration: float
     prefix: float
     total_per_event: float
     gap_per_event: float
-    duration_per_event: float
     prefix_per_event: float
 
     def to_dict(self) -> dict[str, float]:
@@ -221,11 +210,9 @@ class _NLLMetrics:
             "nll": self.total,
             "length_nll": self.length,
             "gap_nll": self.gap,
-            "duration_nll": self.duration,
             "prefix_nll": self.prefix,
             "nll_per_event": self.total_per_event,
             "gap_nll_per_event": self.gap_per_event,
-            "duration_nll_per_event": self.duration_per_event,
             "prefix_nll_per_event": self.prefix_per_event,
         }
 
@@ -237,7 +224,6 @@ class _NLLAccumulator:
     total_sum: float = 0.0
     length_sum: float = 0.0
     gap_sum: float = 0.0
-    duration_sum: float = 0.0
     prefix_sum: float = 0.0
 
     def add(self, loss: Any, batch: Any) -> None:
@@ -248,21 +234,16 @@ class _NLLAccumulator:
         self.total_sum += float(loss.total.detach()) * sequences
         self.length_sum += float(loss.length.detach()) * sequences
         self.gap_sum += float(loss.gap.detach()) * sequences
-        self.duration_sum += float(loss.duration.detach()) * sequences
         self.prefix_sum += float(loss.prefix.detach()) * sequences
 
     def finalize(self) -> _NLLMetrics:
-        if self.sequence_count < 1 or self.event_count < 1:
-            raise ValueError("cannot summarize an empty planner dataset")
         return _NLLMetrics(
             total=self.total_sum / self.sequence_count,
             length=self.length_sum / self.sequence_count,
             gap=self.gap_sum / self.sequence_count,
-            duration=self.duration_sum / self.sequence_count,
             prefix=self.prefix_sum / self.sequence_count,
             total_per_event=self.total_sum / self.event_count,
             gap_per_event=self.gap_sum / self.event_count,
-            duration_per_event=self.duration_sum / self.event_count,
             prefix_per_event=self.prefix_sum / self.event_count,
         )
 
@@ -280,31 +261,8 @@ def split_tensor_dataset(
         split.prefix_codes,
         split.gap_tokens,
         split.lengths,
-        event_time_minutes=split.event_time_minutes,
-        context_features=split.context_features,
-        city_ids=split.city_ids,
+        split.city_ids,
     )
-
-
-def split_nll_metrics(
-    model: OccurrenceARPlanner,
-    split: OccurrencePlannerSplit,
-    *,
-    config: OccurrencePlannerConfig,
-    legality: LegalPrefixIndex,
-    batch_size: int,
-    device: torch.device,
-) -> _NLLMetrics:
-    loader = build_occurrence_tensor_dataloader(
-        split_tensor_dataset(split),
-        config=config,
-        legality=legality,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=device.type == "cuda",
-    )
-    return _loader_nll_metrics(model, loader, device=device)
 
 
 def _loader_nll_metrics(
@@ -337,18 +295,13 @@ def _planner_config(
         gap_vocab=data.gap_vocab,
         prefix_depth=data.prefix_depth,
         max_occurrences=data.max_occurrences,
-        context_dim=data.context_dim,
-        context_schema=data.context_schema,
         city_conditioning=data.city_conditioning,
         model_dim=architecture.model_dim,
         n_heads=architecture.n_heads,
         n_layers=architecture.n_layers,
         dropout=architecture.dropout,
-        prefix_decoder=architecture.prefix_decoder,
-        mobility_router=architecture.mobility_router,
         mobility_gate_prior=architecture.mobility_gate_prior,
         gap_codec_version=data.gap_codec_version,
-        use_tokenizer_latent=architecture.use_tokenizer_latent,
         use_distance_prior=architecture.use_distance_prior,
         gap_bucket_edges_minutes=data.gap_bucket_edges_minutes,
         gap_duration_minutes=data.gap_duration_minutes,
@@ -394,9 +347,6 @@ class _StepLogger:
             "gap_loss": float(loss.gap.detach()),
             "length_loss": float(loss.length.detach()),
         }
-        duration = float(loss.duration.detach())
-        if duration != 0.0:
-            metrics["duration_loss"] = duration
         log_training_step(
             logger,
             step=step,
@@ -417,56 +367,39 @@ def _train_epoch(
     optimizer: optim.Optimizer,
     scheduler: optim.lr_scheduler.LRScheduler | None,
     *,
-    options: OccurrencePlannerTrainingOptions,
     device: torch.device,
     distributed: _DistributedContext,
     step_logger: _StepLogger,
     epoch: int,
-) -> tuple[float, _NLLMetrics, int]:
+) -> tuple[_NLLMetrics, int]:
+    """Train one epoch; return the training NLL (the objective) and the
+    number of sequences processed across ranks."""
     train_model.train()
     step_logger.start_epoch()
-    objective_sum = 0.0
-    sequence_count = 0
     nll = _NLLAccumulator()
     for batch in loader:
         batch = batch.to(device, non_blocking=True)
-        output = train_model(batch)
-        loss = occurrence_planner_loss(
-            output,
-            batch,
-            length_weight=options.length_weight,
-            gap_weight=options.gap_weight,
-            prefix_weight=options.prefix_weight,
-            label_smoothing=options.label_smoothing,
-            recurrence_weight=options.recurrence_weight,
-        )
-        with torch.no_grad():
-            nll.add(occurrence_planner_loss(output, batch), batch)
+        loss = occurrence_planner_loss(train_model(batch), batch)
+        nll.add(loss, batch)
         optimizer.zero_grad(set_to_none=True)
         loss.total.backward()
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
-        batch_size = int(batch.lengths.shape[0])
-        objective_sum += float(loss.total.detach()) * batch_size
-        sequence_count += batch_size
         step_logger.step(
             epoch=epoch,
             loss=loss,
-            batch_size=batch_size,
+            batch_size=int(batch.lengths.shape[0]),
             lr=float(optimizer.param_groups[0]["lr"]),
         )
 
     totals = torch.tensor(
         [
-            objective_sum,
-            float(sequence_count),
             float(nll.sequence_count),
             float(nll.event_count),
             nll.total_sum,
             nll.length_sum,
             nll.gap_sum,
-            nll.duration_sum,
             nll.prefix_sum,
         ],
         dtype=torch.float64,
@@ -475,16 +408,14 @@ def _train_epoch(
     _all_reduce_sum(totals, distributed)
     values = totals.tolist()
     reduced = _NLLAccumulator(
-        sequence_count=int(values[2]),
-        event_count=int(values[3]),
-        total_sum=values[4],
-        length_sum=values[5],
-        gap_sum=values[6],
-        duration_sum=values[7],
-        prefix_sum=values[8],
+        sequence_count=int(values[0]),
+        event_count=int(values[1]),
+        total_sum=values[2],
+        length_sum=values[3],
+        gap_sum=values[4],
+        prefix_sum=values[5],
     )
-    processed = int(values[1])
-    return values[0] / processed, reduced.finalize(), processed
+    return reduced.finalize(), reduced.sequence_count
 
 
 def _primary_split_nll(
@@ -565,39 +496,20 @@ def train_planner(
     return train_occurrence_planner(settings, force=force)
 
 
-def _check_dataset_supports(
-    config: OccurrencePlannerConfig,
-    options: OccurrencePlannerTrainingOptions,
-    dataset: OccurrencePlannerDataset,
-) -> None:
-    if config.mobility_router != "none" and options.label_smoothing != 0.0:
-        raise ValueError(
-            "label_smoothing must be zero when mobility routing is enabled"
-        )
-    if config.use_tokenizer_latent and dataset.prefix_codebooks is None:
-        raise ValueError(
-            "architecture.use_tokenizer_latent requires a dataset built "
-            "with --codebooks"
-        )
-    if config.use_distance_prior and dataset.legal_prefix_centroids is None:
-        raise ValueError(
-            "architecture.use_distance_prior requires a dataset built with "
-            "--places coordinates"
-        )
-
-
 def _catalog_tensors(
     config: OccurrencePlannerConfig,
     dataset: OccurrencePlannerDataset,
 ) -> dict[str, torch.Tensor | None]:
     """Catalog tensors shared by the model and every checkpoint it writes."""
+    if config.use_distance_prior and dataset.legal_prefix_centroids is None:
+        raise ValueError(
+            "architecture.use_distance_prior requires a planner dataset "
+            "built with planner.data.places_path"
+        )
     return {
         "legal_prefixes": dataset.legal_prefixes,
         "catalog_city_ids": dataset.catalog_city_ids,
         "city_legal_prefix_mask": dataset.city_legal_prefix_mask,
-        "prefix_codebooks": (
-            dataset.prefix_codebooks if config.use_tokenizer_latent else None
-        ),
         "legal_prefix_centroids": (
             dataset.legal_prefix_centroids
             if config.use_distance_prior
@@ -621,8 +533,8 @@ def _log_training_start(
 ) -> None:
     logger.info(
         "starting training  device=%s  seed=%d  epochs=%d  batch_size=%d  "
-        "learning_rate=%g  model_dim=%d  n_layers=%d  prefix_decoder=%s  "
-        "mobility_router=%s  lr_scheduler=%s  warmup_steps=%d  min_lr=%g  "
+        "learning_rate=%g  model_dim=%d  n_layers=%d  gate_prior=%s  "
+        "distance_prior=%s  lr_scheduler=%s  warmup_steps=%d  min_lr=%g  "
         "num_workers=%d  distributed=%s world_size=%d compile=%s backend=%s mode=%s "
         "fullgraph=%s float32_matmul_precision=%s",
         device,
@@ -632,8 +544,8 @@ def _log_training_start(
         options.learning_rate,
         config.model_dim,
         config.n_layers,
-        config.prefix_decoder,
-        config.mobility_router,
+        config.mobility_gate_prior,
+        config.use_distance_prior,
         options.lr_scheduler,
         options.warmup_steps,
         options.min_lr,
@@ -720,19 +632,17 @@ def _log_epoch(
         ),
     )
     logger.info(
-        "epoch %d/%d  lr=%.6g  train_objective=%.4f  train_nll=%.4f  "
+        "epoch %d/%d  lr=%.6g  train_nll=%.4f  "
         "validation_nll=%.4f  validation_time=%.2fs  "
-        "val[length=%.4f gap=%.4f duration=%.4f prefix=%.4f]%s",
+        "val[length=%.4f gap=%.4f prefix=%.4f]%s",
         row["epoch"],
         total_epochs,
         row["learning_rate"],
-        row["train_objective"],
         row["train_nll"],
         row["validation_nll"],
         row["validation_elapsed_s"],
         row["validation_length_nll"],
         row["validation_gap_nll"],
-        row["validation_duration_nll"],
         row["validation_prefix_nll"],
         "  (best)" if improved else "",
     )
@@ -751,16 +661,14 @@ def train_occurrence_planner(
     if int(os.environ.get("RANK", "0")) == 0:
         logger.info(
             "loaded planner dataset  path=%s  train=%d  validation=%d  "
-            "codebook_size=%d  gap_vocab=%d  temporal_state=%s",
+            "codebook_size=%d  gap_vocab=%d",
             settings.dataset_path,
             dataset.train.size,
             dataset.validation.size,
             dataset.config.codebook_size,
             dataset.config.gap_vocab,
-            dataset.config.temporal_state_enabled,
         )
     config = _planner_config(dataset.config, settings.architecture)
-    _check_dataset_supports(config, options, dataset)
     check_planner_settings(settings, force=force)
     output_dir = Path(settings.output_dir)
     best_path, last_path, metrics_path, warm_start_path = (
@@ -772,11 +680,6 @@ def train_occurrence_planner(
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
     set_seed_all(seed)
-    legality = LegalPrefixIndex(
-        dataset.legal_prefixes,
-        codebook_size=config.codebook_size,
-        prefix_depth=config.prefix_depth,
-    )
     catalog = _catalog_tensors(config, dataset)
     model = OccurrenceARPlanner(config, **catalog).to(device)
     warm_start_report = (
@@ -829,7 +732,7 @@ def train_occurrence_planner(
         _build_loaders(
             dataset,
             config=config,
-            legality=legality,
+            legality=model.legality,
             options=options,
             seed=seed,
             distributed=distributed,
@@ -862,7 +765,6 @@ def train_occurrence_planner(
 
     stopper = EarlyStopper(patience=options.early_stopping_patience or None)
     history: list[dict[str, float]] = []
-    train_objective = float("nan")
     validation_metrics: _NLLMetrics | None = None
     for epoch in range(1, options.epochs + 1):
         if device.type == "cuda":
@@ -871,12 +773,11 @@ def train_occurrence_planner(
         epoch_start_time = time.perf_counter()
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-        train_objective, train_nll_metrics, processed = _train_epoch(
+        train_nll_metrics, processed = _train_epoch(
             train_model,
             train_loader,
             optimizer,
             scheduler,
-            options=options,
             device=device,
             distributed=distributed,
             step_logger=step_logger,
@@ -905,7 +806,6 @@ def train_occurrence_planner(
                 {
                     "epoch": epoch,
                     "learning_rate": float(optimizer.param_groups[0]["lr"]),
-                    "train_objective": train_objective,
                     "train_elapsed_s": train_elapsed,
                     "validation_elapsed_s": validation_elapsed,
                     "train_samples_per_sec": processed
@@ -934,12 +834,11 @@ def train_occurrence_planner(
 
     best_epoch = stopper.best_epoch
     best_validation_nll = stopper.best_value
-    if validation_metrics is None or best_epoch < 1:
-        raise RuntimeError("training completed without recording an epoch")
 
     final_train_metrics = _primary_split_nll(
         model, eval_train_loader, device=device, distributed=distributed
     )
+    assert validation_metrics is not None
     if distributed.is_primary:
         save_checkpoint(
             last_path,
@@ -952,7 +851,6 @@ def train_occurrence_planner(
             metrics_path,
             best_epoch=best_epoch,
             best_validation_nll=best_validation_nll,
-            final_train_objective=train_objective,
             final_train_metrics=final_train_metrics,
             final_validation_metrics=validation_metrics,
             history=history,
@@ -985,7 +883,6 @@ def train_occurrence_planner(
         metrics_path=metrics_path,
         best_epoch=best_epoch,
         best_validation_nll=best_validation_nll,
-        final_train_objective=train_objective,
         final_train_nll=final_train_metrics.total,
         final_validation_nll=validation_metrics.total,
     )
@@ -1062,7 +959,6 @@ def train_occurrence_planner_on_devices(
         metrics_path=metrics_path,
         best_epoch=int(metrics["best_epoch"]),
         best_validation_nll=float(metrics["best_validation_nll"]),
-        final_train_objective=float(metrics["final_train_objective"]),
         final_train_nll=float(metrics["final_train_nll"]),
         final_validation_nll=float(metrics["final_validation_nll"]),
     )
@@ -1073,7 +969,6 @@ def _write_metrics_json(
     *,
     best_epoch: int,
     best_validation_nll: float,
-    final_train_objective: float,
     final_train_metrics: _NLLMetrics,
     final_validation_metrics: _NLLMetrics,
     history: list[dict[str, float]],
@@ -1083,7 +978,6 @@ def _write_metrics_json(
     payload: dict[str, object] = {
         "best_epoch": best_epoch,
         "best_validation_nll": best_validation_nll,
-        "final_train_objective": final_train_objective,
         **_prefixed_metrics("final_train", final_train_metrics),
         **_prefixed_metrics("final_validation", final_validation_metrics),
         "epochs": history,

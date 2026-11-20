@@ -40,10 +40,6 @@ class CircadianTokenEncoder(nn.Module):
         n_parts_of_day: int = 6,
     ) -> None:
         super().__init__()
-        if time_vocab < 1 or output_dim < 1:
-            raise ValueError("time_vocab and output_dim must be positive")
-        if n_harmonics < 1 or n_parts_of_day < 2:
-            raise ValueError("circadian feature dimensions are too small")
         self.time_vocab = time_vocab
         self.n_harmonics = n_harmonics
         self.n_parts_of_day = n_parts_of_day
@@ -57,8 +53,6 @@ class CircadianTokenEncoder(nn.Module):
         )
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        if tokens.ndim < 1:
-            raise ValueError("time tokens must have at least one dimension")
         valid = (tokens >= 0) & (tokens < self.time_vocab)
         safe = tokens.clamp(min=0, max=self.time_vocab - 1)
         weekday = (safe // self.n_parts_of_day).clamp(max=self.n_weekdays - 1)

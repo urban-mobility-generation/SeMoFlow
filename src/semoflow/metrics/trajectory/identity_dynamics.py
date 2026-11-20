@@ -36,11 +36,6 @@ def _cluster_labels(
         labels = np.arange(n_rows, dtype=np.int64)
         unit = "trajectory_row"
     else:
-        if len(cluster_ids) != n_rows:
-            raise ValueError(
-                f"cluster_ids must align with {rows}: "
-                f"{len(cluster_ids)} != {n_rows}"
-            )
         _, labels = np.unique(
             np.asarray(cluster_ids, dtype=str), return_inverse=True
         )
@@ -243,10 +238,6 @@ def cluster_histogram_jsd_bootstrap(
 ) -> dict[str, Any]:
     real = np.asarray(real_contributions)
     generated = np.asarray(generated_contributions)
-    if real.ndim != 2 or generated.shape != real.shape:
-        raise ValueError("histogram contributions must be aligned matrices")
-    if np.any(real < 0) or np.any(generated < 0):
-        raise ValueError("histogram contributions must be non-negative")
     n_rows = real.shape[0]
     labels, unit, n_clusters = _cluster_labels(
         cluster_ids, n_rows, rows="histogram rows"
@@ -287,10 +278,6 @@ def cluster_sparse_token_distribution_bootstrap(
     cluster_ids: Sequence[str] | None,
     compute_device: torch.device | str | None = None,
 ) -> dict[str, Any]:
-    if real.ndim != 2 or generated.shape != real.shape:
-        raise ValueError("sparse token distributions require aligned matrices")
-    if vocab_size < 1:
-        raise ValueError("vocab_size must be positive")
     n_rows = real.shape[0]
     labels, unit, n_clusters = _cluster_labels(
         cluster_ids, n_rows, rows="sparse token rows"
@@ -340,10 +327,6 @@ def cluster_sparse_ngram_jsd_bootstrap(
 ) -> dict[str, Any] | None:
     if vocab_size > _NGRAM_MAX_VOCAB:
         return None
-    if real.ndim != 2 or generated.shape != real.shape:
-        raise ValueError("n-gram distributions require aligned matrices")
-    if n < 1:
-        raise ValueError("n must be positive")
     n_rows = real.size(0)
     labels, unit, n_clusters = _cluster_labels(
         cluster_ids, n_rows, rows="n-gram rows"

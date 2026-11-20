@@ -28,6 +28,20 @@ class CompositionOptions:
     candidate_selection: str = "first"
     # Score only the comparison metrics and POI coverage.
     brief_metrics: bool = False
+    # "trajectory_prefix" shares calibrated catalog sampling noise among a
+    # trajectory's events with the same planned prefix; per-event marginals
+    # are unchanged. "independent" keeps per-event draws.
+    catalog_noise_coupling: str = "independent"
+
+    def __post_init__(self) -> None:
+        if self.catalog_noise_coupling not in {
+            "independent",
+            "trajectory_prefix",
+        }:
+            raise ValueError(
+                "catalog_noise_coupling must be 'independent' or "
+                "'trajectory_prefix'"
+            )
 
 
 @dataclass(frozen=True, slots=True)

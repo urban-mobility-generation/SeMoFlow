@@ -417,12 +417,6 @@ def encode_geohash(
     *,
     precision: int = 5,
 ) -> str:
-    if precision < 1:
-        raise ValueError("geohash precision must be positive")
-    if not -90.0 <= latitude <= 90.0:
-        raise ValueError(f"latitude out of range: {latitude}")
-    if not -180.0 <= longitude <= 180.0:
-        raise ValueError(f"longitude out of range: {longitude}")
     lat_interval = [-90.0, 90.0]
     lon_interval = [-180.0, 180.0]
     bits: list[int] = []

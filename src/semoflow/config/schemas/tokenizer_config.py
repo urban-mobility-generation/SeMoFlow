@@ -26,15 +26,7 @@ class TokenizerConfig:
     places_index_path: str | None = None
     processed_visits_path: str | None = None
     out_dir: str = "outputs/tokenization"
-    eval_k: int = 10
-    eval_sample_size: int = 5000
-    eval_pair_sample_size: int = 2_000_000
-    eval_geometry_sample_size: int = 5000
-    eval_geometry_lcp_pair_sample_size: int = 10_000
-    eval_bootstrap_resamples: int = 200
-    eval_bootstrap_confidence: float = 0.95
     skip_artifact_export: bool = False
-    skip_semantic_id_eval: bool = False
     text_embeddings_path: str = "outputs/encoder/text/text_embeddings.npy"
     graphsage_artifact_dir: str | None = None
     input_embedding_source: str = "pca_concat"

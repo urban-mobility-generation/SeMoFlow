@@ -26,12 +26,6 @@ def marginal_distribution(
 
 
 def jsd(p: torch.Tensor, q: torch.Tensor) -> float:
-    if p.shape != q.shape:
-        raise ValueError("JSD inputs must have the same shape")
-    if not torch.isfinite(p).all() or not torch.isfinite(q).all():
-        raise ValueError("JSD inputs must contain only finite values")
-    if torch.any(p < 0) or torch.any(q < 0):
-        raise ValueError("JSD inputs must be non-negative")
     p_sum = p.sum()
     q_sum = q.sum()
     if p_sum <= 0 or q_sum <= 0:

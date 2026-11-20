@@ -37,10 +37,6 @@ class TokenizerArtifacts:
         return self.run_dir / "config.yaml"
 
     @property
-    def eval_dir(self) -> Path:
-        return self.run_dir / "eval"
-
-    @property
     def completion_marker(self) -> Path:
         return self.run_dir / "completion.json"
 

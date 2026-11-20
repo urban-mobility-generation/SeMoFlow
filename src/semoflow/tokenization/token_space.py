@@ -31,15 +31,6 @@ def to_token_fields(
     sid_codes: torch.Tensor,
     code_fields: Sequence[str],
 ) -> dict[str, torch.Tensor]:
-    if sid_codes.ndim != 3:
-        raise ValueError(
-            f"sid_codes must be [N, T, M], got {tuple(sid_codes.shape)}"
-        )
-    if sid_codes.shape[-1] != len(code_fields):
-        raise ValueError(
-            "sid_codes last dimension must match code field count: "
-            f"{sid_codes.shape[-1]} vs {len(code_fields)}"
-        )
     codes = sid_codes.long()
     return {
         field_name: to_tokens(codes[:, :, level])
@@ -62,11 +53,6 @@ def apply_trajectory_valid_mask(
     mask = valid_mask.bool().cpu()
     masked: dict[str, torch.Tensor] = {}
     for field_name, value in tokens.items():
-        if value.shape[:2] != mask.shape:
-            raise ValueError(
-                f"valid_mask shape {tuple(mask.shape)} does not match "
-                f"{field_name} token shape {tuple(value.shape)}"
-            )
         field_mask = mask.to(device=value.device)
         masked[field_name] = value.masked_fill(~field_mask, pad_id)
     return masked

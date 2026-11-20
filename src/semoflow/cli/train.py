@@ -5,7 +5,6 @@ import os
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import asdict, replace
-from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -53,65 +52,6 @@ def _torchrun_compat(
             "--local-rank disagrees with the LOCAL_RANK environment variable"
         )
     os.environ["LOCAL_RANK"] = str(local_rank)
-
-
-@app.command(
-    "text-encoder", help="Encode POI text metadata into dense embeddings."
-)
-def text_encoder_cmd(
-    config: ConfigOpt = None,
-    set_args: SetArgsOpt = None,
-    log_level: LogLevelOpt = "INFO",
-    log_file: LogFileOpt = None,
-) -> None:
-    from semoflow.encoder.pipeline import run_text_encoder
-
-    cfg = resolve_cli_config(
-        config, set_args, log_level=log_level, log_file=log_file
-    )
-    with cli_run(
-        cfg,
-        phase="text-encoder",
-        output_dir=cfg.output.output_dir,
-        config_phase="encoder",
-        device=cfg.encoder_pipeline.text.device,
-        log_level=log_level,
-        log_file=log_file,
-    ):
-        run_text_encoder(cfg)
-
-
-@app.command(
-    "graph-encoder",
-    help="Build graph/CF POI embeddings from mobility transitions.",
-)
-def graph_encoder_cmd(
-    config: ConfigOpt = None,
-    set_args: SetArgsOpt = None,
-    dry_run_config: DryRunConfigOpt = False,
-    log_level: LogLevelOpt = "INFO",
-    log_file: LogFileOpt = None,
-) -> None:
-    from semoflow.encoder.pipeline import run_graph_encoder
-
-    cfg = resolve_cli_config(
-        config, set_args, log_level=log_level, log_file=log_file
-    )
-    if dry_run_config:
-        typer.echo(cfg.to_yaml("encoder"))
-        return
-    graph_cfg = cfg.encoder_pipeline.graph
-    with cli_run(
-        cfg,
-        phase="graph-encoder",
-        output_dir=Path(graph_cfg.out_dir),
-        config_phase="encoder",
-        device=graph_cfg.device,
-        seed=graph_cfg.seed,
-        log_level=log_level,
-        log_file=log_file,
-    ) as run:
-        run.result = run_graph_encoder(cfg)
 
 
 @app.command("encoder", help="Run the text encoder, then the graph encoder.")

@@ -15,8 +15,6 @@ def variance_covariance_penalty(
     variance_target: float = 1.0,
     eps: float = 1e-4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if poi_emb.ndim != 2:
-        raise ValueError("poi_emb must be a two-dimensional [N, D] tensor")
     n_rows, n_dims = poi_emb.shape
     if n_rows < 2:
         zero = poi_emb.sum() * 0.0
@@ -41,12 +39,6 @@ def contrastive_link_loss(
     max_negatives: int = 2048,
     max_queries: int = 65536,
 ) -> torch.Tensor:
-    if temperature <= 0.0:
-        raise ValueError("temperature must be positive")
-    if max_negatives < 1:
-        raise ValueError("max_negatives must be positive")
-    if max_queries < 1:
-        raise ValueError("max_queries must be positive")
     source, target = pos_edges
     if source.numel() == 0:
         return poi_emb.sum() * 0.0
@@ -66,8 +58,6 @@ def contrastive_link_loss(
     matched = None
     if neg_edges is not None and neg_edges[0].numel() > 0:
         negative_source, negative_target = neg_edges
-        if negative_source.shape != negative_target.shape:
-            raise ValueError("negative edge source and target shapes differ")
         order = torch.argsort(negative_source)
         sorted_source = negative_source[order]
         positions = torch.searchsorted(sorted_source, source)

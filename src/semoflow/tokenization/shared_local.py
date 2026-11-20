@@ -23,8 +23,6 @@ _ID_COLUMN = "placekey_id"
 
 
 def shared_codebook_fingerprint(codebooks: Sequence[Any]) -> str:
-    if not codebooks:
-        raise ValueError("shared codebooks must be non-empty")
     digest = hashlib.sha256()
     for index, codebook in enumerate(codebooks):
         tensor = codebook.detach().to("cpu").contiguous()
@@ -39,8 +37,6 @@ def semantic_id_lookup_fingerprint(
     lookup: pl.DataFrame,
     code_columns: Sequence[str],
 ) -> str:
-    if not code_columns:
-        raise ValueError("code_columns must be non-empty")
     _require_columns(lookup, [*code_columns], label="lookup")
     key_column = "placekey" if "placekey" in lookup.columns else _ID_COLUMN
     _require_columns(lookup, [key_column], label="lookup")

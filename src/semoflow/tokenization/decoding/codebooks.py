@@ -18,18 +18,6 @@ class SIDCodebookBundle:
     codebooks: torch.Tensor
     code_fields: tuple[str, ...]
 
-    def __post_init__(self) -> None:
-        if self.codebooks.ndim != 3:
-            raise ValueError(
-                "codebooks must have shape [n_codebooks, codebook_size, dim], "
-                f"got {tuple(self.codebooks.shape)}"
-            )
-        if len(self.code_fields) != int(self.codebooks.shape[0]):
-            raise ValueError(
-                "code_fields length must match codebook count: "
-                f"{len(self.code_fields)} vs {int(self.codebooks.shape[0])}"
-            )
-
     @classmethod
     def from_tokenizer(
         cls,
@@ -62,8 +50,6 @@ MAX_STANDALONE_CODEBOOK_ARTIFACT_BYTES = 512 * 1024 * 1024
 
 
 def _canonical_codebooks(codebooks: torch.Tensor) -> torch.Tensor:
-    if not isinstance(codebooks, torch.Tensor):
-        raise TypeError("codebooks must be a torch.Tensor")
     return codebooks.detach().cpu().float().contiguous()
 
 
@@ -106,19 +92,9 @@ def codes_to_embeddings_from_codebooks(
     codes: torch.Tensor,
     codebooks: torch.Tensor,
 ) -> torch.Tensor:
-    if codebooks.ndim != 3:
-        raise ValueError(
-            f"codebooks must have shape [M,K,D], got {tuple(codebooks.shape)}"
-        )
 
     codes = codes.long()
     codebooks = codebooks.to(codes.device)
-
-    if codes.shape[-1] != codebooks.shape[0]:
-        raise ValueError(
-            f"codes last dim must equal n_codebooks={codebooks.shape[0]}, "
-            f"got shape={tuple(codes.shape)}"
-        )
 
     if codes.numel() == 0:
         return torch.empty(
@@ -151,8 +127,6 @@ def extract_codebook_bundle(
 ) -> SIDCodebookBundle:
     path = Path(artifact_path)
     if max_artifact_bytes is not None:
-        if max_artifact_bytes <= 0:
-            raise ValueError("max_artifact_bytes must be positive")
         artifact_size = path.stat().st_size
         if artifact_size > max_artifact_bytes:
             raise ValueError(

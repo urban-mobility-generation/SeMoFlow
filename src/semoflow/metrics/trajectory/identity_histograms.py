@@ -47,12 +47,6 @@ def normalise_histograms(counts: np.ndarray) -> np.ndarray:
 def rowwise_jsd_counts(real: np.ndarray, generated: np.ndarray) -> np.ndarray:
     real = np.asarray(real, dtype=np.float64)
     generated = np.asarray(generated, dtype=np.float64)
-    if real.shape != generated.shape:
-        raise ValueError("histogram inputs must have the same shape")
-    if not np.isfinite(real).all() or not np.isfinite(generated).all():
-        raise ValueError("histogram inputs must contain only finite values")
-    if np.any(real < 0.0) or np.any(generated < 0.0):
-        raise ValueError("histogram inputs must be non-negative")
     real_totals = real.sum(axis=-1)
     generated_totals = generated.sum(axis=-1)
     p = normalise_histograms(real)
