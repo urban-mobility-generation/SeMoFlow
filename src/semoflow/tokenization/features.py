@@ -87,21 +87,6 @@ def graph_feature_frame(
     return _with_block(_identity_frame(places_index), GRAPH_PREFIX, embeddings)
 
 
-def load_graph_embeddings(
-    artifact_dir: Path,
-) -> tuple[pl.DataFrame, torch.Tensor]:
-    root = Path(artifact_dir).expanduser().resolve()
-    emb_path = root / "poi_graph_emb.pt"
-    index_path = root / "places_index.parquet"
-    if not (emb_path.exists() and index_path.exists()):
-        raise FileNotFoundError(
-            f"graphsage_artifact_dir must contain {emb_path.name} and "
-            f"{index_path.name}; got {root}"
-        )
-    embeddings = torch.load(emb_path, map_location="cpu", weights_only=True)
-    return pl.read_parquet(index_path), embeddings
-
-
 def _pca_fit(
     frame: pl.DataFrame, src_prefix: str, dst_prefix: str, n_components: int
 ) -> tuple[pl.DataFrame, dict[str, Any]]:
@@ -354,7 +339,6 @@ __all__ = [
     "feature_columns",
     "frame_to_numpy",
     "graph_feature_frame",
-    "load_graph_embeddings",
     "scale_feature_blocks",
     "text_feature_frame",
 ]

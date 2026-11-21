@@ -138,9 +138,6 @@ class SemanticIDGroundingIndex:
         for payloads in self._mapping.values():
             yield from payloads
 
-    def iter_payload_groups(self) -> Iterable[Sequence[Mapping[str, Any]]]:
-        yield from self._mapping.values()
-
     def iter_key_payload_groups(
         self,
     ) -> Iterable[tuple[CodeKey, Sequence[Mapping[str, Any]]]]:
@@ -234,12 +231,6 @@ class SemanticIDGroundingIndex:
         if self.order_agnostic:
             return tuple(sorted(int(value) for value in code_values))
         return tuple(int(v) for v in code_values)
-
-    def candidate_count(
-        self, code_values: Sequence[int] | Mapping[str, int]
-    ) -> int:
-        key = self._lookup_key(code_values)
-        return len(self._mapping.get(key, ()))
 
     def stats(self) -> GroundingStats:
         candidate_counts = [

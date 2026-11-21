@@ -3,21 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 import polars as pl
 
 __all__ = [
-    "SHARED_LOCAL_FORMAT",
-    "SharedLocalProvenance",
-    "read_shared_local_provenance",
     "semantic_id_lookup_fingerprint",
     "shared_codebook_fingerprint",
 ]
-
-SHARED_LOCAL_FORMAT = "shared_local_sid_v1"
 
 _ID_COLUMN = "placekey_id"
 
@@ -66,31 +59,9 @@ def semantic_id_lookup_fingerprint(
     return digest.hexdigest()
 
 
-@dataclass(frozen=True)
-class SharedLocalProvenance:
-    format_version: str
-    spec: dict[str, Any]
-    city_ids: list[int]
-    n_pois: int
-    n_pois_per_city: dict[str, int]
-    shared_lookup_path: str
-    local_lookup_paths: dict[str, str]
-
-
 def _require_columns(
     frame: pl.DataFrame, columns: Sequence[str], *, label: str
 ) -> None:
     missing = [c for c in columns if c not in frame.columns]
     if missing:
         raise ValueError(f"{label} is missing columns: {missing}")
-
-
-def read_shared_local_provenance(path: Path) -> SharedLocalProvenance:
-    payload = json.loads(Path(path).read_text())
-    declared = payload.get("format_version")
-    if declared != SHARED_LOCAL_FORMAT:
-        raise ValueError(
-            f"{path} declares format {declared!r}, expected "
-            f"{SHARED_LOCAL_FORMAT!r}"
-        )
-    return SharedLocalProvenance(**payload)

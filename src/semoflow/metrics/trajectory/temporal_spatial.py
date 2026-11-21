@@ -33,7 +33,6 @@ from semoflow.metrics.divergence import (
 from semoflow.realizer.time_tokens import (
     N_PART_OF_DAY_BINS,
     N_TIME_TOKENS,
-    PART_OF_DAY_START_MINUTES,
 )
 
 TIME_TOKEN_MIDPOINT_HOURS = np.array([3, 8, 12, 16, 20, 23], dtype=np.int64)
@@ -46,7 +45,6 @@ EARTH_RADIUS_KM = 6371.0088
 # negative-gap (resp. missing-distance) category.
 N_GAP_BINS = len(GAP_EDGES_HOURS)
 N_DISTANCE_BINS = len(DISTANCE_EDGES_KM)
-_PART_OF_DAY_START_HOURS = np.array(PART_OF_DAY_START_MINUTES[1:]) // 60
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -71,15 +69,6 @@ class TemporalSpatialEvents:
             raise ValueError(
                 f"active time tokens must lie in [0, {N_TIME_TOKENS})"
             )
-
-
-def hour_of_week_to_time_token(hours: np.ndarray) -> np.ndarray:
-    """Map Monday-anchored hours of week (0-167) to the 42 weekly tokens."""
-    hours = np.asarray(hours, dtype=np.int64)
-    if np.any((hours < 0) | (hours > 167)):
-        raise ValueError("hour of week must lie in [0, 167]")
-    part = np.searchsorted(_PART_OF_DAY_START_HOURS, hours % 24, side="right")
-    return (hours // 24) * N_PART_OF_DAY_BINS + part
 
 
 def events_from_place_ids(
@@ -254,6 +243,5 @@ def temporal_spatial_jsd(
 __all__ = [
     "TemporalSpatialEvents",
     "events_from_place_ids",
-    "hour_of_week_to_time_token",
     "temporal_spatial_jsd",
 ]
