@@ -39,4 +39,3 @@ evaluation:
     num_steps: 20
     catalog_temperature: 0.4
     candidate_selection: train_prior_sample
-    brief_metrics: true

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import functools
-import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -10,23 +8,9 @@ import torch
 
 from semoflow.config.constants import PAD_ID
 from semoflow.metrics.trajectory.distribution import jsd
-from semoflow.metrics.trajectory.identity_dynamics import (
-    cluster_histogram_jsd_bootstrap,
-)
 
 _EARTH_RADIUS_KM = 6371.0
 _DISTANCE_BINS = 50
-
-
-def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    phi1, phi2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlam = math.radians(lon2 - lon1)
-    a = (
-        math.sin(dphi / 2) ** 2
-        + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
-    )
-    return 2 * _EARTH_RADIUS_KM * math.asin(math.sqrt(a))
 
 
 _CACHE_CAPACITY = 16
@@ -143,32 +127,6 @@ def _pairwise_haversine_km(
     )
     a = a.clamp(0.0, 1.0)
     return 2 * _EARTH_RADIUS_KM * torch.arcsin(torch.sqrt(a))
-
-
-def centroid_geo_error(
-    tokens_real: torch.Tensor,
-    tokens_gen: torch.Tensor,
-    centroids: dict[int, tuple[float, float]],
-    *,
-    pad_id: int = PAD_ID,
-) -> float:
-    def _mean_centroid(tokens: torch.Tensor) -> tuple[float, float] | None:
-        located = _lookup_coordinates(tokens, centroids, pad_id)
-        if located is None or not located[1].any():
-            return None
-        gathered, valid = located
-        gathered = gathered.to(dtype=torch.float64)
-        mask_f = valid.to(dtype=torch.float64).unsqueeze(-1)
-        totals = (gathered * mask_f).sum(dim=(0, 1))
-        denom = mask_f.sum(dim=(0, 1)).clamp_min(1.0)
-        mean = totals / denom
-        return float(mean[0].item()), float(mean[1].item())
-
-    c_real = _mean_centroid(tokens_real)
-    c_gen = _mean_centroid(tokens_gen)
-    if c_real is None or c_gen is None:
-        return 0.0
-    return haversine_km(c_real[0], c_real[1], c_gen[0], c_gen[1])
 
 
 def per_sequence_travel_distance(
@@ -295,76 +253,6 @@ def per_sequence_radius_of_gyration(
     distances = torch.where(valid, distances, torch.zeros_like(distances))
     radius = torch.sqrt((distances * distances).sum(dim=1) / safe_counts)
     return torch.where(counts >= 2, radius, torch.zeros_like(radius))
-
-
-def _scalar_histogram_contributions(
-    real_values: torch.Tensor, generated_values: torch.Tensor
-) -> tuple[np.ndarray, np.ndarray]:
-    """One-hot distance-bin row per trajectory, for cluster bootstrapping."""
-    one_hot = np.eye(_DISTANCE_BINS, dtype=np.int32)
-    if real_values.numel() == 0:
-        return one_hot[:0], one_hot[:0]
-    real_bins, generated_bins = _distance_bins(real_values, generated_values)
-    return one_hot[real_bins.cpu().numpy()], one_hot[
-        generated_bins.cpu().numpy()
-    ]
-
-
-def _geohash_contributions(
-    tokens: torch.Tensor,
-    geohash_lookup: dict[int, str],
-    *,
-    pad_id: int,
-) -> np.ndarray:
-    table, lookup_valid, max_id, geohash_index = _cached_table(
-        _geohash_table, geohash_lookup
-    )
-    out = np.zeros((tokens.size(0), len(geohash_index)), dtype=np.int32)
-    if max_id < 0 or not geohash_index:
-        return out
-    safe, keep = _table_rows(tokens.cpu(), lookup_valid, max_id, pad_id)
-    rows = torch.arange(safe.size(0)).unsqueeze(1).expand_as(safe)
-    np.add.at(
-        out,
-        (rows[keep].numpy(), table[safe][keep].numpy()),
-        1,
-    )
-    return out
-
-
-def spatial_guardrail_uncertainty(
-    tokens_real: torch.Tensor,
-    tokens_gen: torch.Tensor,
-    placekey_latlon: dict[int, tuple[float, float]],
-    *,
-    geohash_lookup: dict[int, str] | None = None,
-    cluster_ids: Sequence[str] | None = None,
-    pad_id: int = PAD_ID,
-    compute_device: torch.device | str | None = None,
-) -> dict[str, Any]:
-    bootstrap = functools.partial(
-        cluster_histogram_jsd_bootstrap,
-        cluster_ids=cluster_ids,
-        compute_device=compute_device,
-    )
-    result = {
-        name: bootstrap(
-            *_scalar_histogram_contributions(
-                per_sequence(tokens_real, placekey_latlon, pad_id=pad_id),
-                per_sequence(tokens_gen, placekey_latlon, pad_id=pad_id),
-            )
-        )
-        for name, per_sequence in (
-            ("travel_distance_jsd", per_sequence_travel_distance),
-            ("radius_of_gyration_jsd", per_sequence_radius_of_gyration),
-        )
-    }
-    if geohash_lookup is not None:
-        result["geohash_spatial_jsd"] = bootstrap(
-            _geohash_contributions(tokens_real, geohash_lookup, pad_id=pad_id),
-            _geohash_contributions(tokens_gen, geohash_lookup, pad_id=pad_id),
-        )
-    return result
 
 
 def spatial_jsd(

@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import dataclasses
 import functools
 import pickle
-from collections import Counter, defaultdict
+from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import polars as pl
@@ -15,26 +13,6 @@ import polars as pl
 from semoflow.tokenization.token_space import sid_code_columns
 
 CodeKey = tuple[int, ...]
-
-
-@dataclass(frozen=True)
-class GroundingStats:
-    n_pois: int
-    n_keys: int
-    key_columns: list[str]
-    order_agnostic: bool
-
-    duplicate_poi_rate: float
-    ambiguous_key_rate: float
-    singleton_key_rate: float
-    mean_candidates_per_key: float
-    max_candidates_per_key: int
-
-    category_purity_mean: float | None
-    candidate_count_histogram: dict[int, int]
-
-    def to_dict(self) -> dict[str, Any]:
-        return dataclasses.asdict(self)
 
 
 def _row_key(
@@ -54,14 +32,6 @@ def pack_code_rows(rows: np.ndarray) -> np.ndarray:
     for column in range(rows.shape[1]):
         packed |= rows[:, column].astype(np.uint64) << (8 * column)
     return packed
-
-
-def _purity(values: Iterable[Any]) -> float | None:
-    vals = [v for v in values if v is not None]
-    if not vals:
-        return None
-    counts = Counter(vals)
-    return counts.most_common(1)[0][1] / len(vals)
 
 
 class SemanticIDGroundingIndex:
@@ -134,66 +104,16 @@ class SemanticIDGroundingIndex:
     def n_pois(self) -> int:
         return sum(len(payloads) for payloads in self._mapping.values())
 
-    def iter_payloads(self) -> Iterable[dict[str, Any]]:
-        for payloads in self._mapping.values():
-            yield from payloads
-
     def iter_key_payload_groups(
         self,
     ) -> Iterable[tuple[CodeKey, Sequence[Mapping[str, Any]]]]:
         yield from self._mapping.items()
 
-    def build_category_string_vocab(
-        self,
-        column: str = "top_category",
-        *,
-        fallback_columns: Sequence[str] = ("top_cat",),
-    ) -> dict[str, int]:
-        strings: set[str] = set()
-        candidates = [column, *fallback_columns]
-        for payload in self.iter_payloads():
-            for candidate in candidates:
-                val = payload.get(candidate)
-                if isinstance(val, str) and val:
-                    strings.add(val)
-                    break
-        return {s: i + 1 for i, s in enumerate(sorted(strings))}
-
-    def build_naics_string_vocab(
-        self,
-        *,
-        column: str = "naics_code",
-    ) -> dict[str, int]:
-        strings: set[str] = set()
-        for payload in self.iter_payloads():
-            val = payload.get(column)
-            if isinstance(val, str) and val:
-                strings.add(val)
-        return {s: i + 1 for i, s in enumerate(sorted(strings))}
-
-    def candidate_payloads(
-        self, code_values: Sequence[int] | Mapping[str, int]
-    ) -> list[dict[str, Any]]:
-        key = self._lookup_key(code_values)
-        return [dict(item) for item in self._mapping.get(key, [])]
-
     @functools.cached_property
     def _packed_lookup(
         self,
-    ) -> tuple[
-        np.ndarray,
-        np.ndarray,
-        list[dict[str, Any]],
-        list[list[dict[str, Any]]],
-    ]:
-        """Sorted packed keys with each key's candidate count and payloads."""
-        if not self._mapping:
-            return (
-                np.empty(0, dtype=np.uint64),
-                np.empty(0, dtype=np.int32),
-                [],
-                [],
-            )
+    ) -> tuple[np.ndarray, list[list[dict[str, Any]]]]:
+        """Sorted packed keys and each key's candidate payloads."""
         key_rows = np.asarray(list(self._mapping), dtype=np.int64)
         if np.any((key_rows < 0) | (key_rows > 255)):
             raise ValueError(
@@ -202,86 +122,15 @@ class SemanticIDGroundingIndex:
         packed = pack_code_rows(key_rows)
         order = np.argsort(packed, kind="mergesort")
         payload_rows = list(self._mapping.values())
-        groups = [payload_rows[int(index)] for index in order]
-        return (
-            packed[order],
-            np.asarray([len(group) for group in groups], dtype=np.int32),
-            [group[0] for group in groups],
-            groups,
-        )
+        return packed[order], [payload_rows[int(index)] for index in order]
 
-    def packed_lookup_table(
-        self,
-    ) -> tuple[np.ndarray, np.ndarray, list[dict[str, Any]]]:
-        keys, counts, first_payloads, _groups = self._packed_lookup
-        return keys, counts, first_payloads
+    def packed_lookup_table(self) -> tuple[np.ndarray, list[dict[str, Any]]]:
+        """Sorted packed keys and each key's first candidate payload."""
+        keys, groups = self._packed_lookup
+        return keys, [group[0] for group in groups]
 
     def packed_lookup_groups(self) -> list[list[dict[str, Any]]]:
-        return self._packed_lookup[3]
-
-    def _lookup_key(
-        self, code_values: Sequence[int] | Mapping[str, int]
-    ) -> CodeKey:
-        if isinstance(code_values, Mapping):
-            return _row_key(
-                cast(Mapping[str, Any], code_values),
-                self.key_columns,
-                order_agnostic=self.order_agnostic,
-            )
-        if self.order_agnostic:
-            return tuple(sorted(int(value) for value in code_values))
-        return tuple(int(v) for v in code_values)
-
-    def stats(self) -> GroundingStats:
-        candidate_counts = [
-            len(payloads) for payloads in self._mapping.values()
-        ]
-        hist = Counter(candidate_counts)
-        ambiguous = [n for n in candidate_counts if n > 1]
-
-        category_col = (
-            "top_category"
-            if "top_category" in self.payload_columns
-            else "top_cat"
-            if "top_cat" in self.payload_columns
-            else None
-        )
-        category_purities: list[float] = []
-        for payloads in self._mapping.values():
-            if category_col is not None:
-                cat_purity = _purity(p.get(category_col) for p in payloads)
-                if cat_purity is not None:
-                    category_purities.append(cat_purity)
-
-        n_pois = self.n_pois
-        n_keys = self.n_keys
-        return GroundingStats(
-            n_pois=n_pois,
-            n_keys=n_keys,
-            key_columns=list(self.key_columns),
-            order_agnostic=self.order_agnostic,
-            duplicate_poi_rate=1.0 - (n_keys / n_pois) if n_pois else 0.0,
-            ambiguous_key_rate=len(ambiguous) / n_keys if n_keys else 0.0,
-            singleton_key_rate=(
-                sum(1 for n in candidate_counts if n == 1) / n_keys
-                if n_keys
-                else 0.0
-            ),
-            mean_candidates_per_key=(
-                sum(candidate_counts) / n_keys if n_keys else 0.0
-            ),
-            max_candidates_per_key=max(candidate_counts)
-            if candidate_counts
-            else 0,
-            category_purity_mean=(
-                sum(category_purities) / len(category_purities)
-                if category_purities
-                else None
-            ),
-            candidate_count_histogram={
-                int(k): int(v) for k, v in hist.items()
-            },
-        )
+        return self._packed_lookup[1]
 
     def to_frame(self) -> pl.DataFrame:
         rows: list[dict[str, Any]] = []
@@ -306,4 +155,4 @@ class SemanticIDGroundingIndex:
         return obj
 
 
-__all__ = ["GroundingStats", "SemanticIDGroundingIndex", "pack_code_rows"]
+__all__ = ["SemanticIDGroundingIndex", "pack_code_rows"]

@@ -17,7 +17,7 @@ from semoflow.metrics.city_inputs import (
 from semoflow.metrics.grounding_candidate_prior import build_prior
 from semoflow.metrics.planner_realizer_composition import (
     evaluate_planner_realizer,
-    realizer_contract,
+    realizer_max_events,
 )
 from semoflow.planner.sampling_run import sample_occurrence_planner
 from semoflow.realizer.bank import build_bank
@@ -35,7 +35,7 @@ def evaluate_cities(
     training bank did.
     """
     tokenizer = TokenizerArtifacts.from_run_dir(settings.tokenization_dir)
-    max_events = realizer_contract(settings.realizer_checkpoint)["max_seq_len"]
+    max_events = realizer_max_events(settings.realizer_checkpoint)
     return {
         name: _evaluate_city(
             settings,
@@ -103,7 +103,6 @@ def _evaluate_city(
     report = evaluate_planner_realizer(
         realizer_checkpoint=settings.realizer_checkpoint,
         planner_samples=plans,
-        planner_checkpoint=settings.planner_checkpoint,
         bank=bank,
         codebooks=tokenizer.tokenizer_codebooks,
         lookup=output_dir / LOOKUP_NAME,
@@ -119,7 +118,6 @@ def _evaluate_city(
         candidate_selection=composition.candidate_selection,
         candidate_prior=prior,
         catalog_temperature=composition.catalog_temperature,
-        brief_metrics=composition.brief_metrics,
         catalog_noise_coupling=composition.catalog_noise_coupling,
     )
     return {"output": output, "samples": num_samples, **report["summary"]}

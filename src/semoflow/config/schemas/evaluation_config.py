@@ -26,8 +26,6 @@ class CompositionOptions:
     # None keeps the realizer's calibrated catalog temperature.
     catalog_temperature: float | None = None
     candidate_selection: str = "first"
-    # Score only the comparison metrics and POI coverage.
-    brief_metrics: bool = False
     # "trajectory_prefix" shares calibrated catalog sampling noise among a
     # trajectory's events with the same planned prefix; per-event marginals
     # are unchanged. "independent" keeps per-event draws.

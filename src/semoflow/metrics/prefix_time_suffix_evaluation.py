@@ -1,26 +1,23 @@
 from __future__ import annotations
 
-import itertools
 import json
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
 import polars as pl
 import torch
+import torch.nn.functional as F
 
 from semoflow.metrics.trajectory.elapsed_recurrence import (
     ReturnEvents,
     elapsed_recurrence_jsd,
 )
 from semoflow.metrics.trajectory.grounding import (
-    compute_decoded_sid_poi_metrics,
     ground_sid_tokens_to_poi_tokens,
-)
-from semoflow.metrics.trajectory.scoring import (
-    compute_trajectory_metrics,
-    summarize_mobility_metrics,
+    grounded_poi_metrics,
 )
 from semoflow.metrics.trajectory.temporal_spatial import (
     events_from_place_ids,
@@ -30,16 +27,14 @@ from semoflow.realizer.bank import (
     load_bank_payload,
     resolve_bank_split_window,
 )
-from semoflow.realizer.objective import normalize_tail
-from semoflow.realizer.time_tokens import N_PART_OF_DAY_BINS
-from semoflow.tokenization.decoding.codebooks import (
-    codes_to_embeddings_from_codebooks,
+from semoflow.realizer.time_tokens import (
+    N_PART_OF_DAY_BINS,
+    PART_OF_DAY_START_MINUTES,
 )
 from semoflow.tokenization.decoding.grounding_index import (
     SemanticIDGroundingIndex,
 )
 from semoflow.tokenization.token_space import (
-    REAL_TOKEN_OFFSET,
     apply_trajectory_valid_mask,
     sid_code_columns,
     to_token_fields,
@@ -81,34 +76,6 @@ def load_places(
     }
     vocab_size = int(frame["placekey_id"].to_numpy().max(initial=0)) + 1
     return coordinates, geohashes, vocab_size
-
-
-def coordinate_less_selection_metrics(
-    selected_placekey_ids: torch.Tensor,
-    valid: torch.BoolTensor,
-    coordinates: Mapping[int, tuple[float, float]],
-) -> dict[str, float | int]:
-    selected = selected_placekey_ids.long().reshape(-1).cpu().tolist()
-    available = torch.tensor(
-        [int(placekey_id) in coordinates for placekey_id in selected],
-        dtype=torch.bool,
-    ).view_as(valid)
-    active = valid.bool().cpu()
-    unavailable = active & ~available
-    events = int(active.sum().item())
-    unavailable_count = int(unavailable.sum().item())
-    effective_count = events - unavailable_count
-    return {
-        "events": events,
-        "effective_coordinate_selection_count": effective_count,
-        "effective_coordinate_selection_rate": float(
-            effective_count / max(events, 1)
-        ),
-        "coordinate_less_selection_count": unavailable_count,
-        "coordinate_less_selection_rate": float(
-            unavailable_count / max(events, 1)
-        ),
-    }
 
 
 def load_reference(
@@ -219,15 +186,6 @@ def aligned_reference_event_hours(
     return out
 
 
-def sampled_plan_event_hours(
-    path: Path, *, max_samples: int
-) -> torch.Tensor | None:
-    """The plan's continuous event hours, or ``None`` for a token-only plan."""
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    hours = payload.get("event_hours") if isinstance(payload, dict) else None
-    return None if hours is None else hours[:max_samples].double()
-
-
 def elapsed_recurrence_block(
     real_poi: torch.Tensor,
     real_valid: torch.Tensor,
@@ -269,148 +227,67 @@ def elapsed_recurrence_block(
     )
 
 
-def load_sampled_plan(
-    path: Path,
+@dataclass(frozen=True)
+class SampledPlan:
+    """Planner samples laid out on the realizer's event grid."""
+
+    prefix: torch.Tensor
+    time_tokens: torch.Tensor
+    valid: torch.Tensor
+    event_hours: torch.Tensor
+    city_id: torch.Tensor | None
+
+
+def plan_from_planner_samples(
+    samples: Mapping[str, Any],
     *,
-    max_samples: int,
-    expected_width: int,
+    width: int,
     prefix_depth: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.BoolTensor, dict[str, Any]]:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    prefix = payload["prefix_codes"].long()
-    times = payload["time_tokens"].long()
-    valid = payload["valid_mask"].bool()
-    if prefix.size(1) != expected_width:
+    max_rows: int,
+) -> SampledPlan:
+    """The leading ``max_rows`` planner samples as a realizer plan.
+
+    Continuous arrival minutes become the realizer's weekly time tokens
+    through its unequal circadian bins, and also give the continuous clock
+    (in hours) for elapsed-time recurrence. Off-plan positions get time
+    token ``-1`` and hour NaN.
+    """
+    prefix = samples["prefix_codes"][:max_rows].long()
+    lengths = samples["lengths"][:max_rows].long()
+    minutes = samples["event_time_minutes"][:max_rows].float()
+    if prefix.size(-1) != prefix_depth:
         raise ValueError(
-            f"sampled plan width {prefix.size(1)} does not match model width "
-            f"{expected_width}"
+            f"planner samples have prefix depth {prefix.size(-1)}; the "
+            f"realizer expects {prefix_depth}"
         )
-    if prefix.size(0) < max_samples:
-        raise ValueError("sampled plan artifact has too few rows")
-    protocol = payload.get("protocol")
-    if protocol.get("reference_row_alignment") is not False:
-        raise ValueError("sampled plan must declare unpaired evaluation")
-    return (
-        prefix[:max_samples],
-        times[:max_samples],
-        valid[:max_samples],
-        protocol,
-    )
-
-
-def dynamics(
-    codes: torch.Tensor,
-    valid: torch.BoolTensor,
-    grounding: SemanticIDGroundingIndex,
-) -> dict[str, float]:
-    repeat_masses: list[float] = []
-    adjacent_rates: list[float] = []
-    support = 0
-    widths: list[int] = []
-    for row in range(codes.size(0)):
-        sequence = [
-            tuple(int(value) for value in sid)
-            for sid in codes[row][valid[row]].tolist()
-        ]
-        if not sequence:
-            continue
-        repeat_masses.append(
-            float((len(sequence) - len(set(sequence))) / len(sequence))
+    if bool((lengths > width).any()):
+        raise ValueError(
+            "planner samples contain a trajectory longer than the "
+            f"realizer's {width} events"
         )
-        if len(sequence) > 1:
-            adjacent_rates.append(
-                float(
-                    sum(
-                        left == right
-                        for left, right in itertools.pairwise(sequence)
-                    )
-                    / (len(sequence) - 1)
-                )
-            )
-        for sid in sequence:
-            candidates = grounding.candidate_payloads(sid)
-            widths.append(len(candidates))
-            support += bool(candidates)
-    events = int(valid.sum().item())
-    return {
-        "events": events,
-        "catalog_support_rate": float(support / max(events, 1)),
-        "candidate_width_mean": float(np.mean(widths) if widths else 0.0),
-        "candidate_width_p50": float(
-            np.percentile(widths, 50) if widths else 0.0
-        ),
-        "full_sid_repeat_mass_mean": float(
-            np.mean(repeat_masses) if repeat_masses else 0.0
-        ),
-        "adjacent_full_sid_copy_rate_mean": float(
-            np.mean(adjacent_rates) if adjacent_rates else 0.0
-        ),
-    }
-
-
-def accuracy(
-    generated: torch.Tensor,
-    target: torch.Tensor,
-    valid: torch.BoolTensor,
-    prefix_depth: int,
-) -> dict[str, Any]:
-    suffix_equal = generated[..., prefix_depth:] == target[..., prefix_depth:]
-    events = int(valid.sum().item())
-    levels = (suffix_equal & valid[..., None]).sum(dim=(0, 1))
-    full = ((generated == target).all(dim=-1) & valid).sum()
-    return {
-        "suffix_level_accuracy": [
-            float(value / max(events, 1)) for value in levels
-        ],
-        "full_sid_accuracy": float(full / max(events, 1)),
-    }
-
-
-def compute_tail_error_metrics(
-    generated_tail: torch.Tensor,
-    target_codes: torch.Tensor,
-    valid: torch.BoolTensor,
-    codebooks: torch.Tensor,
-    tail_whitener: torch.Tensor,
-    *,
-    prefix_depth: int,
-) -> dict[str, float]:
-
-    device = generated_tail.device
-    valid = valid.to(device=device, dtype=torch.bool)
-    target_codes = target_codes.to(device=device, dtype=torch.long).clone()
-    target_codes[~valid] = 0
-    codebooks = codebooks.to(device=device).float()
-    target_tail = codes_to_embeddings_from_codebooks(
-        target_codes[..., prefix_depth:],
-        codebooks[prefix_depth:],
+    padding = width - prefix.size(1)
+    prefix = F.pad(prefix[:, :width], (0, 0, 0, max(padding, 0)))
+    minutes = F.pad(minutes[:, :width], (0, max(padding, 0)))
+    valid = torch.arange(width)[None, :] < lengths[:, None]
+    clamped = minutes.clamp(0.0, 10079.999)
+    part_of_day = torch.bucketize(
+        clamped % 1440.0,
+        torch.tensor(PART_OF_DAY_START_MINUTES[1:], dtype=clamped.dtype),
+        right=True,
     )
-    raw_error = generated_tail.float() - target_tail.float()
-    normalized_error = normalize_tail(
-        raw_error,
-        torch.zeros(raw_error.shape[-1], device=device),
-        tail_whitener.to(device=device).float(),
-    )
-    active_raw = raw_error[valid]
-    active_normalized = normalized_error[valid]
-    events = int(valid.sum().item())
-    if events == 0:
-        return {
-            "events": 0.0,
-            "tail_rmse": 0.0,
-            "tail_mae": 0.0,
-            "normalized_tail_rmse": 0.0,
-            "normalized_tail_mae": 0.0,
-        }
-    return {
-        "events": float(events),
-        "tail_rmse": float(active_raw.square().mean().sqrt().item()),
-        "tail_mae": float(active_raw.abs().mean().item()),
-        "normalized_tail_rmse": float(
-            active_normalized.square().mean().sqrt().item()
+    day = (clamped / 1440.0).long()
+    city = samples.get("city_ids")
+    return SampledPlan(
+        prefix=prefix,
+        time_tokens=(day * N_PART_OF_DAY_BINS + part_of_day).masked_fill(
+            ~valid, -1
         ),
-        "normalized_tail_mae": float(active_normalized.abs().mean().item()),
-    }
+        valid=valid,
+        event_hours=(minutes.double() / 60.0).masked_fill(
+            ~valid, float("nan")
+        ),
+        city_id=None if city is None else city[:max_rows].long(),
+    )
 
 
 CANDIDATE_PRIOR_FORMAT = "grounding_candidate_prior_v1"
@@ -444,16 +321,14 @@ def metric_block(
     placekey_vocab_size: int,
     real_time_tokens: torch.Tensor,
     generated_time_tokens: torch.Tensor,
+    real_event_hours: torch.Tensor | None,
+    generated_event_hours: torch.Tensor | None,
     reference_placekey_ids: torch.Tensor | None = None,
-    cluster_ids: list[str] | None = None,
     candidate_selection: str = "first",
     candidate_weights: Mapping[int, float] | None = None,
     compute_device: torch.device | str | None = None,
-    brief_metrics: bool = False,
-    real_event_hours: torch.Tensor | None = None,
-    generated_event_hours: torch.Tensor | None = None,
 ) -> dict[str, Any]:
-    """Compute the grounding-first metric block for one arm.
+    """Ground both arms' SIDs to POIs and compare them.
 
     ``real_time_tokens``/``generated_time_tokens`` are the 42 weekly time
     tokens aligned with the codes. They give the motif day keys and the joint
@@ -462,117 +337,65 @@ def metric_block(
     recurrence JSDs are scored, otherwise that section records why it is
     unavailable. Times are never derived from tokens.
     """
-    motif_day_keys_real = real_time_tokens // N_PART_OF_DAY_BINS
-    motif_day_keys_generated = generated_time_tokens // N_PART_OF_DAY_BINS
     fields = [f"sem_code_{level}" for level in range(real_codes.size(-1))]
-    real_tokens = apply_trajectory_valid_mask(
-        to_token_fields(real_codes, fields), real_valid
-    )
-    generated_tokens = apply_trajectory_valid_mask(
-        to_token_fields(generated_codes, fields), generated_valid
-    )
-    category_string_vocab = grounding.build_category_string_vocab()
-    naics_string_vocab = grounding.build_naics_string_vocab()
-    real_poi, real_stats = ground_sid_tokens_to_poi_tokens(
-        real_tokens,
+    real_poi = ground_sid_tokens_to_poi_tokens(
+        apply_trajectory_valid_mask(
+            to_token_fields(real_codes, fields), real_valid
+        ),
         grounding,
-        category_string_vocab=category_string_vocab,
-        naics_string_vocab=naics_string_vocab,
         preferred_placekey_ids=reference_placekey_ids,
     )
-    generated_poi, generated_stats = ground_sid_tokens_to_poi_tokens(
-        generated_tokens,
+    generated_poi = ground_sid_tokens_to_poi_tokens(
+        apply_trajectory_valid_mask(
+            to_token_fields(generated_codes, fields), generated_valid
+        ),
         grounding,
-        category_string_vocab=category_string_vocab,
-        naics_string_vocab=naics_string_vocab,
         candidate_selection=candidate_selection,
         candidate_weights=candidate_weights,
     )
-    max_code = int(
-        max(
-            real_codes.max().item() if real_codes.numel() else 0,
-            generated_codes.max().item() if generated_codes.numel() else 0,
-        )
-    )
-    field_vocab = {field: max_code + REAL_TOKEN_OFFSET + 1 for field in fields}
-    sid_metrics = (
-        None
-        if brief_metrics
-        else compute_trajectory_metrics(
-            real_tokens,
-            generated_tokens,
-            field_vocab,
-            motif_day_keys_real=motif_day_keys_real,
-            motif_day_keys_gen=motif_day_keys_generated,
-            compute_device=compute_device,
-        )
-    )
-    grounded = compute_decoded_sid_poi_metrics(
+    metrics: dict[str, Any] = grounded_poi_metrics(
         real_poi,
         generated_poi,
-        real_stats=real_stats,
-        gen_stats=generated_stats,
-        placekey_latlon=coordinates,
-        geohash_lookup=geohashes,
         placekey_vocab_size=placekey_vocab_size,
-        category_vocab_size=len(category_string_vocab) + 1,
-        cluster_ids=cluster_ids,
-        motif_day_keys_real=motif_day_keys_real,
-        motif_day_keys_gen=motif_day_keys_generated,
+        coordinates=coordinates,
+        geohashes=geohashes,
+        day_keys_real=real_time_tokens // N_PART_OF_DAY_BINS,
+        day_keys_generated=generated_time_tokens // N_PART_OF_DAY_BINS,
         compute_device=compute_device,
-        brief_metrics=brief_metrics,
     )
-    grounded["temporal_spatial"] = temporal_spatial_jsd(
-        events_from_place_ids(
-            real_poi["placekey_id"].cpu().numpy(),
-            real_time_tokens.cpu().numpy(),
-            real_valid.cpu().numpy(),
-            coordinates=coordinates,
-            geohashes=geohashes,
-        ),
-        events_from_place_ids(
-            generated_poi["placekey_id"].cpu().numpy(),
-            generated_time_tokens.cpu().numpy(),
-            generated_valid.cpu().numpy(),
-            coordinates=coordinates,
-            geohashes=geohashes,
-        ),
+    metrics["temporal_spatial"] = temporal_spatial_jsd(
+        *(
+            events_from_place_ids(
+                poi.cpu().numpy(),
+                times.cpu().numpy(),
+                valid.cpu().numpy(),
+                coordinates=coordinates,
+                geohashes=geohashes,
+            )
+            for poi, times, valid in (
+                (real_poi, real_time_tokens, real_valid),
+                (generated_poi, generated_time_tokens, generated_valid),
+            )
+        )
     )
-    grounded["elapsed_recurrence"] = elapsed_recurrence_block(
-        real_poi["placekey_id"],
+    metrics["elapsed_recurrence"] = elapsed_recurrence_block(
+        real_poi,
         real_valid,
         real_event_hours,
-        generated_poi["placekey_id"],
+        generated_poi,
         generated_valid,
         generated_event_hours,
     )
-    result: dict[str, Any] = {"decoded_poi_metrics": grounded}
-    if sid_metrics is not None:
-        result.update(
-            {
-                "sid_code_metrics": sid_metrics.to_dict(),
-                "sid_code_summary": summarize_mobility_metrics(sid_metrics),
-                "coordinate_guard": coordinate_less_selection_metrics(
-                    generated_poi["placekey_id"],
-                    generated_valid,
-                    coordinates,
-                ),
-            }
-        )
-    return result
+    return metrics
 
 
 __all__ = [
-    "accuracy",
+    "SampledPlan",
     "aligned_reference_event_hours",
-    "compute_tail_error_metrics",
-    "coordinate_less_selection_metrics",
-    "dynamics",
     "elapsed_recurrence_block",
     "load_lookup",
     "load_places",
     "load_reference",
-    "load_sampled_plan",
     "metric_block",
-    "sampled_plan_event_hours",
+    "plan_from_planner_samples",
 ]

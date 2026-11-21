@@ -187,10 +187,7 @@ def eval_compose_cmd(
         Path,
         typer.Option(
             "--planner-samples",
-            help=(
-                "Occurrence planner samples or a sampled_prefix_time_plan "
-                "artifact."
-            ),
+            help="Occurrence planner samples from sample-plans.",
         ),
     ],
     bank: Annotated[
@@ -220,16 +217,6 @@ def eval_compose_cmd(
         Path,
         typer.Option("--output", help="Composition evaluation JSON path."),
     ],
-    planner_checkpoint: Annotated[
-        Path | None,
-        typer.Option(
-            "--planner-checkpoint",
-            help=(
-                "Optional occurrence planner checkpoint. When supplied, the "
-                "saved sample hash and planner dimensions are verified."
-            ),
-        ),
-    ] = None,
     max_samples: Annotated[
         int,
         typer.Option("--max-samples", help="Maximum trajectories per arm."),
@@ -278,16 +265,6 @@ def eval_compose_cmd(
             help="Override the calibrated catalog decoder temperature.",
         ),
     ] = None,
-    brief_metrics: Annotated[
-        bool,
-        typer.Option(
-            "--brief-metrics",
-            help=(
-                "Compute only the ten comparison metrics and POI coverage; "
-                "skip detailed diagnostics and bootstrap intervals."
-            ),
-        ),
-    ] = False,
     catalog_noise_coupling: Annotated[
         Literal["independent", "trajectory_prefix"],
         typer.Option(
@@ -310,7 +287,6 @@ def eval_compose_cmd(
         report = evaluate_planner_realizer(
             realizer_checkpoint=realizer_checkpoint,
             planner_samples=planner_samples,
-            planner_checkpoint=planner_checkpoint,
             bank=bank,
             codebooks=codebooks,
             lookup=lookup,
@@ -326,7 +302,6 @@ def eval_compose_cmd(
             candidate_selection=candidate_selection,
             candidate_prior=candidate_prior,
             catalog_temperature=catalog_temperature,
-            brief_metrics=brief_metrics,
             catalog_noise_coupling=catalog_noise_coupling,
         )
 

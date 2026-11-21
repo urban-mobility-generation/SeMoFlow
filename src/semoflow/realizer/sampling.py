@@ -15,7 +15,6 @@ from semoflow.realizer.model import (
     PrefixTimeSuffixLatentFlowRealizer,
 )
 from semoflow.realizer.objective import (
-    denormalize_tail,
     normalize_tail,
     suffix_tail_level_embeddings,
 )
@@ -310,8 +309,6 @@ class PrefixTailCatalog:
 @dataclass(frozen=True, slots=True)
 class PrefixTimeSuffixLatentFlowSample:
     full_sids: torch.LongTensor
-    tail_embeddings: torch.Tensor
-    valid_mask: torch.BoolTensor
     city_constrained_events: int = 0
     city_constraint_fallback_events: int = 0
 
@@ -594,7 +591,6 @@ def sample_prefix_time_suffix_latent_flow(
     catalog: PrefixTailCatalog,
     tail_mean: torch.Tensor,
     tail_whitener: torch.Tensor,
-    tail_dewhitener: torch.Tensor,
     num_steps: int = 32,
     solver: str = "heun",
     device: torch.device | str | None = None,
@@ -615,7 +611,6 @@ def sample_prefix_time_suffix_latent_flow(
     valid = valid_mask.to(resolved_device, dtype=torch.bool)
     mean = tail_mean.to(resolved_device).float()
     tail_whitener = tail_whitener.to(resolved_device).float()
-    tail_dewhitener = tail_dewhitener.to(resolved_device).float()
     catalog = catalog.to(resolved_device)
 
     if generator is None:
@@ -645,9 +640,6 @@ def sample_prefix_time_suffix_latent_flow(
         solver=solver,
         city_id=city_id,
     )
-    tail = denormalize_tail(normalized, mean, tail_dewhitener).masked_fill(
-        ~valid[..., None], 0.0
-    )
     decode_stats: dict[str, int] = {}
     full_sids = _decode_calibrated_catalog(
         model,
@@ -667,8 +659,6 @@ def sample_prefix_time_suffix_latent_flow(
     )
     return PrefixTimeSuffixLatentFlowSample(
         full_sids=full_sids,
-        tail_embeddings=tail,
-        valid_mask=valid,
         city_constrained_events=decode_stats.get("city_constrained_events", 0),
         city_constraint_fallback_events=decode_stats.get(
             "city_constraint_fallback_events", 0

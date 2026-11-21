@@ -13,17 +13,13 @@ import polars as pl
 import torch
 
 from semoflow.metrics.prefix_time_suffix_evaluation import (
-    accuracy,
     aligned_reference_event_hours,
-    compute_tail_error_metrics,
-    dynamics,
     load_candidate_prior,
     load_lookup,
     load_places,
     load_reference,
-    load_sampled_plan,
     metric_block,
-    sampled_plan_event_hours,
+    plan_from_planner_samples,
 )
 from semoflow.realizer.bank import (
     bank_split_city_ids,
@@ -50,7 +46,6 @@ from semoflow.tokenization.decoding.codebooks import (
 from semoflow.tokenization.decoding.grounding_index import (
     SemanticIDGroundingIndex,
 )
-from semoflow.utils.serialization import normalize_mapping, write_json
 
 LOGGER = logging.getLogger(__name__)
 
@@ -159,22 +154,6 @@ def _catalog_supported_events(
     return valid_mask.bool().cpu() & supported
 
 
-def _sampled_plan_city_ids(
-    sampled_plan_path: Path, expected_rows: int
-) -> torch.Tensor:
-    payload = torch.load(
-        sampled_plan_path, map_location="cpu", weights_only=False
-    )
-    city = payload.get("city_id")
-    if city is None:
-        raise ValueError(
-            f"{sampled_plan_path} carries no city_id; a city-conditioned "
-            "checkpoint cannot be evaluated on it"
-        )
-    city = torch.as_tensor(city).long()
-    return city[:expected_rows]
-
-
 def _sample(
     model: PrefixTimeSuffixLatentFlowRealizer,
     prefix: torch.Tensor,
@@ -184,7 +163,6 @@ def _sample(
     catalog: PrefixTailCatalog,
     tail_mean: torch.Tensor,
     tail_whitener: torch.Tensor,
-    tail_dewhitener: torch.Tensor,
     catalog_prior_weight: float,
     catalog_temperature: float,
     batch_size: int,
@@ -218,7 +196,6 @@ def _sample(
         catalog=catalog,
         tail_mean=tail_mean,
         tail_whitener=tail_whitener,
-        tail_dewhitener=tail_dewhitener,
         catalog_prior_weight=catalog_prior_weight,
         catalog_temperature=catalog_temperature,
         num_steps=num_steps,
@@ -230,16 +207,8 @@ def _sample(
         catalog_noise_coupling=catalog_noise_coupling,
     )
     sampled_full_sids = sampled.full_sids.cpu()
-    sampled_tail_embeddings = sampled.tail_embeddings.cpu()
-    if empty_rows.any():
-        sampled_full_sids[empty_rows] = 0
-        sampled_tail_embeddings[empty_rows] = 0
-    sampled_cpu = dataclasses.replace(
-        sampled,
-        full_sids=sampled_full_sids,
-        tail_embeddings=sampled_tail_embeddings,
-        valid_mask=input_valid,
-    )
+    sampled_full_sids[empty_rows] = 0
+    sampled_cpu = dataclasses.replace(sampled, full_sids=sampled_full_sids)
     if device.type == "cuda":
         LOGGER.info(
             "latent-flow arm peak CUDA memory allocated=%.2f GiB reserved=%.2f GiB",
@@ -284,7 +253,6 @@ def _catalog_support(arms: Sequence[_Arm]) -> dict[str, int]:
 class _Decoding:
     tail_mean: torch.Tensor
     tail_whitener: torch.Tensor
-    tail_dewhitener: torch.Tensor
     prior_weight: float
     checkpoint_temperature: float
     temperature: float
@@ -319,7 +287,6 @@ def _decoding_settings(
     return _Decoding(
         tail_mean=_on_device("tail_mean"),
         tail_whitener=_on_device("tail_whitener"),
-        tail_dewhitener=_on_device("tail_dewhitener"),
         prior_weight=float(config.get("catalog_prior_weight", 0.25)),
         checkpoint_temperature=checkpoint_temperature,
         temperature=temperature,
@@ -392,8 +359,8 @@ def _conditioning_arms(
     *,
     real: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     sampled: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    sampled_city: torch.Tensor | None,
     bank_path: Path,
-    sampled_plan_path: Path,
     reference_split: str,
 ) -> tuple[_Arm, _Arm]:
     """Gold reference prefixes and sampled plans, with their conditioning.
@@ -403,17 +370,19 @@ def _conditioning_arms(
     real_codes, real_times, real_valid = real
     sampled_prefix, sampled_times, sampled_valid = sampled
     gold_prefix = real_codes[..., : model.prefix_depth]
-    gold_city = sampled_city = None
+    gold_city = None
     if model.city_vocab > 0:
+        if sampled_city is None:
+            raise ValueError(
+                "planner samples carry no city_ids; a city-conditioned "
+                "realizer cannot be evaluated on them"
+            )
         gold_city = bank_split_city_ids(
             payload,
             bank_path,
             split=reference_split,
             valid_mask=real_valid,
             time_tokens=real_times,
-        )
-        sampled_city = _sampled_plan_city_ids(
-            sampled_plan_path, sampled_prefix.shape[0]
         )
     gold = _Arm(
         name="gold_prefix",
@@ -456,45 +425,11 @@ def _city_constraint_report(
     return report
 
 
-def _gold_reconstruction_metrics(
-    sample: PrefixTimeSuffixLatentFlowSample,
-    real_codes: torch.Tensor,
-    supported: torch.Tensor,
-    *,
-    model: PrefixTimeSuffixLatentFlowRealizer,
-    codebooks: torch.Tensor,
-    tail_whitener: torch.Tensor,
-) -> dict[str, Any]:
-    """Suffix accuracy and continuous tail error against the gold POIs."""
-    suffix_accuracy = accuracy(
-        sample.full_sids.cpu(), real_codes, supported, model.prefix_depth
-    )
-    tail_error = compute_tail_error_metrics(
-        sample.tail_embeddings,
-        real_codes,
-        supported,
-        codebooks,
-        tail_whitener,
-        prefix_depth=model.prefix_depth,
-    )
-    return {"accuracy": suffix_accuracy, "tail_error": tail_error}
-
-
-_LIMITATIONS = (
-    "sampled_plan is unpaired with the validation reference; exact target-POI accuracy is not applicable",
-    "tail_error and suffix accuracy are reported only for the row-aligned gold-prefix condition",
-    "the model receives fixed planner lengths and does not generate an EOS or length distribution",
-    "the catalog decoder uses only catalog SIDs whose prefix exactly matches the input prefix",
-    "generated ambiguous SIDs use the grounding index canonical first-candidate policy; this is not a learned POI disambiguator",
-    "prefix events without a legal catalog continuation are excluded from generated events and counted in generation_catalog_support",
-)
-
-
 def evaluate(
     *,
     checkpoint_path: Path,
     bank_path: Path,
-    sampled_plan_path: Path,
+    planner_samples: Mapping[str, Any],
     codebooks_path: Path,
     lookup_path: Path,
     grounding_path: Path,
@@ -509,7 +444,6 @@ def evaluate(
     candidate_selection: str = "first",
     candidate_prior_path: Path | None = None,
     catalog_temperature_override: float | None = None,
-    brief_metrics: bool = False,
     catalog_noise_coupling: str = "independent",
 ) -> dict[str, Any]:
     _check_options(
@@ -539,28 +473,21 @@ def evaluate(
         split=reference_split,
         payload=payload,
     )
-    sampled_prefix, sampled_times, sampled_valid, sampled_protocol = (
-        load_sampled_plan(
-            sampled_plan_path,
-            max_samples=max_samples,
-            expected_width=model.max_seq_len,
-            prefix_depth=model.prefix_depth,
-        )
+    plan = plan_from_planner_samples(
+        planner_samples,
+        width=model.max_seq_len,
+        prefix_depth=model.prefix_depth,
+        max_rows=max_samples,
     )
-    n_rows = min(real_codes.size(0), sampled_prefix.size(0))
+    n_rows = min(real_codes.size(0), plan.prefix.size(0))
     real_codes = real_codes[:n_rows]
     real_times = real_times[:n_rows]
     real_valid = real_valid[:n_rows]
     real_placekey_ids = real_placekey_ids[:n_rows]
-    sampled_prefix = sampled_prefix[:n_rows]
-    sampled_times = sampled_times[:n_rows]
-    sampled_valid = sampled_valid[:n_rows]
     real_hours = aligned_reference_event_hours(
         payload, split=reference_split, valid_mask=real_valid
     )
-    sampled_hours = sampled_plan_event_hours(
-        sampled_plan_path, max_samples=n_rows
-    )
+    sampled_hours = plan.event_hours[:n_rows]
     catalog, bundle = _generation_catalog(
         model,
         payload,
@@ -578,9 +505,13 @@ def evaluate(
         catalog,
         payload,
         real=(real_codes, real_times, real_valid),
-        sampled=(sampled_prefix, sampled_times, sampled_valid),
+        sampled=(
+            plan.prefix[:n_rows],
+            plan.time_tokens[:n_rows],
+            plan.valid[:n_rows],
+        ),
+        sampled_city=None if plan.city_id is None else plan.city_id[:n_rows],
         bank_path=bank_path,
-        sampled_plan_path=sampled_plan_path,
         reference_split=reference_split,
     )
     arms = (gold, planned)
@@ -591,7 +522,6 @@ def evaluate(
         catalog=catalog,
         tail_mean=decoding.tail_mean,
         tail_whitener=decoding.tail_whitener,
-        tail_dewhitener=decoding.tail_dewhitener,
         catalog_prior_weight=decoding.prior_weight,
         catalog_temperature=decoding.temperature,
         batch_size=batch_size,
@@ -637,7 +567,6 @@ def evaluate(
         candidate_selection=candidate_selection,
         candidate_weights=candidate_weights,
         compute_device=resolved_device,
-        brief_metrics=brief_metrics,
     )
     evaluations: dict[str, dict[str, Any]] = {}
     for arm in arms:
@@ -662,36 +591,11 @@ def evaluate(
             label,
             time.perf_counter() - started_at,
         )
-    if not brief_metrics:
-        evaluations[gold.name].update(
-            _gold_reconstruction_metrics(
-                samples[gold.name],
-                real_codes,
-                gold.supported,
-                model=model,
-                codebooks=bundle.codebooks,
-                tail_whitener=decoding.tail_whitener,
-            )
-        )
-        evaluations[planned.name].update(accuracy=None, tail_error=None)
-        for arm in arms:
-            evaluations[arm.name]["sampling_dynamics"] = {
-                **dynamics(
-                    samples[arm.name].full_sids.cpu(),
-                    arm.supported,
-                    grounding,
-                ),
-                "catalog_validity_rate": float(
-                    arm.supported.sum().item()
-                    / max(int(arm.input_valid.sum().item()), 1)
-                ),
-            }
 
     result: dict[str, Any] = {
         "model_type": MODEL_TYPE,
         "checkpoint": str(checkpoint_path),
         "reference_bank": str(bank_path),
-        "sampled_plan": str(sampled_plan_path),
         "codebooks": str(codebooks_path),
         "codebook_metadata": codebook_bundle_metadata(bundle),
         "lookup": str(lookup_path),
@@ -712,7 +616,6 @@ def evaluate(
         },
         "metric_protocol": {
             "undefined_metric_value": None,
-            "brief_metrics": brief_metrics,
             "ground_before_poi_metrics": True,
             "reference_poi_source": (
                 f"aligned_{reference_split}_segment_placekey_ids"
@@ -722,15 +625,9 @@ def evaluate(
                 if candidate_selection == "first"
                 else f"train_prior_candidate_policy:{candidate_selection}"
             ),
-            "sid_code_metrics_are_secondary_diagnostics": True,
-            "gold_prefix_tail_error": "continuous_tail_embedding_before_catalog_decode",
         },
-        "sampled_plan_protocol": sampled_protocol,
         "evaluations": evaluations,
-        "limitations": list(_LIMITATIONS),
     }
-    result = normalize_mapping(result)
-    write_json(output_path, result)
     return result
 
 

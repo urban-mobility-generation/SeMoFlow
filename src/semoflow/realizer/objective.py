@@ -300,17 +300,6 @@ def normalize_tail(
     return torch.matmul(tail - tail_mean, tail_whitener.transpose(-1, -2))
 
 
-def denormalize_tail(
-    normalized_tail: torch.Tensor,
-    tail_mean: torch.Tensor,
-    tail_dewhitener: torch.Tensor,
-) -> torch.Tensor:
-    return (
-        torch.matmul(normalized_tail, tail_dewhitener.transpose(-1, -2))
-        + tail_mean
-    )
-
-
 def compute_tail_whitening_stats(
     clean_codes: torch.Tensor,
     valid_mask: torch.BoolTensor,
@@ -619,7 +608,6 @@ def prefix_time_suffix_latent_flow_loss(
 __all__ = [
     "CatalogCandidateBank",
     "compute_tail_whitening_stats",
-    "denormalize_tail",
     "normalize_tail",
     "prefix_time_suffix_latent_flow_loss",
     "suffix_tail_embeddings",
