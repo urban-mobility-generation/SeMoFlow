@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ResidualVQ", "sinkhorn_assign"]
+__all__ = ["ResidualVQ"]
 
 
 @torch.no_grad()
@@ -137,14 +137,13 @@ class ResidualVQ(nn.Module):
 
     def forward(
         self, z: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not self._initialized:
             self._init_from_data(z)
 
         residual = z
         q_sum = torch.zeros_like(z)
         code_list: list[torch.Tensor] = []
-        quantized_per_cb: list[torch.Tensor] = []
         commit_loss = z.new_tensor(0.0)
 
         for i, cb in enumerate(self.codebooks):
@@ -164,7 +163,6 @@ class ResidualVQ(nn.Module):
 
             q = cb[idx]
             code_list.append(idx)
-            quantized_per_cb.append(q)
             q_sum = q_sum + q
             commit_loss = commit_loss + F.mse_loss(residual, q.detach())
 
@@ -190,4 +188,4 @@ class ResidualVQ(nn.Module):
             residual = residual - q.detach()
 
         q_st = z + (q_sum - z).detach()
-        return q_st, torch.stack(code_list, 1), commit_loss, quantized_per_cb
+        return q_st, torch.stack(code_list, 1), commit_loss

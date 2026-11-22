@@ -4,11 +4,11 @@ import logging
 import time
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 
-from semoflow.utils.serialization import normalize_mapping, write_json
+from semoflow.utils.serialization import normalize_value, write_json
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +124,7 @@ def evaluate_planner_realizer(
     result["summary"] = {
         arm: summary(metrics) for arm, metrics in result["evaluations"].items()
     }
-    result = normalize_mapping(result)
+    result = cast(dict[str, Any], normalize_value(result))
     write_json(output, result)
     logger.info(
         "planner+realizer evaluation complete output=%s elapsed_seconds=%.1f",

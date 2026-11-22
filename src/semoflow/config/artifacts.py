@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from semoflow.utils.serialization import write_json_atomic
+from semoflow.utils.serialization import write_json
 
 
 @dataclass(frozen=True)
@@ -29,56 +28,28 @@ class TokenizerArtifacts:
         )
 
     @property
-    def config_yaml(self) -> Path:
-        return self.run_dir / "config.yaml"
-
-    @property
     def completion_marker(self) -> Path:
         return self.run_dir / "completion.json"
 
-    def is_complete(self) -> bool:
-        if not self.completion_marker.exists():
-            return False
-        try:
-            payload = json.loads(
-                self.completion_marker.read_text(encoding="utf-8")
-            )
-        except (OSError, ValueError):
-            return False
-        if payload.get("status") != "complete":
-            return False
-        required = payload.get("required", {})
-        if not isinstance(required, dict) or not required:
-            return False
-        known = self.export_paths()
-        return all(
-            name in known and known[name] == Path(path) and Path(path).exists()
-            for name, path in required.items()
+    def outputs(self) -> tuple[Path, ...]:
+        return (
+            self.augmented_processed_visits,
+            self.placekey_lookup,
+            self.tokenizer_model,
+            self.tokenizer_codebooks,
+            self.grounding_index,
         )
 
-    def write_completion(
-        self,
-        *,
-        status: str,
-        required: tuple[str, ...],
-    ) -> None:
-        payload = {
-            "schema_version": 1,
-            "status": status,
-            "required": {
-                name: str(self.export_paths()[name]) for name in required
-            },
-        }
-        write_json_atomic(self.completion_marker, payload)
+    def mark_complete(self) -> None:
+        missing = [str(path) for path in self.outputs() if not path.exists()]
+        if missing:
+            raise RuntimeError(f"tokenizer outputs missing: {missing}")
+        write_json(self.completion_marker, {"status": "complete"})
 
-    def export_paths(self) -> dict[str, Path]:
-        return {
-            "augmented_processed_visits": self.augmented_processed_visits,
-            "placekey_lookup": self.placekey_lookup,
-            "tokenizer_model": self.tokenizer_model,
-            "tokenizer_codebooks": self.tokenizer_codebooks,
-            "grounding_index": self.grounding_index,
-        }
+    def is_complete(self) -> bool:
+        return self.completion_marker.exists() and all(
+            path.exists() for path in self.outputs()
+        )
 
 
 @dataclass(frozen=True)

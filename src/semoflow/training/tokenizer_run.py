@@ -6,18 +6,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import polars as pl
 import torch
 from torch.utils.data import DataLoader
 
 from semoflow.config import ExperimentConfig
 from semoflow.tokenization.features import (
-    GRAPH_PREFIX,
     build_features,
     feature_columns,
     frame_to_numpy,
-    graph_feature_frame,
     scale_feature_blocks,
 )
 from semoflow.tokenization.rqvae import (
@@ -40,7 +37,6 @@ class PreparedFeatures:
     feature_mean: torch.Tensor
     feature_std: torch.Tensor
     feature_preprocessing: dict[str, Any]
-    graph_dim: int | None
     poi_features: pl.DataFrame
     places_index: pl.DataFrame
     stays: pl.DataFrame
@@ -51,12 +47,10 @@ def prepare_features(cfg: ExperimentConfig) -> PreparedFeatures:
     layout = cfg.layout
     places_index = pl.read_parquet(layout.preprocessing.places_index)
     stays = pl.read_parquet(layout.preprocessing.processed_visits)
-    graph_dir = layout.graph_dir
     poi_features, pca_state = build_features(
         places_index=places_index,
-        source=tcfg.input_embedding_source,
         text_embeddings_path=layout.text_embeddings,
-        graphsage_artifact_dir=graph_dir,
+        graph_dir=layout.graph_dir,
         pca_text_dim=tcfg.pca_text_dim,
         pca_graph_dim=tcfg.pca_graph_dim,
         geo_relative_dim=tcfg.geo_relative_dim,
@@ -73,55 +67,23 @@ def prepare_features(cfg: ExperimentConfig) -> PreparedFeatures:
         text_graph_scale=tcfg.text_graph_scale,
         geo_scale=tcfg.geo_scale,
     )
-    tensors = {"x": x_norm}
-
-    graph_dim = None
-    if tcfg.lambda_graph > 0 or tcfg.lambda_prefix_graph > 0:
-        graph_targets = _graph_targets(poi_features, places_index, graph_dir)
-        tensors["graph_target"] = torch.from_numpy(graph_targets)
-        graph_dim = int(graph_targets.shape[1])
-
     return PreparedFeatures(
-        tensors=tensors,
+        tensors={"x": x_norm},
         feature_cols=feature_cols,
         feature_mean=x_mean,
         feature_std=x_std,
         feature_preprocessing={"pca": pca_state},
-        graph_dim=graph_dim,
         poi_features=poi_features,
         places_index=places_index,
         stays=stays,
     )
 
 
-def _graph_targets(
-    poi_features: pl.DataFrame,
-    places_index: pl.DataFrame,
-    artifact_dir: Path,
-) -> np.ndarray:
-    graph = graph_feature_frame(places_index, artifact_dir)
-    graph_cols = [c for c in graph.columns if c.startswith(GRAPH_PREFIX)]
-    aligned = poi_features.select("placekey_id").join(
-        graph.select("placekey_id", *graph_cols),
-        on="placekey_id",
-        how="left",
-        maintain_order="left",
-    )
-    return frame_to_numpy(aligned, graph_cols)
-
-
 def fit_tokenizer(
-    cfg: ExperimentConfig,
-    prepared: PreparedFeatures,
-    *,
-    checkpoints_dir: Path,
+    cfg: ExperimentConfig, prepared: PreparedFeatures
 ) -> tuple[RQVAE, list[dict[str, float]]]:
     tcfg = cfg.tokenizer
-    model = build_tokenizer_model(
-        tcfg,
-        input_dim=len(prepared.feature_cols),
-        graph_dim=prepared.graph_dim,
-    )
+    model = build_tokenizer_model(tcfg, input_dim=len(prepared.feature_cols))
     generator = torch.Generator()
     generator.manual_seed(tcfg.seed)
     device = torch.device(tcfg.device)
@@ -143,8 +105,6 @@ def fit_tokenizer(
         epochs=tcfg.epochs,
         lr=tcfg.lr,
         device=tcfg.device,
-        mixed_precision=tcfg.mixed_precision,
-        checkpoint_dir=checkpoints_dir,
     )
     return model, history
 
@@ -154,12 +114,9 @@ def run_semantic_id_tokenizer(cfg: ExperimentConfig) -> Path | None:
     arts = cfg.layout.tokenizer
     if arts.augmented_processed_visits.exists():
         logger.info("replacing existing tokenizer outputs: %s", arts.run_dir)
-    cfg.save_yaml(arts.config_yaml)
     logger.info("building semantic IDs  run_dir=%s", arts.run_dir)
     prepared = prepare_features(cfg)
-    model, history = fit_tokenizer(
-        cfg, prepared, checkpoints_dir=arts.run_dir / "checkpoints"
-    )
+    model, history = fit_tokenizer(cfg, prepared)
     return publish_tokenizer_artifacts(
         cfg, arts, model=model, prepared=prepared, history=history
     )

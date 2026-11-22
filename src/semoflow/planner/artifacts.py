@@ -7,8 +7,8 @@ from typing import Any
 
 import torch
 
-from semoflow.config.schemas.planner_config import (
-    OccurrencePlannerTrainingOptions,
+from semoflow.config.schema import (
+    PlannerTrainingConfig,
 )
 from semoflow.planner.config import OccurrencePlannerConfig
 from semoflow.planner.model import OccurrenceARPlanner
@@ -127,7 +127,7 @@ def save_occurrence_planner_checkpoint(
     epoch: int,
     validation_metric: float,
     seed: int,
-    options: OccurrencePlannerTrainingOptions,
+    options: PlannerTrainingConfig,
     legal_prefix_centroids: torch.Tensor | None = None,
     legal_prefix_centroid_available: torch.Tensor | None = None,
     force: bool = False,

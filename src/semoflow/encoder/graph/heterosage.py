@@ -46,7 +46,7 @@ class HeteroSAGE(nn.Module):
             self.convs.append(
                 HeteroConv(
                     {
-                        edge_type: SAGEConv(  # ty: ignore[call-non-callable]
+                        edge_type: SAGEConv(
                             (hidden_dim, hidden_dim), out_channels
                         )
                         for edge_type in metadata[1]

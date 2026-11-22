@@ -12,7 +12,6 @@ from semoflow.encoder.artifacts import load_poi_embedding_artifact
 
 logger = logging.getLogger(__name__)
 
-INPUT_SOURCES = ("pca_text", "pca_concat")
 TEXT_PREFIX = "text_emb_"
 GRAPH_PREFIX = "graph_emb_"
 PCA_TEXT_PREFIX = "pca_text_"
@@ -87,7 +86,7 @@ def graph_feature_frame(
     return _with_block(_identity_frame(places_index), GRAPH_PREFIX, embeddings)
 
 
-def _pca_fit(
+def _pca(
     frame: pl.DataFrame, src_prefix: str, dst_prefix: str, n_components: int
 ) -> tuple[pl.DataFrame, dict[str, Any]]:
     from sklearn.decomposition import PCA
@@ -110,45 +109,8 @@ def _pca_fit(
     return _with_block(frame.drop(src_cols), dst_prefix, reduced), parameters
 
 
-def _pca_apply(
-    frame: pl.DataFrame,
-    src_prefix: str,
-    dst_prefix: str,
-    n_components: int,
-    parameters: dict[str, Any],
-) -> pl.DataFrame:
-    src_cols = sorted(c for c in frame.columns if c.startswith(src_prefix))
-    if list(parameters.get("input_columns") or []) != src_cols:
-        raise ValueError(
-            "frozen PCA input columns do not match the tokenizer fit: "
-            f"expected {parameters.get('input_columns')}, got {src_cols}"
-        )
-    mean = np.asarray(parameters.get("mean"), dtype=np.float32)
-    components = np.asarray(parameters.get("components"), dtype=np.float32)
-    values = frame.select(src_cols).to_numpy().astype(np.float32, copy=False)
-    reduced = (values - mean) @ components.T
-    return _with_block(frame.drop(src_cols), dst_prefix, reduced)
-
-
-def _pca(
-    frame: pl.DataFrame,
-    src_prefix: str,
-    dst_prefix: str,
-    n_components: int,
-    parameters: dict[str, Any] | None,
-) -> tuple[pl.DataFrame, dict[str, Any]]:
-    if parameters is None:
-        return _pca_fit(frame, src_prefix, dst_prefix, n_components)
-    return (
-        _pca_apply(frame, src_prefix, dst_prefix, n_components, parameters),
-        parameters,
-    )
-
-
 def city_relative_position_frame(
-    places_index: pl.DataFrame,
-    dim: int,
-    centroids: dict[int, tuple[float, float]] | None = None,
+    places_index: pl.DataFrame, dim: int
 ) -> tuple[pl.DataFrame, dict[int, tuple[float, float]]]:
     required = {"placekey_id", "latitude", "longitude", "city_id"}
     missing = required - set(places_index.columns)
@@ -158,28 +120,21 @@ def city_relative_position_frame(
             f"{sorted(required)} on the places index; missing {sorted(missing)}"
         )
     frame = places_index.select(sorted(required))
-    if centroids is None:
-        fitted = (
-            frame.drop_nulls(["latitude", "longitude"])
-            .group_by("city_id")
-            .agg(
-                pl.col("latitude").mean().alias("lat0"),
-                pl.col("longitude").mean().alias("lon0"),
-            )
+    fitted = (
+        frame.drop_nulls(["latitude", "longitude"])
+        .group_by("city_id")
+        .agg(
+            pl.col("latitude").mean().alias("lat0"),
+            pl.col("longitude").mean().alias("lon0"),
         )
-        centroids = {
-            int(c): (float(a), float(o))
-            for c, a, o in zip(
-                fitted["city_id"], fitted["lat0"], fitted["lon0"], strict=True
-            )
-        }
+    )
+    centroids = {
+        int(c): (float(a), float(o))
+        for c, a, o in zip(
+            fitted["city_id"], fitted["lat0"], fitted["lon0"], strict=True
+        )
+    }
     city = frame["city_id"].to_numpy()
-    unknown = sorted(set(int(c) for c in city) - set(centroids))
-    if unknown:
-        raise ValueError(
-            "city-relative position has no fitted centroid for city ids "
-            f"{unknown}; refit rather than centring on a foreign frame"
-        )
     lat0 = np.array([centroids[int(c)][0] for c in city])
     lon0 = np.array([centroids[int(c)][1] for c in city])
     lat = frame["latitude"].to_numpy().astype(float)
@@ -222,118 +177,61 @@ def city_relative_position_frame(
 def build_features(
     *,
     places_index: pl.DataFrame,
-    source: str,
     text_embeddings_path: Path,
-    graphsage_artifact_dir: Path | None,
-    pca_text_dim: int | None,
-    pca_graph_dim: int | None = None,
-    geo_relative_dim: int | None = None,
-    state: dict[str, Any] | None = None,
+    graph_dir: Path,
+    pca_text_dim: int,
+    pca_graph_dim: int,
+    geo_relative_dim: int,
 ) -> tuple[pl.DataFrame, dict[str, Any]]:
-    if source not in INPUT_SOURCES:
-        raise ValueError(
-            f"input_embedding_source must be one of {INPUT_SOURCES}; "
-            f"got {source!r}"
-        )
-    if pca_text_dim is None:
-        raise ValueError(f"pca_text_dim must be set for source {source!r}")
-    fitting = state is None
-    frame, state = _pca(
+    frame, text_pca = _pca(
         text_feature_frame(places_index, text_embeddings_path),
         TEXT_PREFIX,
         PCA_TEXT_PREFIX,
         pca_text_dim,
-        state,
     )
-    if source == "pca_text":
-        return frame, state
-
-    if graphsage_artifact_dir is None:
-        raise ValueError("pca_concat requires graphsage_artifact_dir")
-    graph = graph_feature_frame(places_index, graphsage_artifact_dir)
-    graph_prefix = GRAPH_PREFIX
-    if pca_graph_dim is not None:
-        if not fitting and "graph_pca" not in state:
-            raise ValueError(
-                "pca_graph_dim is set but the fitted preprocessing state "
-                "carries no graph PCA basis; refit rather than encoding "
-                "through a text-only basis"
-            )
-        graph, state["graph_pca"] = _pca(
-            graph,
-            GRAPH_PREFIX,
-            PCA_GRAPH_PREFIX,
-            pca_graph_dim,
-            state.get("graph_pca"),
-        )
-        graph_prefix = PCA_GRAPH_PREFIX
-    graph_cols = [c for c in graph.columns if c.startswith(graph_prefix)]
-    frame = frame.with_columns(graph.select(graph_cols).get_columns())
-
-    if geo_relative_dim is not None:
-        if not fitting and "geo_centroids" not in state:
-            raise ValueError(
-                "geo_relative_dim is set but the fitted preprocessing state "
-                "carries no city centroids; refit rather than centring this "
-                "POI set on its own frame"
-            )
-        geo, state["geo_centroids"] = city_relative_position_frame(
-            places_index, geo_relative_dim, state.get("geo_centroids")
-        )
-        before = frame.height
-        frame = frame.join(
-            geo, on="placekey_id", how="inner", maintain_order="left"
-        )
-        if frame.height != before:
-            raise ValueError(
-                "city-relative position did not cover every POI: "
-                f"{before} rows became {frame.height}"
-            )
-    return frame, state
-
-
-def _scale_block(
-    x: torch.Tensor,
-    columns: list[str],
-    prefix: str,
-    scale: float | None,
-    field: str,
-) -> torch.Tensor:
-    if scale is None:
-        return x
-    index = [i for i, c in enumerate(columns) if c.startswith(prefix)]
-    if not index:
-        raise ValueError(
-            f"{field} is set but no {prefix!r} columns are present"
-        )
-    scaled = x.clone()
-    scaled[:, index] *= float(scale)
-    logger.info(
-        "%s %.4f applied to %d standardized %s columns (%d others at 1.0)",
-        field,
-        scale,
-        len(index),
-        prefix.rstrip("_"),
-        x.shape[1] - len(index),
+    graph, graph_pca = _pca(
+        graph_feature_frame(places_index, graph_dir),
+        GRAPH_PREFIX,
+        PCA_GRAPH_PREFIX,
+        pca_graph_dim,
     )
-    return scaled
+    frame = frame.with_columns(
+        graph.select(
+            c for c in graph.columns if c.startswith(PCA_GRAPH_PREFIX)
+        ).get_columns()
+    )
+    geo, centroids = city_relative_position_frame(
+        places_index, geo_relative_dim
+    )
+    rows = frame.height
+    frame = frame.join(geo, on="placekey_id", maintain_order="left")
+    if frame.height != rows:
+        raise ValueError("city-relative position did not cover every POI")
+    return frame, {
+        **text_pca,
+        "graph_pca": graph_pca,
+        "geo_centroids": centroids,
+    }
 
 
 def scale_feature_blocks(
     x: torch.Tensor,
     columns: list[str],
     *,
-    text_graph_scale: float | None,
-    geo_scale: float | None,
+    text_graph_scale: float,
+    geo_scale: float,
 ) -> torch.Tensor:
-    x = _scale_block(
-        x, columns, PCA_TEXT_PREFIX, text_graph_scale, "text_graph_scale"
-    )
-    return _scale_block(x, columns, GEO_PREFIX, geo_scale, "geo_scale")
+    x = x.clone()
+    for prefix, scale in (
+        (PCA_TEXT_PREFIX, text_graph_scale),
+        (GEO_PREFIX, geo_scale),
+    ):
+        index = [i for i, c in enumerate(columns) if c.startswith(prefix)]
+        x[:, index] *= float(scale)
+    return x
 
 
 __all__ = [
-    "INPUT_SOURCES",
     "build_features",
     "city_relative_position_frame",
     "feature_columns",

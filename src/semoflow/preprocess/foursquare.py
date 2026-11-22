@@ -8,10 +8,13 @@ import numpy as np
 import polars as pl
 
 from semoflow.config import constants
-from semoflow.utils.data import stable_device_key
-from semoflow.utils.provenance import closure_from_stays, write_closure
 from semoflow.utils.serialization import write_json
-from semoflow.utils.splits import GLOBAL_SPLIT_SEED, SPLIT_COLUMN, assign_split
+from semoflow.utils.splits import (
+    GLOBAL_SPLIT_SEED,
+    SPLIT_COLUMN,
+    assign_split,
+    stable_key,
+)
 
 if TYPE_CHECKING:
     from semoflow.config import ExperimentConfig
@@ -264,7 +267,7 @@ def read_checkins(source: Path, catalog: pl.DataFrame) -> pl.DataFrame:
         .with_columns(
             pl.struct("city", "caid")
             .map_elements(
-                lambda row: stable_device_key(row["city"], row["caid"]),
+                lambda row: stable_key(f"{row['city']}|{row['caid']}"),
                 return_dtype=pl.Utf8,
             )
             .alias("device_key"),
@@ -354,15 +357,6 @@ def run_foursquare_pipeline(cfg: ExperimentConfig) -> None:
         artifacts.run_dir,
     )
 
-    write_closure(
-        closure_from_stays(
-            stays,
-            artifact=str(artifacts.processed_visits),
-            source=str(source),
-            split_seed=GLOBAL_SPLIT_SEED,
-        ),
-        artifacts.run_dir,
-    )
     write_json(
         artifacts.run_dir / "foursquare_source_manifest.json",
         {

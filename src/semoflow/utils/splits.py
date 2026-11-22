@@ -1,26 +1,27 @@
 from __future__ import annotations
 
-from semoflow.utils.data import hash_fraction
+import hashlib
 
 GLOBAL_SPLIT_SEED = 20260712
-
-TRAIN_FRACTION = 0.70
-VAL_FRACTION = 0.15
-
 SPLIT_COLUMN = "split"
 
 
-def assign_split(
-    key: str,
-    *,
-    seed: int = GLOBAL_SPLIT_SEED,
-    train_fraction: float = TRAIN_FRACTION,
-    val_fraction: float = VAL_FRACTION,
-) -> str:
-    frac = hash_fraction(str(key), seed)
-    if frac < train_fraction:
+def stable_key(value: str) -> str:
+    return hashlib.blake2b(value.encode(), digest_size=12).hexdigest()
+
+
+def hash_fraction(value: str, seed: int) -> float:
+    digest = hashlib.blake2b(
+        f"{seed}:{value}".encode(), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "little") / 2**64
+
+
+def assign_split(key: str, *, seed: int = GLOBAL_SPLIT_SEED) -> str:
+    fraction = hash_fraction(key, seed)
+    if fraction < 0.70:
         return "train"
-    if frac < train_fraction + val_fraction:
+    if fraction < 0.85:
         return "val"
     return "test"
 
@@ -28,7 +29,7 @@ def assign_split(
 __all__ = [
     "GLOBAL_SPLIT_SEED",
     "SPLIT_COLUMN",
-    "TRAIN_FRACTION",
-    "VAL_FRACTION",
     "assign_split",
+    "hash_fraction",
+    "stable_key",
 ]

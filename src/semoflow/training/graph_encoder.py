@@ -39,7 +39,6 @@ from semoflow.training.utils.distributed import (
     find_free_port,
     unwrap_ddp,
 )
-from semoflow.training.utils.mixed_precision import build_amp_context
 from semoflow.training.utils.runtime import (
     parse_device_spec,
     set_seed_all,
@@ -110,7 +109,6 @@ class GraphEncoderTrainer:
         model: torch.nn.Module,
         optimizer: optim.Optimizer,
         device: torch.device,
-        mixed_precision: str = "bf16",
         variance_weight: float = 0.0,
         covariance_weight: float = 0.0,
         variance_target: float = 1.0,
@@ -121,7 +119,11 @@ class GraphEncoderTrainer:
         self.model = model
         self.optimizer = optimizer
         self.device = device
-        self.amp_ctx, self.scaler = build_amp_context(mixed_precision, device)
+        self.amp_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if device.type == "cuda"
+            else contextlib.nullcontext()
+        )
         self.variance_weight = float(variance_weight)
         self.covariance_weight = float(covariance_weight)
         self.variance_target = float(variance_target)
@@ -139,24 +141,14 @@ class GraphEncoderTrainer:
 
         if target_edge is None:
             dummy_loss = poi_emb.sum() * 0.0
-            if self.scaler is not None:
-                self.scaler.scale(dummy_loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                dummy_loss.backward()
-                self.optimizer.step()
+            dummy_loss.backward()
+            self.optimizer.step()
             return dummy_loss.detach()
 
         with self.amp_ctx:
             loss = self._total_loss(graph_batch, poi_emb, target_edge)
-        if self.scaler is not None:
-            self.scaler.scale(loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            loss.backward()
-            self.optimizer.step()
+        loss.backward()
+        self.optimizer.step()
         return loss.detach()
 
     def eval_epoch_totals(self, val_loader: Any) -> tuple[float, float]:
@@ -318,23 +310,6 @@ def _build_graph_data(
     )
     _write_graph_data_cache(cfg, cache_dir, data, val_edges)
 
-    from semoflow.utils.provenance import (
-        closure_from_stays,
-        write_closure,
-    )
-    from semoflow.utils.splits import GLOBAL_SPLIT_SEED
-
-    out_dir = cfg.layout.graph_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
-    write_closure(
-        closure_from_stays(
-            stays_df,
-            artifact=str(out_dir),
-            source="graphsage_behavioral_graph",
-            split_seed=GLOBAL_SPLIT_SEED,
-        ),
-        out_dir,
-    )
     return data, val_edges
 
 
@@ -515,7 +490,6 @@ def _train_graph_single(
         model=model,
         optimizer=optimizer,
         device=device,
-        mixed_precision=graph_cfg.mixed_precision,
         variance_weight=graph_cfg.variance_weight,
         covariance_weight=graph_cfg.covariance_weight,
         variance_target=graph_cfg.variance_target,

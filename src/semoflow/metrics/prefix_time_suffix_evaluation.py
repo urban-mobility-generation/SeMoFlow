@@ -4,7 +4,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import polars as pl
@@ -16,17 +16,14 @@ from semoflow.metrics.trajectory.elapsed_recurrence import (
     elapsed_recurrence_jsd,
 )
 from semoflow.metrics.trajectory.grounding import (
-    ground_sid_tokens_to_poi_tokens,
+    ground_sid_codes,
     grounded_poi_metrics,
 )
 from semoflow.metrics.trajectory.temporal_spatial import (
     events_from_place_ids,
     temporal_spatial_jsd,
 )
-from semoflow.realizer.bank import (
-    load_bank_payload,
-    resolve_bank_split_window,
-)
+from semoflow.realizer.bank import bank_segments, bank_split_window
 from semoflow.realizer.time_tokens import (
     N_PART_OF_DAY_BINS,
     PART_OF_DAY_START_MINUTES,
@@ -34,11 +31,7 @@ from semoflow.realizer.time_tokens import (
 from semoflow.tokenization.decoding.grounding_index import (
     SemanticIDGroundingIndex,
 )
-from semoflow.tokenization.token_space import (
-    apply_trajectory_valid_mask,
-    sid_code_columns,
-    to_token_fields,
-)
+from semoflow.tokenization.token_space import sid_code_columns
 
 
 def load_lookup(path: Path) -> np.ndarray:
@@ -79,97 +72,40 @@ def load_places(
 
 
 def load_reference(
-    bank_path: Path,
-    *,
-    max_samples: int,
-    split: str = "val",
-    payload: dict[str, Any] | None = None,
+    payload: dict[str, Any], *, split: str, max_samples: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.BoolTensor, torch.Tensor]:
     """The leading ``max_samples`` bank rows of a split, with their POIs."""
-    if payload is None:
-        payload = load_bank_payload(bank_path)
-    if split not in {"val", "test"}:
-        raise ValueError("reference split must be 'val' or 'test'")
-    offset, count = resolve_bank_split_window(payload, split, path=bank_path)
-    selected_count = min(int(count), max_samples)
-    if selected_count == 0:
+    offset, count = bank_split_window(payload, split)
+    selected = min(count, max_samples)
+    if selected == 0:
         raise ValueError("reference selection is empty")
-    rows = slice(offset, offset + selected_count)
-    sid_codes = payload["sid_codes"][rows].long()
-    time_tokens = payload["time_tokens"][rows].long()
+    rows = slice(offset, offset + selected)
     valid_mask = payload["valid_mask"][rows].bool()
-
-    source = payload["source"]
-    segments_value = source.get("segments_path")
-    segments_path = Path(segments_value)
-    skipped = source.get("skipped_missing_sid", {})
-    if isinstance(skipped, dict) and int(skipped.get(split, 0)):
-        raise ValueError(
-            "cannot reconstruct aligned reference POIs when the bank "
-            f"skipped {split} segments with missing SIDs"
-        )
-    max_events = int(source.get("max_events", sid_codes.size(1)))
-    min_length = int(source.get("min_length", 1))
-    frame = (
-        pl.scan_parquet(segments_path)
-        .filter(pl.col("_split") == split)
-        .filter(
-            pl.col("placekey_id").list.len().is_between(min_length, max_events)
-        )
-        .head(selected_count)
-        .collect()
-    )
-    if frame.height != selected_count:
-        raise ValueError(
-            f"reference segment metadata has {frame.height} rows; "
-            f"expected {selected_count}"
-        )
+    frame = bank_segments(payload, split, ["placekey_id"], rows=selected)
     placekey_ids = torch.zeros_like(valid_mask, dtype=torch.long)
-    for row_index, row in enumerate(frame.iter_rows(named=True)):
-        ids = [int(value) for value in row["placekey_id"]]
-        length = int(valid_mask[row_index].sum().item())
-        if len(ids) != length:
-            raise ValueError(
-                "reference segment and bank valid lengths do not align at "
-                f"row {row_index}: {len(ids)} != {length}"
-            )
-        placekey_ids[row_index, :length] = torch.tensor(ids, dtype=torch.long)
-    return sid_codes, time_tokens, valid_mask, placekey_ids
+    flat = frame["placekey_id"].explode().to_numpy().astype(np.int64)
+    placekey_ids[valid_mask] = torch.from_numpy(flat)
+    return (
+        payload["sid_codes"][rows].long(),
+        payload["time_tokens"][rows].long(),
+        valid_mask,
+        placekey_ids,
+    )
 
 
 def aligned_reference_event_hours(
-    payload: dict[str, Any],
-    *,
-    split: str,
-    valid_mask: torch.Tensor,
+    payload: dict[str, Any], *, split: str, valid_mask: torch.Tensor
 ) -> torch.Tensor:
     """Observed event times in nominal local hours from each row's week start.
 
     Segments are naive local timestamps grouped into Monday-truncated weeks,
     so each row's origin is Monday 00:00 of its first event's week and its
     times lie in [0, 168) h. Rows are the first ``valid_mask.size(0)`` rows of
-    the split, selected exactly as :func:`load_reference` selects them.
-    Inactive positions are NaN.
+    the split. Inactive positions are NaN.
     """
-    source = payload["source"]
-    max_events = int(source.get("max_events", valid_mask.size(1)))
-    min_length = int(source.get("min_length", 1))
-    frame = cast(
-        pl.DataFrame,
-        pl.scan_parquet(Path(source["segments_path"]))
-        .filter(pl.col("_split") == split)
-        .filter(
-            pl.col("placekey_id").list.len().is_between(min_length, max_events)
-        )
-        .head(int(valid_mask.size(0)))
-        .select("_timestamps")
-        .collect(),
+    frame = bank_segments(
+        payload, split, ["_timestamps"], rows=int(valid_mask.size(0))
     )
-    lengths = torch.from_numpy(
-        frame["_timestamps"].list.len().to_numpy().astype(np.int64)
-    )
-    if not torch.equal(lengths, valid_mask.sum(dim=1).long()):
-        raise ValueError("reference timestamps do not align with bank rows")
     exploded = frame.with_columns(
         pl.col("_timestamps").list.first().dt.truncate("1w").alias("week")
     ).explode("_timestamps")
@@ -177,39 +113,23 @@ def aligned_reference_event_hours(
         exploded["_timestamps"] - exploded["week"]
     ).dt.total_microseconds().to_numpy() / 3.6e9
     out = torch.full(valid_mask.shape, float("nan"), dtype=torch.float64)
-    rows = torch.repeat_interleave(torch.arange(len(lengths)), lengths)
-    starts = torch.cumsum(lengths, 0) - lengths
-    columns = torch.arange(int(lengths.sum())) - torch.repeat_interleave(
-        starts, lengths
-    )
-    out[rows, columns] = torch.from_numpy(hours).double()
+    out[valid_mask.bool()] = torch.from_numpy(hours).double()
     return out
 
 
 def elapsed_recurrence_block(
     real_poi: torch.Tensor,
     real_valid: torch.Tensor,
-    real_hours: torch.Tensor | None,
+    real_hours: torch.Tensor,
     generated_poi: torch.Tensor,
     generated_valid: torch.Tensor,
-    generated_hours: torch.Tensor | None,
+    generated_hours: torch.Tensor,
 ) -> dict[str, Any]:
-    """Elapsed-time recurrence on grounded POIs, or why it is unavailable.
+    """Elapsed-time recurrence on grounded POIs.
 
     Events that ground to no POI (ID 0) are dropped, as the index
     recurrence metric drops them.
     """
-    missing = [
-        side
-        for side, hours in (
-            ("real", real_hours),
-            ("generated", generated_hours),
-        )
-        if hours is None
-    ]
-    if missing:
-        return {"unavailable": f"no continuous clock: {', '.join(missing)}"}
-    assert real_hours is not None and generated_hours is not None
 
     def events(poi, valid, hours) -> ReturnEvents:
         if hours.shape != valid.shape:
@@ -321,8 +241,8 @@ def metric_block(
     placekey_vocab_size: int,
     real_time_tokens: torch.Tensor,
     generated_time_tokens: torch.Tensor,
-    real_event_hours: torch.Tensor | None,
-    generated_event_hours: torch.Tensor | None,
+    real_event_hours: torch.Tensor,
+    generated_event_hours: torch.Tensor,
     reference_placekey_ids: torch.Tensor | None = None,
     candidate_selection: str = "first",
     candidate_weights: Mapping[int, float] | None = None,
@@ -333,22 +253,18 @@ def metric_block(
     ``real_time_tokens``/``generated_time_tokens`` are the 42 weekly time
     tokens aligned with the codes. They give the motif day keys and the joint
     temporal-spatial JSDs. ``real_event_hours``/``generated_event_hours`` are
-    continuous event times in hours; when both are given the elapsed-time
-    recurrence JSDs are scored, otherwise that section records why it is
-    unavailable. Times are never derived from tokens.
+    continuous event times in hours for the elapsed-time recurrence JSDs;
+    times are never derived from tokens.
     """
-    fields = [f"sem_code_{level}" for level in range(real_codes.size(-1))]
-    real_poi = ground_sid_tokens_to_poi_tokens(
-        apply_trajectory_valid_mask(
-            to_token_fields(real_codes, fields), real_valid
-        ),
+    real_poi = ground_sid_codes(
+        real_codes,
+        real_valid,
         grounding,
         preferred_placekey_ids=reference_placekey_ids,
     )
-    generated_poi = ground_sid_tokens_to_poi_tokens(
-        apply_trajectory_valid_mask(
-            to_token_fields(generated_codes, fields), generated_valid
-        ),
+    generated_poi = ground_sid_codes(
+        generated_codes,
+        generated_valid,
         grounding,
         candidate_selection=candidate_selection,
         candidate_weights=candidate_weights,

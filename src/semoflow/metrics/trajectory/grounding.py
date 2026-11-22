@@ -16,7 +16,6 @@ from semoflow.metrics.trajectory.geo import (
     travel_distance_jsd,
 )
 from semoflow.metrics.trajectory.mobility_motifs import mobility_motif_metrics
-from semoflow.tokenization import token_space
 from semoflow.tokenization.decoding.grounding_index import pack_code_rows
 
 _CANDIDATE_SELECTION_POLICIES = frozenset(
@@ -29,17 +28,15 @@ _CANDIDATE_WEIGHT_SMOOTHING = 1.0
 def _vectorized_lookup(
     code_rows: np.ndarray, grounding_index: Any
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    """Each token-space SID row's index into the packed payload table.
+    """Each SID row's index into the packed payload table.
 
-    Rows holding a special token (below ``REAL_TOKEN_OFFSET``) or no
-    catalog SID get ``-1``.
+    Rows with a negative code or no catalog SID get ``-1``.
     """
     table_keys, table_payloads = grounding_index.packed_lookup_table()
     payload_indices = np.full(code_rows.shape[0], -1, dtype=np.int64)
-    special = np.any(code_rows < token_space.REAL_TOKEN_OFFSET, axis=1)
-    row_indices = np.flatnonzero(~special)
+    row_indices = np.flatnonzero(~np.any(code_rows < 0, axis=1))
     if row_indices.size:
-        lookup_rows = code_rows[row_indices] - token_space.REAL_TOKEN_OFFSET
+        lookup_rows = code_rows[row_indices]
         if grounding_index.order_agnostic:
             lookup_rows = np.sort(lookup_rows, axis=1)
         packed = pack_code_rows(lookup_rows)
@@ -73,20 +70,6 @@ def _candidate_probabilities(
     return raw / raw.sum()
 
 
-def _sid_code_rows(
-    sid_tokens: Mapping[str, torch.Tensor], key_columns: Sequence[str]
-) -> tuple[torch.Size, np.ndarray]:
-    shape = sid_tokens[key_columns[0]].shape
-    codes = np.stack(
-        [
-            sid_tokens[field].long().reshape(-1).cpu().numpy()
-            for field in key_columns
-        ],
-        axis=1,
-    ).astype(np.int64, copy=False)
-    return shape, codes
-
-
 def _preferred_payloads(
     preferred_placekey_ids: np.ndarray,
     active_codes: np.ndarray,
@@ -102,10 +85,7 @@ def _preferred_payloads(
             placekey_id = payload.get("placekey_id")
             if placekey_id is not None:
                 by_placekey[int(placekey_id)] = (
-                    tuple(
-                        int(value) + token_space.REAL_TOKEN_OFFSET
-                        for value in key
-                    ),
+                    tuple(int(value) for value in key),
                     dict(payload),
                 )
     payloads: list[Mapping[str, Any]] = []
@@ -144,15 +124,18 @@ def _unique_code_rows(
     return unique, inverse, counts
 
 
-def ground_sid_tokens_to_poi_tokens(
-    sid_tokens: dict[str, torch.Tensor],
+def ground_sid_codes(
+    sid_codes: torch.Tensor,
+    valid_mask: torch.Tensor,
     grounding_index: Any,
     *,
     preferred_placekey_ids: torch.Tensor | None = None,
     candidate_selection: str = "first",
     candidate_weights: Mapping[int, float] | None = None,
 ) -> torch.Tensor:
-    """The placekey ID each SID token grounds to (``PAD_ID`` when none).
+    """The placekey ID each valid ``[rows, events, depth]`` SID grounds to.
+
+    Invalid or ungrounded positions get ``PAD_ID``.
 
     Each SID resolves to the grounding index's first candidate, or to a
     train-prior choice under ``candidate_selection``;
@@ -169,8 +152,9 @@ def ground_sid_tokens_to_poi_tokens(
             f"candidate_selection={candidate_selection!r} requires "
             "candidate_weights fitted on training data"
         )
-    shape, codes = _sid_code_rows(sid_tokens, grounding_index.key_columns)
-    active = np.flatnonzero(~(codes == PAD_ID).all(axis=1))
+    shape = valid_mask.shape
+    codes = sid_codes.long().reshape(-1, sid_codes.size(-1)).cpu().numpy()
+    active = np.flatnonzero(valid_mask.bool().reshape(-1).cpu().numpy())
     active_codes = codes[active]
     encoded = np.full(len(codes), PAD_ID, dtype=np.int64)
     if preferred_placekey_ids is not None:
@@ -295,4 +279,4 @@ def grounded_poi_metrics(
     }
 
 
-__all__ = ["ground_sid_tokens_to_poi_tokens", "grounded_poi_metrics"]
+__all__ = ["ground_sid_codes", "grounded_poi_metrics"]

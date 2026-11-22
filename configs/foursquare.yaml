@@ -42,7 +42,6 @@ tokenizer:
   latent_dim: 256
   hidden_dim: 512
   n_encoder_layers: 4
-  input_embedding_source: pca_concat
   pca_text_dim: 32
   pca_graph_dim: 32
   geo_relative_dim: 6
@@ -65,7 +64,6 @@ planner:
     n_heads: 8
     n_layers: 6
     dropout: 0.2
-    mobility_gate_prior: log_distinct
     use_distance_prior: true
   training:
     epochs: 60
@@ -99,9 +97,7 @@ realizer:
   min_lr: 0.00001
   tail_whitening_chunk_size: 16384
   compile: true
-  mixed_precision: bf16
-  tf32: true
-  fused_optimizer: true
+  bf16: true
 
 evaluation:
   reference_split: test

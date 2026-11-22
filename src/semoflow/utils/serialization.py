@@ -15,7 +15,7 @@ def normalize_value(value: object) -> object:
     if isinstance(value, float) and not math.isfinite(value):
         return None
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return normalize_mapping(dataclasses.asdict(value))
+        return normalize_value(dataclasses.asdict(value))
     if (
         not isinstance(value, type)
         and hasattr(value, "to_dict")
@@ -26,17 +26,13 @@ def normalize_value(value: object) -> object:
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, Mapping):
-        return normalize_mapping(cast(Mapping[Any, Any], value))
+        return {
+            str(k): normalize_value(v)
+            for k, v in cast(Mapping[Any, Any], value).items()
+        }
     if isinstance(value, (list, tuple)):
         return [normalize_value(v) for v in value]
     return value
-
-
-def normalize_mapping(mapping: Mapping[Any, Any]) -> dict[str, Any]:
-    return {
-        str(key): cast(Any, normalize_value(value))
-        for key, value in mapping.items()
-    }
 
 
 def to_yaml_string(obj: object) -> str:
@@ -62,32 +58,18 @@ def dump_json(payload: object, *, indent: int | None = 2) -> str:
 def write_json(path: str | Path, payload: object) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(dump_json(payload) + "\n", encoding="utf-8")
-    return target
-
-
-def write_json_atomic(
-    path: str | Path, payload: object, *, force: bool = True
-) -> None:
-    target = Path(path)
-    if target.exists() and not force:
-        raise FileExistsError(
-            f"refusing to overwrite existing artifact: {target}"
-        )
-    target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(f"{target.name}.tmp-{os.getpid()}")
     try:
         tmp.write_text(dump_json(payload) + "\n", encoding="utf-8")
         os.replace(tmp, target)
     finally:
         tmp.unlink(missing_ok=True)
+    return target
 
 
 __all__ = [
     "dump_json",
-    "normalize_mapping",
     "normalize_value",
     "to_yaml_string",
     "write_json",
-    "write_json_atomic",
 ]

@@ -8,7 +8,7 @@ from typing import Any, cast
 
 from semoflow.config.artifacts import RunLayout
 from semoflow.config.constants import CITY_ID
-from semoflow.config.schemas.evaluation_config import EvaluationConfig
+from semoflow.config.schema import EvaluationConfig
 from semoflow.metrics.city_inputs import (
     GROUNDING_NAME,
     LOOKUP_NAME,

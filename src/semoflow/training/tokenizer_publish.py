@@ -9,16 +9,6 @@ import polars as pl
 
 from semoflow.config import ExperimentConfig
 from semoflow.config.artifacts import TokenizerArtifacts
-from semoflow.tokenization.shared_local import (
-    semantic_id_lookup_fingerprint,
-    shared_codebook_fingerprint,
-)
-from semoflow.utils.provenance import (
-    ClosureComponent,
-    ProvenanceClosure,
-    load_closure,
-    write_closure,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +71,6 @@ def publish_tokenizer_artifacts(
         )
     code_cols = [c for c in codes_df.columns if c.startswith("sem_code_")]
     bundle = SIDCodebookBundle.from_tokenizer(model, code_fields=code_cols)
-    codebook_fingerprint = shared_codebook_fingerprint(list(bundle.codebooks))
-    lookup_fingerprint = semantic_id_lookup_fingerprint(codes_df, code_cols)
 
     codes_df.write_parquet(artifacts.placekey_lookup)
     write_grounding_artifacts(
@@ -99,7 +87,6 @@ def publish_tokenizer_artifacts(
             "n_codebooks": model.n_codebooks,
             "codebook_size": model.codebook_size,
             "input_dim": len(prepared.feature_cols),
-            "graph_dim": prepared.graph_dim,
             "hidden_dim": tcfg.hidden_dim,
             "latent_dim": tcfg.latent_dim,
             "history": history,
@@ -109,8 +96,6 @@ def publish_tokenizer_artifacts(
             "feature_mean": prepared.feature_mean,
             "feature_std": prepared.feature_std,
             "feature_preprocessing": prepared.feature_preprocessing,
-            "shared_codebook_fingerprint": codebook_fingerprint,
-            "lookup_fingerprint": lookup_fingerprint,
         },
         artifacts.tokenizer_model,
     )
@@ -118,8 +103,6 @@ def publish_tokenizer_artifacts(
         {
             "codebooks": bundle.codebooks,
             "code_fields": bundle.code_fields,
-            "shared_codebook_fingerprint": codebook_fingerprint,
-            "lookup_fingerprint": lookup_fingerprint,
         },
         artifacts.tokenizer_codebooks,
     )
@@ -140,50 +123,8 @@ def publish_tokenizer_artifacts(
         aug_path,
         artifacts.tokenizer_codebooks,
     )
-    write_tokenizer_provenance(cfg, artifacts)
-    required = (
-        "augmented_processed_visits",
-        "placekey_lookup",
-        "tokenizer_model",
-        "tokenizer_codebooks",
-        "grounding_index",
-    )
-    missing = [
-        name
-        for name in required
-        if not artifacts.export_paths()[name].exists()
-    ]
-    if missing:
-        artifacts.write_completion(status="partial", required=required)
-        raise RuntimeError(
-            "tokenizer publication incomplete; missing " + ", ".join(missing)
-        )
-    artifacts.write_completion(status="complete", required=required)
+    artifacts.mark_complete()
     return aug_path
-
-
-def write_tokenizer_provenance(
-    cfg: ExperimentConfig, artifacts: TokenizerArtifacts
-) -> None:
-    layout = cfg.layout
-    closure = ProvenanceClosure(artifact=str(artifacts.run_dir))
-    closure.components.append(
-        ClosureComponent(
-            source=f"tokenizer_text:{layout.text_embeddings}",
-            kind="substrate",
-        )
-    )
-    upstream = load_closure(layout.graph_dir.resolve())
-    if upstream is not None:
-        closure.components.extend(upstream.components)
-    else:
-        closure.components.append(
-            ClosureComponent(
-                source=f"graphsage:{layout.graph_dir}", kind="behavioral"
-            )
-        )
-
-    write_closure(closure, artifacts.run_dir)
 
 
 def encode_feature_tensors(

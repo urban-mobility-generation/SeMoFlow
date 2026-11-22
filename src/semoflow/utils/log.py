@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
 
 _PACKAGE_ROOT = "semoflow."
@@ -10,7 +10,6 @@ _LOG_FORMAT_DEBUG = "%(asctime)s | %(levelname)-5s | %(name)s | %(message)s"
 _DATE_FORMAT = "%H:%M:%S"
 _CONSOLE_HANDLER = "semoflow-console"
 _FILE_HANDLER = "semoflow-file"
-_RULE = "─" * 56
 
 
 class _SubsystemFilter(logging.Filter):
@@ -81,55 +80,6 @@ def _fmt_value(value: object) -> str:
     return str(value)
 
 
-def _section(logger: logging.Logger, title: str) -> None:
-    logger.info("")
-    logger.info(_RULE)
-    logger.info("  %s", title)
-    logger.info(_RULE)
-
-
-def _section_end(logger: logging.Logger) -> None:
-    logger.info(_RULE)
-
-
-def _kv_block(
-    logger: logging.Logger,
-    title: str | None,
-    items: Mapping[str, object] | Sequence[tuple[str, object]],
-) -> None:
-    pairs = list(items.items()) if isinstance(items, Mapping) else list(items)
-    if not pairs:
-        return
-    width = min(max(len(str(key)) for key, _ in pairs), 30)
-    if title is not None:
-        logger.info("  %s", title)
-    for key, value in pairs:
-        logger.info("    %-*s  %s", width, key, _fmt_value(value))
-
-
-def log_config_resolution(
-    logger: logging.Logger,
-    *,
-    config_path: Path | None,
-    overrides: Sequence[str],
-    experiment_name: str,
-) -> None:
-    _section(logger, "Config Resolution")
-    _kv_block(
-        logger,
-        None,
-        [
-            ("config_path", config_path or "defaults only"),
-            ("experiment", experiment_name),
-        ],
-    )
-    if overrides:
-        logger.info("  Overrides (%d)", len(overrides))
-        for override in overrides:
-            logger.info("    %s", override)
-    _section_end(logger)
-
-
 def _progress(current: int, total: int) -> str:
     return f"{current:0{len(str(total))}d}/{total}"
 
@@ -195,7 +145,6 @@ def log_ddp_summary(
 __all__ = [
     "configure_logging",
     "get_configured_log_file",
-    "log_config_resolution",
     "log_ddp_summary",
     "log_epoch_summary",
     "log_training_step",

@@ -1,22 +1,40 @@
+"""The realizer's SID bank: each split's weekly segments as SID tensors.
+
+Bank rows are the segments of each split, in segment-table order, whose
+length lies in ``[min_length, max_events]``; :func:`bank_segments` reads the
+segment rows behind any leading slice of a split.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import polars as pl
 import torch
 
 from semoflow.config.artifacts import RunLayout
-from semoflow.config.schemas.realizer_config import (
-    PrefixTimeSuffixLatentFlowRealizerConfig,
+from semoflow.config.schema import (
+    RealizerConfig,
 )
 from semoflow.preprocess.weekly_segments import SEGMENT_CITY_COLUMN
-from semoflow.realizer.time_tokens import (
-    N_TIME_TOKENS,
-    time_tokens_from_timestamps,
-)
+from semoflow.realizer.time_tokens import time_tokens_from_timestamps
 from semoflow.tokenization.token_space import sid_code_columns
+
+BANK_SPLITS = ("train", "val", "test")
+MIN_LENGTH = 5
+
+
+def _split_segments(
+    segments_path: Path | str, split: str, *, min_length: int, max_events: int
+) -> pl.LazyFrame:
+    length = pl.col("placekey_id").list.len()
+    return (
+        pl.scan_parquet(segments_path)
+        .filter(pl.col("_split") == split)
+        .filter(length.is_between(min_length, max_events))
+    )
 
 
 def _load_lookup(path: Path) -> dict[int, np.ndarray]:
@@ -24,10 +42,10 @@ def _load_lookup(path: Path) -> dict[int, np.ndarray]:
         sid_code_columns(pl.scan_parquet(path).collect_schema().names())
     )
     frame = pl.read_parquet(path).select(["placekey_id", *columns])
-    lookup: dict[int, np.ndarray] = {}
-    for row in frame.iter_rows():
-        lookup[int(row[0])] = np.asarray(row[1:], dtype=np.int16)
-    return lookup
+    return {
+        int(row[0]): np.asarray(row[1:], dtype=np.int16)
+        for row in frame.iter_rows()
+    }
 
 
 def _build_split(
@@ -36,50 +54,29 @@ def _build_split(
     *,
     split: str,
     max_events: int,
-    min_length: int,
-    max_segments: int,
-    allow_empty: bool = False,
-    width: int | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
-    query = (
-        pl.scan_parquet(segments_path)
-        .filter(pl.col("_split") == split)
-        .filter(
-            pl.col("placekey_id").list.len().is_between(min_length, max_events)
-        )
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    frame = cast(
+        pl.DataFrame,
+        _split_segments(
+            segments_path, split, min_length=MIN_LENGTH, max_events=max_events
+        ).collect(),
     )
-    if max_segments > 0:
-        query = query.head(max_segments)
-    frame = query.collect()
+    if frame.is_empty():
+        raise ValueError(f"no usable {split} segments found")
     rows = frame.iter_rows(named=True)
     selected: list[tuple[np.ndarray, np.ndarray]] = []
-    skipped = 0
     for row in rows:
-        placekey_ids = [int(value) for value in row["placekey_id"]]
-        timestamps = list(row["_timestamps"])
-        sid_rows = [lookup.get(placekey_id) for placekey_id in placekey_ids]
-        if any(codes is None for codes in sid_rows):
-            skipped += 1
-            continue
-        codes = np.stack(
-            [codes for codes in sid_rows if codes is not None], axis=0
+        try:
+            codes = np.stack([lookup[int(pid)] for pid in row["placekey_id"]])
+        except KeyError as error:
+            raise ValueError(
+                f"{split} segment visits placekey_id {error} with no SID"
+            ) from None
+        selected.append(
+            (codes, time_tokens_from_timestamps(row["_timestamps"]))
         )
-        times = time_tokens_from_timestamps(timestamps)
-        selected.append((codes, times))
-    if not selected:
-        if allow_empty:
-            sid_width = width or 6
-            return (
-                np.zeros((0, max_events, sid_width), dtype=np.int16),
-                np.zeros((0, max_events), dtype=np.int16),
-                np.zeros((0, max_events), dtype=bool),
-                skipped,
-            )
-        raise ValueError(f"no usable {split} segments found")
-    sid_width = int(selected[0][0].shape[1])
-    sid_codes = np.zeros(
-        (len(selected), max_events, sid_width), dtype=np.int16
-    )
+    depth = int(selected[0][0].shape[1])
+    sid_codes = np.zeros((len(selected), max_events, depth), dtype=np.int16)
     time_tokens = np.full((len(selected), max_events), -1, dtype=np.int16)
     valid_mask = np.zeros((len(selected), max_events), dtype=np.bool_)
     for index, (codes, times) in enumerate(selected):
@@ -87,7 +84,7 @@ def _build_split(
         sid_codes[index, :length] = codes
         time_tokens[index, :length] = times
         valid_mask[index, :length] = True
-    return sid_codes, time_tokens, valid_mask, skipped
+    return sid_codes, time_tokens, valid_mask
 
 
 def build_bank(
@@ -96,171 +93,95 @@ def build_bank(
     segments_path: Path,
     output_path: Path,
     max_events: int,
-    min_length: int = 5,
-    max_train_segments: int = 0,
-    max_val_segments: int = 0,
-    max_test_segments: int = 0,
-    allow_empty_splits: bool = False,
 ) -> dict[str, object]:
     lookup = _load_lookup(lookup_path)
-    by_split: dict[str, tuple] = {}
-    skipped: dict[str, int] = {}
-    width: int | None = None
-    for split, cap in (
-        ("val", max_val_segments),
-        ("train", max_train_segments),
-        ("test", max_test_segments),
-    ):
-        part = _build_split(
-            segments_path,
-            lookup,
-            split=split,
-            max_events=max_events,
-            min_length=min_length,
-            max_segments=cap,
-            allow_empty=allow_empty_splits and split != "val",
-            width=width,
-        )
-        if width is None and len(part[0]):
-            width = int(part[0].shape[2])
-        by_split[split] = part[:3]
-        skipped[split] = part[3]
-    parts = [by_split["train"], by_split["val"], by_split["test"]]
-    sid_codes = np.concatenate([part[0] for part in parts], axis=0)
-    time_tokens = np.concatenate([part[1] for part in parts], axis=0)
-    valid_mask = np.concatenate([part[2] for part in parts], axis=0)
-    train_count = len(parts[0][0])
-    val_count = len(parts[1][0])
-    test_count = len(parts[2][0])
+    parts = [
+        _build_split(segments_path, lookup, split=split, max_events=max_events)
+        for split in BANK_SPLITS
+    ]
+    row_counts = {
+        split: len(part[0])
+        for split, part in zip(BANK_SPLITS, parts, strict=True)
+    }
     payload = {
-        "schema_version": 1,
-        "sid_codes": torch.from_numpy(sid_codes),
-        "time_tokens": torch.from_numpy(time_tokens),
-        "valid_mask": torch.from_numpy(valid_mask),
-        "row_counts": {
-            "train": train_count,
-            "val": val_count,
-            "test": test_count,
-        },
-        "codebook_size": 64,
-        "time_vocab": N_TIME_TOKENS,
+        "sid_codes": torch.from_numpy(np.concatenate([p[0] for p in parts])),
+        "time_tokens": torch.from_numpy(np.concatenate([p[1] for p in parts])),
+        "valid_mask": torch.from_numpy(np.concatenate([p[2] for p in parts])),
+        "row_counts": row_counts,
         "source": {
             "lookup_path": str(lookup_path),
             "segments_path": str(segments_path),
             "max_events": max_events,
-            "min_length": min_length,
-            "skipped_missing_sid": skipped,
+            "min_length": MIN_LENGTH,
         },
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, output_path)
     return {
         "output": str(output_path),
-        "rows": len(sid_codes),
-        "width": int(max_events),
-        "codebook_depth": int(sid_codes.shape[-1]),
-        "row_counts": payload["row_counts"],
-        "skipped_missing_sid": skipped,
+        "rows": sum(row_counts.values()),
+        "width": max_events,
+        "codebook_depth": int(payload["sid_codes"].shape[-1]),
+        "row_counts": row_counts,
     }
 
 
-BANK_SPLITS = ("train", "val", "test")
-
-
 def load_bank_payload(path: Path) -> dict[str, Any]:
-    payload = torch.load(
-        path,
-        map_location="cpu",
-        weights_only=False,
-        mmap=True,
+    return torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+
+
+def bank_split_window(payload: dict[str, Any], split: str) -> tuple[int, int]:
+    """The offset and row count of ``split`` in the bank tensors."""
+    counts = payload["row_counts"]
+    offset = sum(
+        int(counts[name]) for name in BANK_SPLITS[: BANK_SPLITS.index(split)]
     )
-    return payload
+    return offset, int(counts[split])
 
 
-def resolve_bank_split_window(
+def bank_segments(
     payload: dict[str, Any],
     split: str,
+    columns: list[str],
     *,
-    path: Path,
-) -> tuple[int, int]:
-    row_counts = payload["row_counts"]
-    offset = 0
-    for name in BANK_SPLITS:
-        if name == split:
-            break
-        offset += int(row_counts.get(name, 0))
-    return offset, int(row_counts[split])
+    rows: int | None = None,
+) -> pl.DataFrame:
+    """``columns`` of the segments behind the first ``rows`` rows of a split.
+
+    Defaults to the whole split; segment lengths are checked against the
+    bank's valid mask.
+    """
+    offset, count = bank_split_window(payload, split)
+    rows = count if rows is None else min(rows, count)
+    source = payload["source"]
+    frame = cast(
+        pl.DataFrame,
+        _split_segments(
+            source["segments_path"],
+            split,
+            min_length=int(source["min_length"]),
+            max_events=int(source["max_events"]),
+        )
+        .head(rows)
+        .select(pl.col("placekey_id").list.len().alias("_length"), *columns)
+        .collect(),
+    )
+    expected = payload["valid_mask"][offset : offset + rows].sum(dim=1).long()
+    lengths = torch.from_numpy(frame["_length"].to_numpy().astype(np.int64))
+    if frame.height != rows or not torch.equal(lengths, expected):
+        raise ValueError(f"segments do not align with the bank's {split} rows")
+    return frame.drop("_length")
 
 
 def bank_split_city_ids(
-    payload: dict[str, Any],
-    bank_path: Path,
-    *,
-    split: str,
-    valid_mask: torch.Tensor,
-    time_tokens: torch.Tensor | None = None,
-) -> torch.LongTensor:
-    count = int(valid_mask.shape[0])
-    source = payload["source"]
-    segments_value = source.get("segments_path")
-    skipped = source.get("skipped_missing_sid", {})
-    if isinstance(skipped, dict) and int(skipped.get(split, 0)):
-        raise ValueError(
-            f"cannot align {split} rows: the bank skipped segments with "
-            "missing SIDs"
-        )
-    max_events = int(source.get("max_events", payload["sid_codes"].size(1)))
-    min_length = int(source.get("min_length", 1))
-    lazy = pl.scan_parquet(segments_value)
-    if SEGMENT_CITY_COLUMN not in lazy.collect_schema().names():
-        raise ValueError(
-            "city-conditioned bank source carries no `_city_id` column"
-        )
-    columns = [
-        pl.col(SEGMENT_CITY_COLUMN),
-        pl.col("placekey_id").list.len().alias("_length"),
-    ]
-    if time_tokens is not None:
-        columns.append(pl.col("_timestamps"))
-    frame = (
-        lazy.filter(pl.col("_split") == split)
-        .filter(
-            pl.col("placekey_id").list.len().is_between(min_length, max_events)
-        )
-        .head(count)
-        .select(columns)
-        .collect()
-    )
-    if frame.height < count:
-        raise ValueError(
-            f"segment source has {frame.height} {split} rows; expected {count}"
-        )
-    expected_lengths = valid_mask.sum(dim=1).long().cpu()
-    lengths = torch.tensor(frame["_length"].to_numpy(), dtype=torch.long)
-    if not torch.equal(lengths, expected_lengths):
-        mismatch = torch.where(lengths.ne(expected_lengths))[0][0]
-        raise ValueError(
-            f"segment and bank lengths disagree at {split} row {int(mismatch)}"
-        )
-    if time_tokens is not None:
-        for row_index, timestamps in enumerate(frame["_timestamps"]):
-            length = int(lengths[row_index])
-            observed = [
-                int(v) for v in time_tokens_from_timestamps(timestamps)
-            ]
-            expected = [int(v) for v in time_tokens[row_index, :length]]
-            if observed != expected:
-                raise ValueError(
-                    "bank time tokens disagree with source timestamps at "
-                    f"{split} row {row_index}"
-                )
-    return torch.tensor(
-        frame[SEGMENT_CITY_COLUMN].to_numpy(), dtype=torch.long
-    )
+    payload: dict[str, Any], split: str, *, rows: int | None = None
+) -> torch.Tensor:
+    frame = bank_segments(payload, split, [SEGMENT_CITY_COLUMN], rows=rows)
+    return torch.from_numpy(frame[SEGMENT_CITY_COLUMN].to_numpy()).long()
 
 
 def build_realizer_data(
-    settings: PrefixTimeSuffixLatentFlowRealizerConfig, layout: RunLayout
+    settings: RealizerConfig, layout: RunLayout
 ) -> dict[str, object]:
     """Build the bank the realizer trains on, keyed by the tokenizer lookup."""
     return build_bank(
@@ -273,9 +194,10 @@ def build_realizer_data(
 
 __all__ = [
     "BANK_SPLITS",
+    "bank_segments",
     "bank_split_city_ids",
+    "bank_split_window",
     "build_bank",
     "build_realizer_data",
     "load_bank_payload",
-    "resolve_bank_split_window",
 ]

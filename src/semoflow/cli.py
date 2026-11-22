@@ -2,19 +2,23 @@ from __future__ import annotations
 
 import logging
 import os
+import platform
+import shlex
+import subprocess
+import sys
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import asdict, replace
+from dataclasses import replace
+from importlib import metadata
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import typer
 
-from semoflow.config import ExperimentConfig, resolve_experiment_config
+from semoflow.config import ExperimentConfig, load_config
 from semoflow.utils.log import configure_logging
-from semoflow.utils.run_metadata import write_run_manifest
-from semoflow.utils.serialization import dump_json
+from semoflow.utils.serialization import dump_json, write_json
 
 logger = logging.getLogger(__name__)
 
@@ -60,9 +64,7 @@ def _load(
 ) -> ExperimentConfig:
     configure_logging(level=log_level)
     try:
-        return resolve_experiment_config(
-            config_path=config, overrides=list(sets or [])
-        )
+        return load_config(config, list(sets or []))
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
@@ -74,6 +76,57 @@ def _is_rank_zero() -> bool:
 def _echo(payload: object) -> None:
     if _is_rank_zero():
         typer.echo(dump_json(payload))
+
+
+_RECORDED_PACKAGES = ("torch", "polars", "numpy", "pyyaml")
+
+
+def _git(*args: str) -> str:
+    try:
+        return subprocess.check_output(
+            ["git", *args], stderr=subprocess.DEVNULL, text=True
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+def _git_info() -> dict[str, str | bool]:
+    return {
+        "commit": _git("rev-parse", "HEAD"),
+        "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
+        "dirty": _git("status", "--porcelain") != "",
+        "origin": _git("remote", "get-url", "origin"),
+    }
+
+
+def _package_version(name: str) -> str:
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return "not installed"
+
+
+def _environment_info() -> dict[str, Any]:
+    return {
+        "python": sys.version,
+        "platform": platform.platform(),
+        "packages": {
+            name: _package_version(name) for name in _RECORDED_PACKAGES
+        },
+    }
+
+
+def _write_manifest(directory: Path, **fields: Any) -> None:
+    argv = [str(part) for part in sys.argv]
+    manifest = {
+        "command": shlex.join(argv),
+        "argv": argv,
+        "cwd": str(Path.cwd()),
+        "git": _git_info(),
+        "environment": _environment_info(),
+        **fields,
+    }
+    write_json(directory / "run_manifest.json", manifest)
 
 
 @contextmanager
@@ -96,7 +149,7 @@ def _run(
         status = "completed"
     finally:
         elapsed = round(time.perf_counter() - started, 1)
-        write_run_manifest(
+        _write_manifest(
             output_dir,
             experiment=cfg.name,
             stage=stage,
@@ -192,7 +245,7 @@ def planner(
         result = train_planner(
             cfg.planner, cfg.layout, force=force, log_level=log_level
         )
-    _echo(asdict(result))
+    _echo(result)
 
 
 @app.command(

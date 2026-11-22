@@ -23,8 +23,8 @@ from semoflow.metrics.prefix_time_suffix_evaluation import (
 )
 from semoflow.realizer.bank import (
     bank_split_city_ids,
+    bank_split_window,
     load_bank_payload,
-    resolve_bank_split_window,
 )
 from semoflow.realizer.model import (
     MODEL_TYPE,
@@ -323,7 +323,7 @@ def _generation_catalog(
     """The legal SID catalog generation decodes into, with its train-split
     log-count prior, and its codebooks."""
     catalog_codes = torch.from_numpy(load_lookup(lookup_path)).long()
-    offset, count = resolve_bank_split_window(payload, "train", path=bank_path)
+    offset, count = bank_split_window(payload, "train")
     rows = slice(offset, offset + count)
     observed_codes = payload["sid_codes"][rows][
         payload["valid_mask"][rows].bool()
@@ -378,11 +378,7 @@ def _conditioning_arms(
                 "realizer cannot be evaluated on them"
             )
         gold_city = bank_split_city_ids(
-            payload,
-            bank_path,
-            split=reference_split,
-            valid_mask=real_valid,
-            time_tokens=real_times,
+            payload, reference_split, rows=int(real_valid.shape[0])
         )
     gold = _Arm(
         name="gold_prefix",
@@ -468,10 +464,7 @@ def evaluate(
     )
     payload = load_bank_payload(bank_path)
     real_codes, real_times, real_valid, real_placekey_ids = load_reference(
-        bank_path,
-        max_samples=max_samples,
-        split=reference_split,
-        payload=payload,
+        payload, split=reference_split, max_samples=max_samples
     )
     plan = plan_from_planner_samples(
         planner_samples,

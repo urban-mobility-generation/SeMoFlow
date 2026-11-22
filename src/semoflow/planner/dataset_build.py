@@ -7,8 +7,8 @@ import polars as pl
 import torch
 
 from semoflow.config.artifacts import RunLayout
-from semoflow.config.schemas.planner_config import (
-    OccurrencePlannerDataOptions,
+from semoflow.config.schema import (
+    PlannerDataConfig,
 )
 from semoflow.planner.artifacts import (
     DATASET_ARTIFACT_TYPE,
@@ -148,7 +148,7 @@ def _materialize_split(
 
 
 def build_planner_data(
-    data: OccurrencePlannerDataOptions,
+    data: PlannerDataConfig,
     layout: RunLayout,
     *,
     force: bool = False,
@@ -180,12 +180,9 @@ def build_planner_data(
     )
 
     length = pl.col("placekey_id").list.len()
-    frame = (
-        pl.scan_parquet(layout.segments)
-        .filter(pl.col("_split").is_in(["train", "val"]))
-        .select("_split", "placekey_id", "_timestamps")
-        .collect()
-    )
+    frame = pl.read_parquet(
+        layout.segments, columns=["_split", "placekey_id", "_timestamps"]
+    ).filter(pl.col("_split").is_in(["train", "val"]))
     truncated_rows = frame.filter(length > data.max_occurrences).height
     frame = frame.with_columns(
         pl.col("placekey_id").list.slice(0, data.max_occurrences),
