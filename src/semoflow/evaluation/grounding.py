@@ -8,16 +8,16 @@ import numpy as np
 import torch
 
 from semoflow.config import PAD_ID
-from semoflow.metrics.distribution import (
+from semoflow.evaluation.distribution import (
     jensen_shannon_divergence,
     token_marginal_jsd,
 )
-from semoflow.metrics.geo import (
+from semoflow.evaluation.geo import (
     radius_of_gyration_jsd,
     spatial_jsd,
     travel_distance_jsd,
 )
-from semoflow.metrics.motifs import mobility_motif_metrics
+from semoflow.evaluation.motifs import mobility_motif_metrics
 from semoflow.tokenization.sids import pack_code_rows
 
 _CANDIDATE_SELECTION_POLICIES = frozenset(

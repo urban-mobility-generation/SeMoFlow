@@ -11,15 +11,15 @@ import polars as pl
 import torch
 import torch.nn.functional as F
 
-from semoflow.metrics.elapsed_recurrence import (
+from semoflow.evaluation.elapsed_recurrence import (
     ReturnEvents,
     elapsed_recurrence_jsd,
 )
-from semoflow.metrics.grounding import (
+from semoflow.evaluation.grounding import (
     ground_sid_codes,
     grounded_poi_metrics,
 )
-from semoflow.metrics.temporal_spatial import (
+from semoflow.evaluation.temporal_spatial import (
     events_from_place_ids,
     temporal_spatial_jsd,
 )

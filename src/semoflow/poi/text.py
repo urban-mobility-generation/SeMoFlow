@@ -10,7 +10,7 @@ import polars as pl
 import torch
 from sentence_transformers import SentenceTransformer
 
-from semoflow.encoder.embeddings import (
+from semoflow.poi.embeddings import (
     load_poi_embeddings,
     write_poi_embeddings,
 )

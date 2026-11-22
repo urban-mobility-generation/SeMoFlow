@@ -163,7 +163,7 @@ def preprocess(
 def encoder(
     config: Config, sets: Sets = None, log_level: LogLevel = "INFO"
 ) -> None:
-    from semoflow.encoder.training import run_encoder_pipeline
+    from semoflow.poi.training import run_encoder_pipeline
 
     cfg = _load(config, sets, log_level)
     with _run(cfg, "encoder", cfg.layout.encoder_dir, log_level):
@@ -179,7 +179,7 @@ def tokenizer(
     force: Force = False,
     log_level: LogLevel = "INFO",
 ) -> None:
-    from semoflow.tokenization.training import run_semantic_id_tokenizer
+    from semoflow.poi.training import run_semantic_id_tokenizer
 
     cfg = _load(config, sets, log_level)
     artifacts = cfg.layout.tokenizer
@@ -297,7 +297,7 @@ def evaluate(
     force: Force = False,
     log_level: LogLevel = "INFO",
 ) -> None:
-    from semoflow.metrics.cities import evaluate_cities
+    from semoflow.evaluation.cities import evaluate_cities
 
     cfg = _load(config, sets, log_level)
     layout, cities = cfg.layout, cfg.evaluation_cities

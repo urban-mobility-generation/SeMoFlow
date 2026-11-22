@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from semoflow.config import PAD_ID
-from semoflow.metrics.distribution import jsd
+from semoflow.evaluation.distribution import jsd
 
 _EARTH_RADIUS_KM = 6371.0
 _DISTANCE_BINS = 50

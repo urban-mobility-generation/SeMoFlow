@@ -13,7 +13,7 @@ import torch
 from torch_geometric.data import HeteroData
 from torch_geometric.loader import LinkNeighborLoader
 
-from semoflow.encoder.embeddings import load_poi_embeddings
+from semoflow.poi.embeddings import load_poi_embeddings
 
 logger = logging.getLogger(__name__)
 
