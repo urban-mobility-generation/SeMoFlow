@@ -25,14 +25,6 @@ from semoflow.config.schemas.planner_config import (
     OccurrencePlannerTrainingOptions,
     PlannerTrainingConfig,
 )
-from semoflow.logging.primitives import (
-    configure_logging,
-    get_configured_log_file,
-)
-from semoflow.logging.training import (
-    log_epoch_summary,
-    log_training_step,
-)
 from semoflow.planner.artifacts import (
     OccurrencePlannerDataConfig,
     OccurrencePlannerDataset,
@@ -54,6 +46,12 @@ from semoflow.training.utils.lr_schedule import build_lr_scheduler
 from semoflow.training.utils.runtime import (
     parse_device_spec,
     set_seed_all,
+)
+from semoflow.utils.log import (
+    configure_logging,
+    get_configured_log_file,
+    log_epoch_summary,
+    log_training_step,
 )
 from semoflow.utils.serialization import write_json_atomic
 

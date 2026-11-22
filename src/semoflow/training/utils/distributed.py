@@ -52,7 +52,7 @@ def init_worker(
     log_level: str,
     log_file: Path | None,
 ) -> torch.device:
-    from semoflow.logging.primitives import configure_logging
+    from semoflow.utils.log import configure_logging
 
     configure_logging(
         level=log_level, log_file=log_file if rank == 0 else None

@@ -15,8 +15,8 @@ from semoflow.config import (
     ExperimentConfig,
     resolve_experiment_config,
 )
-from semoflow.logging.primitives import configure_logging
-from semoflow.logging.run import (
+from semoflow.utils.log import (
+    configure_logging,
     log_artifact_inventory,
     log_run_complete,
     log_run_start,

@@ -18,7 +18,7 @@ from semoflow.cli.common import (
     resolve_cli_config,
     validate_device,
 )
-from semoflow.logging.primitives import configure_logging
+from semoflow.utils.log import configure_logging
 
 app = typer.Typer(
     help="Evaluate planner samples, compositions, and tokenizers.",

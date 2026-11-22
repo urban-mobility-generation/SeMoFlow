@@ -8,7 +8,7 @@ import yaml
 
 from semoflow.config.overrides import apply_override, from_dict
 from semoflow.config.schemas.experiment_config import ExperimentConfig
-from semoflow.logging.config_resolution import log_config_resolution
+from semoflow.utils.log import log_config_resolution
 
 logger = logging.getLogger(__name__)
 

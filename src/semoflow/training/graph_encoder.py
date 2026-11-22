@@ -697,8 +697,7 @@ def train_heterosage(
             cfg, data, val_edges, primary_device, rank=0, world_size=1
         )
 
-    from semoflow.logging.primitives import get_configured_log_file
-    from semoflow.logging.training import log_ddp_summary
+    from semoflow.utils.log import get_configured_log_file, log_ddp_summary
 
     port = find_free_port()
     log_ddp_summary(
