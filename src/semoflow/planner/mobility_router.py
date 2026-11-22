@@ -43,18 +43,22 @@ def _causal_history_mask(prefix_codes: torch.Tensor) -> torch.Tensor:
     return causal & valid_memory[:, None, :]
 
 
+def _same_prefix(
+    prefix_codes: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Which memory steps hold an event, and which pairs share a prefix."""
+    valid = (prefix_codes >= 0).all(dim=-1)
+    same = (prefix_codes[:, :, None, :] == prefix_codes[:, None, :, :]).all(
+        dim=-1
+    )
+    return valid, same & valid[:, :, None] & valid[:, None, :]
+
+
 def _prefix_statistics(
     prefix_codes: torch.Tensor,
     history_mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    valid = (prefix_codes >= 0).all(dim=-1)
-    safe = torch.where(
-        valid[..., None],
-        prefix_codes,
-        torch.full_like(prefix_codes, -2),
-    )
-    same = (safe[:, :, None, :] == safe[:, None, :, :]).all(dim=-1)
-    same = same & valid[:, :, None] & valid[:, None, :]
+    valid, same = _same_prefix(prefix_codes)
 
     cumulative = same.cumsum(dim=-1, dtype=torch.int32)
     frequency_count = cumulative.transpose(1, 2).to(torch.float32)
@@ -75,14 +79,7 @@ def _prefix_statistics(
 def _step_prefix_statistics(
     prefix_codes: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    valid = (prefix_codes >= 0).all(dim=-1)
-    safe = torch.where(
-        valid[..., None],
-        prefix_codes,
-        torch.full_like(prefix_codes, -2),
-    )
-    same = (safe[:, :, None, :] == safe[:, None, :, :]).all(dim=-1)
-    same = same & valid[:, :, None] & valid[:, None, :]
+    valid, same = _same_prefix(prefix_codes)
     frequency_count = same.sum(dim=-1, dtype=torch.int32).to(torch.float32)
 
     memory_steps = prefix_codes.shape[1]

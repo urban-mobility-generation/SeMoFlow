@@ -143,6 +143,7 @@ class OccurrenceARPlanner(nn.Module):
             gate_prior=config.mobility_gate_prior,
         )
 
+    # Released checkpoints carry an empty ``_extra_state`` entry.
     def get_extra_state(self) -> dict[str, Any]:
         return {}
 
@@ -216,12 +217,43 @@ class OccurrenceARPlanner(nn.Module):
         query = self.length_query.expand(city_ids.shape[0], -1)
         return self.length_head(self._add_city_state(query, city_ids))
 
-    def _embed_prefix_history(self, prefix_ids: torch.Tensor) -> torch.Tensor:
+    def _embed_events(
+        self, prefix_codes: torch.Tensor, gap_tokens: torch.Tensor
+    ) -> torch.Tensor:
+        """Summed prefix-level and gap embeddings; ``-1`` (no event) maps
+        to each table's padding row."""
+        prefix_ids = torch.where(
+            prefix_codes >= 0,
+            prefix_codes,
+            torch.full_like(prefix_codes, self.config.codebook_size),
+        )
+        gap_ids = torch.where(
+            gap_tokens >= 0,
+            gap_tokens,
+            torch.full_like(gap_tokens, self.config.gap_vocab),
+        )
         level_states = [
             embedding(prefix_ids[..., level])
             for level, embedding in enumerate(self.prefix_embeddings)
         ]
-        return torch.stack(level_states, dim=0).sum(dim=0)
+        prefix_state = torch.stack(level_states, dim=0).sum(dim=0)
+        return prefix_state + self.gap_embedding(gap_ids)
+
+    def _embed_history(
+        self,
+        previous_prefix_codes: torch.Tensor,
+        previous_gap_tokens: torch.Tensor,
+        previous_event_time_minutes: torch.Tensor,
+        lengths: torch.Tensor,
+        city_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """The causal input state of each step from its previous event."""
+        hidden = self._embed_events(previous_prefix_codes, previous_gap_tokens)
+        bos = (previous_prefix_codes < 0).all(dim=-1)
+        hidden = hidden + bos[..., None] * self.bos_embedding
+        hidden = hidden + self.length_embedding(lengths - 1)[:, None, :]
+        hidden = self._add_city_state(hidden, city_ids)
+        return hidden + self._time_state_embedding(previous_event_time_minutes)
 
     def _distance_context(
         self, source_prefix_codes: torch.Tensor
@@ -241,18 +273,7 @@ class OccurrenceARPlanner(nn.Module):
         previous_gap_tokens: torch.Tensor,
         previous_event_time_minutes: torch.Tensor,
     ) -> torch.Tensor:
-        prefix_ids = torch.where(
-            previous_prefix_codes >= 0,
-            previous_prefix_codes,
-            torch.full_like(previous_prefix_codes, self.config.codebook_size),
-        )
-        gap_ids = torch.where(
-            previous_gap_tokens >= 0,
-            previous_gap_tokens,
-            torch.full_like(previous_gap_tokens, self.config.gap_vocab),
-        )
-        memory = self._embed_prefix_history(prefix_ids)
-        memory = memory + self.gap_embedding(gap_ids)
+        memory = self._embed_events(previous_prefix_codes, previous_gap_tokens)
         return memory + self._time_state_embedding(previous_event_time_minutes)
 
     def initialize_generation_cache(
@@ -282,33 +303,14 @@ class OccurrenceARPlanner(nn.Module):
         step: int,
         active: torch.Tensor,
     ) -> torch.Tensor:
-        previous_prefixes = batch.previous_prefix_codes[
-            active, step : step + 1
-        ]
-        previous_gaps = batch.previous_gap_tokens[active, step : step + 1]
-        prefix_ids = torch.where(
-            previous_prefixes >= 0,
-            previous_prefixes,
-            torch.full_like(previous_prefixes, self.config.codebook_size),
+        window = slice(step, step + 1)
+        return self._embed_history(
+            batch.previous_prefix_codes[active, window],
+            batch.previous_gap_tokens[active, window],
+            batch.previous_event_time_minutes[active, window],
+            batch.lengths[active],
+            batch.city_ids[active],
         )
-        gap_ids = torch.where(
-            previous_gaps >= 0,
-            previous_gaps,
-            torch.full_like(previous_gaps, self.config.gap_vocab),
-        )
-        hidden = self._embed_prefix_history(prefix_ids)
-        hidden = hidden + self.gap_embedding(gap_ids)
-        bos = (previous_prefixes < 0).all(dim=-1)
-        hidden = hidden + bos[..., None] * self.bos_embedding
-        hidden = (
-            hidden
-            + self.length_embedding(batch.lengths[active] - 1)[:, None, :]
-        )
-        hidden = self._add_city_state(hidden, batch.city_ids[active])
-        previous_time = batch.previous_event_time_minutes[
-            active, step : step + 1
-        ]
-        return hidden + self._time_state_embedding(previous_time)
 
     @torch.no_grad()
     def _encode_history_step(
@@ -356,24 +358,12 @@ class OccurrenceARPlanner(nn.Module):
 
     def _encode_history(self, batch: OccurrenceBatch) -> torch.Tensor:
         previous_prefixes = batch.previous_prefix_codes
-        prefix_ids = torch.where(
-            previous_prefixes >= 0,
+        hidden = self._embed_history(
             previous_prefixes,
-            torch.full_like(previous_prefixes, self.config.codebook_size),
-        )
-        gap_ids = torch.where(
-            batch.previous_gap_tokens >= 0,
             batch.previous_gap_tokens,
-            torch.full_like(batch.previous_gap_tokens, self.config.gap_vocab),
-        )
-        hidden = self._embed_prefix_history(prefix_ids)
-        hidden = hidden + self.gap_embedding(gap_ids)
-        bos = (previous_prefixes < 0).all(dim=-1)
-        hidden = hidden + bos[..., None] * self.bos_embedding
-        hidden = hidden + self.length_embedding(batch.lengths - 1)[:, None, :]
-        hidden = self._add_city_state(hidden, batch.city_ids)
-        hidden = hidden + self._time_state_embedding(
-            batch.previous_event_time_minutes
+            batch.previous_event_time_minutes,
+            batch.lengths,
+            batch.city_ids,
         )
         relation_bias = self.relation_bias(
             previous_prefixes,

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-
 import torch
 
 PLANNER_GAP_CODEC_VERSION = "positive_duration_v1"
@@ -44,67 +42,39 @@ PLANNER_GAP_REPRESENTATIVES_MINUTES = (
 )
 
 
-def exact_gap_duration_minutes(
-    event_time_minutes: torch.Tensor,
-) -> torch.Tensor:
-    times = torch.as_tensor(event_time_minutes, dtype=torch.float32)
-    durations = torch.empty_like(times)
-    durations[..., 0] = times[..., 0]
-    if times.shape[-1] > 1:
-        durations[..., 1:] = times[..., 1:] - times[..., :-1]
-    return durations
-
-
 def reconstruct_event_time_minutes(
     gap_tokens: torch.Tensor,
+    valid_mask: torch.Tensor,
     *,
     representative_minutes: tuple[float, ...],
     observation_window_minutes: float,
-    valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    tokens = torch.as_tensor(gap_tokens, dtype=torch.long)
+    """Event times as cumulative representative gaps, capped at the window."""
     representatives = torch.tensor(
-        representative_minutes,
-        dtype=torch.float32,
-        device=tokens.device,
+        representative_minutes, dtype=torch.float32, device=gap_tokens.device
     )
-    durations = representatives[tokens]
-    if valid_mask is not None:
-        mask = torch.as_tensor(
-            valid_mask, dtype=torch.bool, device=tokens.device
-        )
-        durations = torch.where(mask, durations, 0.0)
+    durations = torch.where(valid_mask, representatives[gap_tokens], 0.0)
     return torch.cumsum(durations, dim=-1).clamp(
         max=float(observation_window_minutes)
     )
 
 
-def bucketize_gap_durations(
-    durations: torch.Tensor, bucket_edges_minutes: Sequence[float]
-) -> torch.Tensor:
-    boundaries = torch.tensor(
-        bucket_edges_minutes, dtype=durations.dtype, device=durations.device
-    )
-    return torch.bucketize(durations, boundaries, right=False).to(torch.long)
-
-
 def gap_tokens_from_event_time_minutes(
     event_time_minutes: torch.Tensor,
-    *,
-    bucket_edges_minutes: tuple[float, ...],
 ) -> torch.Tensor:
-    times = torch.as_tensor(event_time_minutes, dtype=torch.float32)
-    return bucketize_gap_durations(
-        exact_gap_duration_minutes(times), bucket_edges_minutes
+    """Bucket each event's gap since the previous event (the first event's
+    since the week start)."""
+    durations = torch.diff(event_time_minutes, prepend=torch.zeros(1))
+    edges = torch.tensor(
+        PLANNER_GAP_BUCKET_EDGES_MINUTES, dtype=durations.dtype
     )
+    return torch.bucketize(durations, edges, right=False).to(torch.long)
 
 
 __all__ = [
     "PLANNER_GAP_BUCKET_EDGES_MINUTES",
     "PLANNER_GAP_CODEC_VERSION",
     "PLANNER_GAP_REPRESENTATIVES_MINUTES",
-    "bucketize_gap_durations",
-    "exact_gap_duration_minutes",
     "gap_tokens_from_event_time_minutes",
     "reconstruct_event_time_minutes",
 ]

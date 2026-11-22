@@ -153,14 +153,6 @@ def _id_embedding_counts(
     if graph_cfg.id_embedding_dim <= 0:
         return None
     selected = graph_cfg.id_embedding_node_types
-    if selected is not None:
-        unknown = sorted(set(selected).difference(data.node_types))
-        if unknown:
-            raise ValueError(
-                "encoder.graph.id_embedding_node_types names node types "
-                f"absent from the graph: {unknown}; graph has "
-                f"{sorted(data.node_types)}"
-            )
     counts = {
         ntype: int(data[ntype].num_nodes)
         for ntype in data.node_types
@@ -206,7 +198,7 @@ def _export_poi_embeddings(
 def _train(
     cfg: ExperimentConfig,
     data: Any,
-    val_edges: torch.Tensor | None,
+    val_edges: torch.Tensor,
     device: torch.device,
     rank: int = 0,
     world_size: int = 1,
@@ -520,8 +512,6 @@ def run_semantic_id_tokenizer(cfg: ExperimentConfig) -> Path:
     codebooks, model and SID-augmented visits into the run directory."""
     tcfg, layout = cfg.tokenizer, cfg.layout
     arts = layout.tokenizer
-    if arts.augmented_processed_visits.exists():
-        logger.info("replacing existing tokenizer outputs: %s", arts.run_dir)
     logger.info("building semantic IDs  run_dir=%s", arts.run_dir)
     places = pl.read_parquet(layout.preprocessing.places_index)
     features, pca_state = build_features(
@@ -532,9 +522,6 @@ def run_semantic_id_tokenizer(cfg: ExperimentConfig) -> Path:
         pca_graph_dim=tcfg.pca_graph_dim,
         geo_relative_dim=tcfg.geo_relative_dim,
     )
-    # Feature rows follow the places index, one per POI.
-    if not features["placekey_id"].equals(places["placekey_id"]):
-        raise ValueError("POI features do not follow the places index")
 
     torch.manual_seed(tcfg.seed)
     columns = feature_columns(features)
@@ -591,7 +578,6 @@ def run_semantic_id_tokenizer(cfg: ExperimentConfig) -> Path:
         arts.augmented_processed_visits,
         arts.tokenizer_codebooks,
     )
-    arts.mark_complete()
     return arts.augmented_processed_visits
 
 

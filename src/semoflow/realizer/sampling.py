@@ -5,11 +5,6 @@ from dataclasses import dataclass
 
 import torch
 
-from semoflow.realizer.flow_matching import (
-    euler_step,
-    heun_step,
-    velocity_from_x0,
-)
 from semoflow.realizer.model import (
     LatentSuffixConditioning,
     PrefixTimeSuffixLatentFlowRealizer,
@@ -18,6 +13,7 @@ from semoflow.realizer.objective import (
     count_catalog_occurrences,
     normalize_tail,
     suffix_tail_level_embeddings,
+    velocity_from_x0,
 )
 from semoflow.tokenization.sids import (
     codes_to_embeddings,
@@ -190,9 +186,11 @@ class PrefixTailCatalog:
         codebooks: torch.Tensor,
         *,
         prefix_depth: int,
-        observed_codes: torch.Tensor | None = None,
+        observed_codes: torch.Tensor,
         candidate_city: torch.Tensor | None = None,
     ) -> PrefixTailCatalog:
+        """The distinct catalog SIDs sorted by prefix, with log-count priors
+        from the ``[N, M]`` observed train SIDs."""
         codebook_size = int(codebooks.shape[1])
         codes, unique_inverse = torch.unique(
             catalog_codes.long(), dim=0, return_inverse=True
@@ -217,14 +215,12 @@ class PrefixTailCatalog:
             codes[:, :prefix_depth], codebook_size=codebook_size
         )
         order = torch.argsort(keys, stable=True)
-        log_prior = torch.zeros(codes.size(0), dtype=torch.float32)
-        if observed_codes is not None:
-            counts = count_catalog_occurrences(
-                packed_code_keys(codes, codebook_size=codebook_size),
-                observed_codes,
-                codebook_size=codebook_size,
-            )
-            log_prior = torch.log1p(counts.float()).to(codes.device)
+        counts = count_catalog_occurrences(
+            packed_code_keys(codes, codebook_size=codebook_size),
+            observed_codes,
+            codebook_size=codebook_size,
+        )
+        log_prior = torch.log1p(counts.float()).to(codes.device)
         return cls(
             codes=codes[order],
             tail_embeddings=tail[order],
@@ -274,7 +270,6 @@ class PrefixTimeSuffixLatentFlowSample:
     city_constraint_fallback_events: int = 0
 
 
-CATALOG_NOISE_COUPLINGS = ("independent", "trajectory_prefix")
 _UINT32_MASK = 0xFFFFFFFF
 
 
@@ -393,10 +388,8 @@ def _decode_calibrated_catalog(
         catalog.tail_embeddings, tail_mean, tail_whitener
     )
     catalog_levels = suffix_tail_level_embeddings(
-        catalog.codes.unsqueeze(1),
-        catalog.codebooks,
-        prefix_depth=model.prefix_depth,
-    ).squeeze(1)
+        catalog.codes, catalog.codebooks, prefix_depth=model.prefix_depth
+    )
     catalog_features = _precompute_catalog_candidate_features(
         model, normalized_catalog_tail, catalog_levels
     )
@@ -483,11 +476,11 @@ def _integrate_flow(
         v1 = velocity(state, t)
         dt = times_grid[step + 1] - times_grid[step]
         if solver == "heun" and step < num_steps - 1:
-            predicted = euler_step(state, v1, dt).masked_fill(padding, 0.0)
+            predicted = (state + dt * v1).masked_fill(padding, 0.0)
             v2 = velocity(predicted, times_grid[step + 1].expand(rows))
-            state = heun_step(state, v1, v2, dt)
+            state = state + dt * (v1 + v2) * 0.5
         else:
-            state = euler_step(state, v1, dt)
+            state = state + dt * v1
         state = state.masked_fill(padding, 0.0)
     return state
 
@@ -504,37 +497,32 @@ def _integrate_chunks(
     solver: str,
     city_id: torch.LongTensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Integrate the flow from ``noise`` in row chunks, in eval mode.
+    """Integrate the flow from ``noise`` in row chunks.
 
     Returns the normalized endpoints and the conditioning plans.
     """
     batch_size = valid.size(0)
     normalized_chunks: list[torch.Tensor] = []
     conditioning_chunks: list[torch.Tensor] = []
-    was_training = model.training
-    model.eval()
-    try:
-        for start in range(0, batch_size, chunk_size):
-            rows = slice(start, min(start + chunk_size, batch_size))
-            conditioning = model.encode_conditioning(
-                prefix[rows],
-                times[rows],
+    for start in range(0, batch_size, chunk_size):
+        rows = slice(start, min(start + chunk_size, batch_size))
+        conditioning = model.encode_conditioning(
+            prefix[rows],
+            times[rows],
+            valid[rows],
+            city_id=None if city_id is None else city_id[rows],
+        )
+        conditioning_chunks.append(conditioning.plan)
+        normalized_chunks.append(
+            _integrate_flow(
+                model,
+                noise[rows],
+                conditioning,
                 valid[rows],
-                city_id=None if city_id is None else city_id[rows],
+                times_grid,
+                solver=solver,
             )
-            conditioning_chunks.append(conditioning.plan.detach())
-            normalized_chunks.append(
-                _integrate_flow(
-                    model,
-                    noise[rows].clone(),
-                    conditioning,
-                    valid[rows],
-                    times_grid,
-                    solver=solver,
-                )
-            )
-    finally:
-        model.train(was_training)
+        )
     return torch.cat(normalized_chunks, dim=0), torch.cat(
         conditioning_chunks, dim=0
     )
@@ -550,21 +538,18 @@ def sample_prefix_time_suffix_latent_flow(
     catalog: PrefixTailCatalog,
     tail_mean: torch.Tensor,
     tail_whitener: torch.Tensor,
-    num_steps: int = 32,
-    solver: str = "heun",
-    device: torch.device | str | None = None,
-    generator: torch.Generator | None = None,
-    max_batch_size: int | None = None,
-    catalog_prior_weight: float = 0.25,
-    catalog_temperature: float = 1.0,
-    city_id: torch.LongTensor | None = None,
-    catalog_noise_coupling: str = "independent",
+    num_steps: int,
+    solver: str,
+    generator: torch.Generator,
+    max_batch_size: int,
+    catalog_prior_weight: float,
+    catalog_temperature: float,
+    city_id: torch.LongTensor | None,
+    catalog_noise_coupling: str,
 ) -> PrefixTimeSuffixLatentFlowSample:
-    if solver not in {"euler", "heun"}:
-        raise ValueError("solver must be 'euler' or 'heun'")
-
-    model_device = next(model.parameters()).device
-    resolved_device = model_device if device is None else torch.device(device)
+    """Complete each planned prefix with an eval-mode ``model``: integrate
+    the suffix flow, then decode it into the catalog."""
+    resolved_device = next(model.parameters()).device
     prefix = prefix_codes.to(resolved_device, dtype=torch.long)
     times = time_tokens.to(resolved_device, dtype=torch.long)
     valid = valid_mask.to(resolved_device, dtype=torch.bool)
@@ -572,12 +557,7 @@ def sample_prefix_time_suffix_latent_flow(
     tail_whitener = tail_whitener.to(resolved_device).float()
     catalog = catalog.to(resolved_device)
 
-    if generator is None:
-        generator = torch.Generator(device=resolved_device)
-        generator.manual_seed(torch.seed())
-
     batch_size, seq_len = valid.shape
-    chunk_size = batch_size if max_batch_size is None else max_batch_size
     times_grid = torch.linspace(
         1.0, 0.0, num_steps + 1, device=resolved_device
     )
@@ -595,7 +575,7 @@ def sample_prefix_time_suffix_latent_flow(
         times,
         valid,
         times_grid,
-        chunk_size=chunk_size,
+        chunk_size=max_batch_size,
         solver=solver,
         city_id=city_id,
     )
@@ -624,7 +604,6 @@ def sample_prefix_time_suffix_latent_flow(
 
 
 __all__ = [
-    "CATALOG_NOISE_COUPLINGS",
     "PrefixTailCatalog",
     "PrefixTimeSuffixLatentFlowSample",
     "sample_prefix_time_suffix_latent_flow",

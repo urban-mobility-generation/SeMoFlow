@@ -3,6 +3,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from semoflow.tokenization.sids import find_sorted, packed_code_keys
+
 
 class LegalPrefixIndex(nn.Module):
     def __init__(
@@ -14,12 +16,12 @@ class LegalPrefixIndex(nn.Module):
         city_legal_prefix_mask: torch.Tensor,
     ) -> None:
         super().__init__()
-        codes = torch.as_tensor(legal_prefixes, dtype=torch.long)
+        codes = legal_prefixes.long()
         self.codebook_size = int(codebook_size)
         self.prefix_depth = int(prefix_depth)
         self.register_buffer("codes", codes.clone(), persistent=False)
 
-        city_mask = torch.as_tensor(city_legal_prefix_mask, dtype=torch.bool)
+        city_mask = city_legal_prefix_mask.bool()
 
         flat = self._flatten(codes)
         sorted_flat_ids, token_ids = torch.sort(flat)
@@ -75,30 +77,35 @@ class LegalPrefixIndex(nn.Module):
         return int(self.codes.shape[0])
 
     def _flatten(self, codes: torch.Tensor) -> torch.Tensor:
-        depth = codes.shape[-1]
-        weights = torch.tensor(
-            [
-                self.codebook_size ** (depth - level - 1)
-                for level in range(depth)
-            ],
-            dtype=torch.long,
-            device=codes.device,
-        )
-        return (codes * weights).sum(dim=-1)
+        return packed_code_keys(codes, codebook_size=self.codebook_size)
+
+    def _find(
+        self, sorted_ids: torch.Tensor, codes: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Each code row's position in ``sorted_ids`` and whether it is
+        there; rows with out-of-range codes are never found."""
+        in_range = ((codes >= 0) & (codes < self.codebook_size)).all(dim=-1)
+        safe = codes.clamp(min=0, max=self.codebook_size - 1)
+        positions, found = find_sorted(sorted_ids, self._flatten(safe))
+        return positions, in_range & found
 
     def resolve_token_ids(
         self, codes: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        in_range = ((codes >= 0) & (codes < self.codebook_size)).all(dim=-1)
-        safe = codes.clamp(min=0, max=self.codebook_size - 1)
-        flat = self._flatten(safe)
-        positions = torch.searchsorted(self.sorted_flat_ids, flat)
-        safe_positions = positions.clamp(max=self.vocabulary_size - 1)
-        found = self.sorted_flat_ids[safe_positions] == flat
-        return (
-            self.token_ids_by_sorted_flat[safe_positions],
-            in_range & found,
-        )
+        positions, found = self._find(self.sorted_flat_ids, codes)
+        return self.token_ids_by_sorted_flat[positions], found
+
+    def parent_rows(
+        self, level: int, parents: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Each ``level``-code parent's row in the level's tables, and
+        whether the parent is legal."""
+        if level == 0:
+            rows = torch.zeros(
+                parents.shape[0], dtype=torch.long, device=parents.device
+            )
+            return rows, torch.ones_like(rows, dtype=torch.bool)
+        return self._find(getattr(self, f"level_{level}_parent_ids"), parents)
 
     def next_mask(
         self,
@@ -107,14 +114,5 @@ class LegalPrefixIndex(nn.Module):
         catalog_rows: torch.Tensor,
     ) -> torch.Tensor:
         city_masks = getattr(self, f"level_{level}_city_masks")
-        if level == 0:
-            return city_masks[catalog_rows, 0]
-        valid = ((parents >= 0) & (parents < self.codebook_size)).all(dim=-1)
-        safe = parents.clamp(min=0, max=self.codebook_size - 1)
-        flat = self._flatten(safe)
-        parent_ids = getattr(self, f"level_{level}_parent_ids")
-        positions = torch.searchsorted(parent_ids, flat)
-        safe_positions = positions.clamp(max=parent_ids.shape[0] - 1)
-        found = parent_ids[safe_positions] == flat
-        result = city_masks[catalog_rows, safe_positions]
-        return result & valid[..., None] & found[..., None]
+        rows, found = self.parent_rows(level, parents)
+        return city_masks[catalog_rows, rows] & found[..., None]

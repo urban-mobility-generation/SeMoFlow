@@ -34,8 +34,6 @@ def _cached_table[K, V](build: Callable[[K], V], lookup: K) -> V:
 def _latlon_table(
     placekey_latlon: dict[int, tuple[float, float]],
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    if not placekey_latlon:
-        return torch.zeros(0, 2), torch.zeros(0, dtype=torch.bool), -1
     keys = np.fromiter(
         placekey_latlon.keys(), dtype=np.int64, count=len(placekey_latlon)
     )
@@ -52,13 +50,6 @@ def _latlon_table(
 def _geohash_table(
     geohash_lookup: dict[int, str],
 ) -> tuple[torch.Tensor, torch.Tensor, int, dict[str, int]]:
-    if not geohash_lookup:
-        return (
-            torch.zeros(0, dtype=torch.long),
-            torch.zeros(0, dtype=torch.bool),
-            -1,
-            {},
-        )
     all_geohashes = sorted(set(geohash_lookup.values()))
     gh_index = {gh: i for i, gh in enumerate(all_geohashes)}
     keys = np.fromiter(
@@ -97,14 +88,11 @@ def _lookup_coordinates(
     tokens: torch.Tensor,
     placekey_latlon: dict[int, tuple[float, float]],
     pad_id: int,
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """(lat, lon) per token and whether it is a located POI; ``None`` for
-    an empty lookup."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(lat, lon) per token and whether it is a located POI."""
     coords, lookup_valid, max_id = _cached_table(
         _latlon_table, placekey_latlon
     )
-    if max_id < 0:
-        return None
     rows, valid = _table_rows(
         tokens, lookup_valid.to(tokens.device), max_id, pad_id
     )
@@ -135,10 +123,7 @@ def per_sequence_travel_distance(
     *,
     pad_id: int = PAD_ID,
 ) -> torch.Tensor:
-    located = _lookup_coordinates(tokens, placekey_latlon, pad_id)
-    if located is None:
-        return torch.zeros(tokens.size(0))
-    gathered, valid = located
+    gathered, valid = _lookup_coordinates(tokens, placekey_latlon, pad_id)
     n, t = valid.shape
     if t < 2:
         return torch.zeros(n, dtype=gathered.dtype, device=gathered.device)
@@ -236,10 +221,7 @@ def per_sequence_radius_of_gyration(
     *,
     pad_id: int = PAD_ID,
 ) -> torch.Tensor:
-    located = _lookup_coordinates(tokens, placekey_latlon, pad_id)
-    if located is None:
-        return torch.zeros(tokens.size(0))
-    gathered, valid = located
+    gathered, valid = _lookup_coordinates(tokens, placekey_latlon, pad_id)
     mask_f = valid.float().unsqueeze(-1)
     totals = (gathered * mask_f).sum(dim=1)
     counts = mask_f.sum(dim=1).squeeze(-1)
@@ -265,8 +247,6 @@ def spatial_jsd(
     gh_table, valid_tbl, max_id, gh_index = _cached_table(
         _geohash_table, geohash_lookup
     )
-    if max_id < 0:
-        return float("nan")
     n_hashes = len(gh_index)
 
     def _hist(tokens: torch.Tensor) -> torch.Tensor:

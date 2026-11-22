@@ -31,7 +31,7 @@ def _transformer_encoder(
     layer = nn.TransformerEncoderLayer(
         d_model=model_dim,
         nhead=num_heads,
-        dim_feedforward=max(1, int(model_dim * mlp_ratio)),
+        dim_feedforward=int(model_dim * mlp_ratio),
         dropout=dropout,
         activation="gelu",
         batch_first=True,
@@ -47,19 +47,19 @@ class PrefixTimeSuffixLatentFlowRealizer(nn.Module):
         self,
         *,
         max_seq_len: int,
-        prefix_depth: int = 3,
-        num_codebooks: int = 6,
-        codebook_size: int = 64,
-        time_vocab: int = 42,
-        latent_dim: int = 128,
-        model_dim: int = 256,
-        condition_depth: int = 4,
-        depth: int = 6,
-        num_heads: int = 8,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.1,
+        prefix_depth: int,
+        num_codebooks: int,
+        codebook_size: int,
+        time_vocab: int,
+        latent_dim: int,
+        model_dim: int,
+        condition_depth: int,
+        depth: int,
+        num_heads: int,
+        mlp_ratio: float,
+        dropout: float,
         prefix_plan_codebooks: torch.Tensor,
-        city_vocab: int = 0,
+        city_vocab: int,
     ) -> None:
         """Hard-prefix suffix flow over summed, whitened suffix-tail latents.
 
@@ -183,12 +183,7 @@ class PrefixTimeSuffixLatentFlowRealizer(nn.Module):
         )
         if self.city_vocab > 0:
             assert city_id is not None
-            city = city_id.long()
-            plan = plan + self.city_embedding(city)[:, None, :]
-        elif city_id is not None:
-            raise ValueError(
-                "city_id was supplied but the model has city_vocab=0"
-            )
+            plan = plan + self.city_embedding(city_id.long())[:, None, :]
         plan = self.condition_encoder(
             plan,
             src_key_padding_mask=~valid,
@@ -201,10 +196,8 @@ class PrefixTimeSuffixLatentFlowRealizer(nn.Module):
         t: torch.Tensor,
         conditioning: LatentSuffixConditioning,
         *,
-        valid_mask: torch.BoolTensor | None = None,
+        valid_mask: torch.BoolTensor,
     ) -> torch.Tensor:
-        valid = conditioning.valid_mask if valid_mask is None else valid_mask
-
         positions = torch.arange(zt.size(1), device=zt.device)
         x = (
             self.input_projection(zt)
@@ -212,12 +205,9 @@ class PrefixTimeSuffixLatentFlowRealizer(nn.Module):
             + self.flow_position_embedding(positions)[None, :, :]
             + self.timestep_embedding(t).unsqueeze(1)
         )
-        x = self.flow_trunk(
-            x,
-            src_key_padding_mask=~valid,
-        )
+        x = self.flow_trunk(x, src_key_padding_mask=~valid_mask)
         prediction = self.output_projection(self.output_norm(x))
-        return prediction.masked_fill(~valid[..., None], 0.0)
+        return prediction.masked_fill(~valid_mask[..., None], 0.0)
 
     def catalog_query_features(
         self,
@@ -245,9 +235,6 @@ class PrefixTimeSuffixLatentFlowRealizer(nn.Module):
         )
         candidate = self.catalog_candidate(candidate_input)
         return self.catalog_score_norm(candidate)
-
-    def count_parameters(self) -> int:
-        return sum(parameter.numel() for parameter in self.parameters())
 
 
 __all__ = [

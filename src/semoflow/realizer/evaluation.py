@@ -31,7 +31,6 @@ from semoflow.realizer.bank import (
 )
 from semoflow.realizer.model import PrefixTimeSuffixLatentFlowRealizer
 from semoflow.realizer.sampling import (
-    CATALOG_NOISE_COUPLINGS,
     PrefixTailCatalog,
     sample_prefix_time_suffix_latent_flow,
 )
@@ -87,7 +86,7 @@ def load_realizer_checkpoint(
         mlp_ratio=float(config["mlp_ratio"]),
         dropout=float(config["dropout"]),
         prefix_plan_codebooks=codebooks[:prefix_depth],
-        city_vocab=int(config.get("city_vocab", 0)),
+        city_vocab=int(config["city_vocab"]),
     ).to(device)
     model.load_state_dict(state)
     model.eval()
@@ -125,7 +124,6 @@ def _catalog(
     payload: dict[str, Any],
     *,
     lookup_path: Path,
-    places_path: Path,
 ) -> PrefixTailCatalog:
     """The legal SID catalog generation decodes into, with the train-split
     log-count prior and, for a city-conditioned realizer, each SID's city."""
@@ -137,33 +135,11 @@ def _catalog(
     offset, count = bank_split_window(payload, "train")
     rows = slice(offset, offset + count)
     observed = payload["sid_codes"][rows][payload["valid_mask"][rows].bool()]
-    city = None
-    if model.city_vocab > 0:
-        places = pl.read_parquet(
-            places_path, columns=["placekey_id", "city_id"]
-        )
-        city_of_sid = (
-            lookup.select("placekey_id", *columns)
-            .join(places, on="placekey_id", how="left", maintain_order="left")
-            .drop_nulls("city_id")
-            .unique(columns, keep="first", maintain_order=True)
-            .drop("placekey_id")
-        )
-        city_column = (
-            lookup.select(columns)
-            .join(city_of_sid, on=columns, how="left", maintain_order="left")[
-                "city_id"
-            ]
-            .fill_null(-1)
-        )
-        missing = int((city_column == -1).sum())
-        if missing:
-            LOGGER.warning(
-                "%d catalog rows have no city and cannot satisfy the "
-                "constraint",
-                missing,
-            )
-        city = torch.from_numpy(city_column.to_numpy().astype("int64"))
+    city = (
+        torch.from_numpy(lookup["city_id"].to_numpy().astype("int64"))
+        if model.city_vocab > 0
+        else None
+    )
     return PrefixTailCatalog.from_codes(
         catalog_codes,
         codebooks,
@@ -229,12 +205,11 @@ def _sample_arm(
         tail_mean=checkpoint["tail_mean"].float().to(device),
         tail_whitener=checkpoint["tail_whitener"].float().to(device),
         catalog_prior_weight=float(
-            checkpoint["config"].get("catalog_prior_weight", 0.25)
+            checkpoint["config"]["catalog_prior_weight"]
         ),
         catalog_temperature=catalog_temperature,
         num_steps=num_steps,
         solver=solver,
-        device=device,
         generator=torch.Generator(device=device).manual_seed(arm.seed),
         max_batch_size=batch_size,
         city_id=None if arm.city_id is None else arm.city_id.to(device),
@@ -272,12 +247,6 @@ def evaluate_planner_realizer(
 ) -> dict[str, Any]:
     """Complete planner samples with the realizer, score both arms against
     the reference split, and write the report to ``output``."""
-    if max_samples < 1 or batch_size < 1:
-        raise ValueError("max_samples and batch_size must be positive")
-    if catalog_noise_coupling not in CATALOG_NOISE_COUPLINGS:
-        raise ValueError(
-            f"catalog_noise_coupling must be one of {CATALOG_NOISE_COUPLINGS}"
-        )
     if candidate_selection != "first" and candidate_prior is None:
         raise ValueError("--candidate-selection requires --candidate-prior")
     started = time.perf_counter()
@@ -286,12 +255,10 @@ def evaluate_planner_realizer(
         realizer_checkpoint, resolved_device
     )
     temperature = float(
-        checkpoint["config"].get("catalog_temperature", 1.0)
+        checkpoint["config"]["catalog_temperature"]
         if catalog_temperature is None
         else catalog_temperature
     )
-    if temperature <= 0.0:
-        raise ValueError("catalog temperature must be positive")
 
     payload = load_bank_payload(bank)
     real_codes, real_times, real_valid, real_placekey_ids = load_reference(
@@ -300,7 +267,6 @@ def evaluate_planner_realizer(
     plan = plan_from_planner_samples(
         torch.load(planner_samples, map_location="cpu", weights_only=False),
         width=model.max_seq_len,
-        prefix_depth=model.prefix_depth,
         max_rows=max_samples,
     )
     n_rows = min(real_codes.size(0), plan.prefix.size(0))
@@ -316,16 +282,10 @@ def evaluate_planner_realizer(
         checkpoint["codebooks"].float(),
         payload,
         lookup_path=lookup,
-        places_path=places,
     )
 
     gold_city = sampled_city = None
     if model.city_vocab > 0:
-        if plan.city_id is None:
-            raise ValueError(
-                "planner samples carry no city_ids; a city-conditioned "
-                "realizer cannot be evaluated on them"
-            )
         gold_city = bank_split_city_ids(payload, reference_split, rows=n_rows)
         sampled_city = plan.city_id[:n_rows]
     gold_prefix = real_codes[..., : model.prefix_depth]

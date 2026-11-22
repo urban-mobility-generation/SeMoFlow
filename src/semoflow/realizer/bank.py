@@ -66,12 +66,7 @@ def _build_split(
     rows = frame.iter_rows(named=True)
     selected: list[tuple[np.ndarray, np.ndarray]] = []
     for row in rows:
-        try:
-            codes = np.stack([lookup[int(pid)] for pid in row["placekey_id"]])
-        except KeyError as error:
-            raise ValueError(
-                f"{split} segment visits placekey_id {error} with no SID"
-            ) from None
+        codes = np.stack([lookup[int(pid)] for pid in row["placekey_id"]])
         selected.append(
             (codes, time_tokens_from_timestamps(row["_timestamps"]))
         )

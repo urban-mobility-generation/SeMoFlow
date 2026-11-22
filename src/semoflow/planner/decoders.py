@@ -44,24 +44,9 @@ def sample_categorical_logits(
 
 
 class _CompileSafeGRUCell(nn.GRUCell):
-    def forward(
-        self,
-        input: torch.Tensor,
-        hx: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        is_batched = input.dim() == 2
-        if not is_batched:
-            input = input.unsqueeze(0)
-        if hx is None:
-            hx = torch.zeros(
-                input.shape[0],
-                self.hidden_size,
-                dtype=input.dtype,
-                device=input.device,
-            )
-        elif not is_batched:
-            hx = hx.unsqueeze(0)
+    """``nn.GRUCell`` written out in tensor ops, which compile fully."""
 
+    def forward(self, input: torch.Tensor, hx: torch.Tensor) -> torch.Tensor:
         input_reset, input_update, input_new = F.linear(
             input, self.weight_ih, self.bias_ih
         ).chunk(3, dim=-1)
@@ -71,8 +56,7 @@ class _CompileSafeGRUCell(nn.GRUCell):
         reset = torch.sigmoid(input_reset + hidden_reset)
         update = torch.sigmoid(input_update + hidden_update)
         new = torch.tanh(input_new + reset * hidden_new)
-        output = new + update * (hx - new)
-        return output if is_batched else output.squeeze(0)
+        return new + update * (hx - new)
 
 
 class HierarchicalPrefixDecoder(nn.Module):

@@ -82,14 +82,9 @@ def _pca(
 def city_relative_position_frame(
     places_index: pl.DataFrame, dim: int
 ) -> tuple[pl.DataFrame, dict[int, tuple[float, float]]]:
-    required = {"placekey_id", "latitude", "longitude", "city_id"}
-    missing = required - set(places_index.columns)
-    if missing:
-        raise ValueError(
-            "city-relative position requires "
-            f"{sorted(required)} on the places index; missing {sorted(missing)}"
-        )
-    frame = places_index.select(sorted(required))
+    frame = places_index.select(
+        sorted({"placekey_id", "latitude", "longitude", "city_id"})
+    )
     fitted = (
         frame.drop_nulls(["latitude", "longitude"])
         .group_by("city_id")
@@ -125,10 +120,6 @@ def city_relative_position_frame(
                 columns[f"geo_{index}"] = np.sin(angle).astype("float32")
                 columns[f"geo_{index + 1}"] = np.cos(angle).astype("float32")
                 index += 2
-    if len(columns) != dim:
-        raise ValueError(
-            f"geo_relative_dim {dim} produced {len(columns)} columns"
-        )
     logger.info(
         "city-relative position: %d columns over %d cities, %d POIs without "
         "coordinates centred at their city centre and flagged",
@@ -173,10 +164,7 @@ def build_features(
     geo, centroids = city_relative_position_frame(
         places_index, geo_relative_dim
     )
-    rows = frame.height
     frame = frame.join(geo, on="placekey_id", maintain_order="left")
-    if frame.height != rows:
-        raise ValueError("city-relative position did not cover every POI")
     return frame, {
         **text_pca,
         "graph_pca": graph_pca,

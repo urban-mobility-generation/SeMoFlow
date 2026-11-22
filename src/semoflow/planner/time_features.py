@@ -17,12 +17,7 @@ def time_features(
     *,
     observation_window_minutes: float,
 ) -> torch.Tensor:
-    if observation_window_minutes <= 0.0 or not math.isfinite(
-        observation_window_minutes
-    ):
-        raise ValueError(
-            "observation_window_minutes must be finite and positive"
-        )
+    """Daily and weekly harmonics plus the elapsed window fraction."""
     minutes = event_time_minutes.float()
     day_phase = (
         2.0 * math.pi * torch.remainder(minutes, _DAY_MINUTES) / _DAY_MINUTES

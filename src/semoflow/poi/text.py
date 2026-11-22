@@ -87,10 +87,6 @@ def encode_texts(
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
     }
-    if precision not in dtypes:
-        raise ValueError(
-            "text precision must be float32, float16, or bfloat16"
-        )
     devices = _parse_devices(device)
     multi_gpu = len(devices) > 1
 

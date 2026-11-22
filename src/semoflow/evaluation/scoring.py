@@ -63,8 +63,6 @@ def load_reference(
     """The leading ``max_samples`` bank rows of a split, with their POIs."""
     offset, count = bank_split_window(payload, split)
     selected = min(count, max_samples)
-    if selected == 0:
-        raise ValueError("reference selection is empty")
     rows = slice(offset, offset + selected)
     valid_mask = payload["valid_mask"][rows].bool()
     frame = bank_segments(payload, split, ["placekey_id"], rows=selected)
@@ -118,8 +116,6 @@ def elapsed_recurrence_block(
     """
 
     def events(poi, valid, hours) -> ReturnEvents:
-        if hours.shape != valid.shape:
-            raise ValueError("event hours do not align with the valid mask")
         poi = poi.cpu().numpy()
         return ReturnEvents(
             place_ids=poi,
@@ -141,14 +137,13 @@ class SampledPlan:
     time_tokens: torch.Tensor
     valid: torch.Tensor
     event_hours: torch.Tensor
-    city_id: torch.Tensor | None
+    city_id: torch.Tensor
 
 
 def plan_from_planner_samples(
     samples: Mapping[str, Any],
     *,
     width: int,
-    prefix_depth: int,
     max_rows: int,
 ) -> SampledPlan:
     """The leading ``max_rows`` planner samples as a realizer plan.
@@ -161,11 +156,6 @@ def plan_from_planner_samples(
     prefix = samples["prefix_codes"][:max_rows].long()
     lengths = samples["lengths"][:max_rows].long()
     minutes = samples["event_time_minutes"][:max_rows].float()
-    if prefix.size(-1) != prefix_depth:
-        raise ValueError(
-            f"planner samples have prefix depth {prefix.size(-1)}; the "
-            f"realizer expects {prefix_depth}"
-        )
     if bool((lengths > width).any()):
         raise ValueError(
             "planner samples contain a trajectory longer than the "
@@ -182,7 +172,6 @@ def plan_from_planner_samples(
         right=True,
     )
     day = (clamped / 1440.0).long()
-    city = samples.get("city_ids")
     return SampledPlan(
         prefix=prefix,
         time_tokens=(day * N_PART_OF_DAY_BINS + part_of_day).masked_fill(
@@ -192,7 +181,7 @@ def plan_from_planner_samples(
         event_hours=(minutes.double() / 60.0).masked_fill(
             ~valid, float("nan")
         ),
-        city_id=None if city is None else city[:max_rows].long(),
+        city_id=samples["city_ids"][:max_rows].long(),
     )
 
 

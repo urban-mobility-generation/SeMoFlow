@@ -48,19 +48,19 @@ def _load_prefix_lookup(
     torch.Tensor,
 ]:
     """Map placekey ids to (prefix, city) and derive prefix legality."""
-    names = pl.read_parquet_schema(lookup_path)
-    selected = list(sid_code_columns(names))[:prefix_depth]
-    has_city = "city_id" in names
+    selected = list(sid_code_columns(pl.read_parquet_schema(lookup_path)))
     frame = pl.read_parquet(
         lookup_path,
-        columns=["placekey_id", *(["city_id"] if has_city else []), *selected],
+        columns=["placekey_id", "city_id", *selected[:prefix_depth]],
     )
     mapping: dict[int, tuple[torch.Tensor, int]] = {}
     city_tuples: dict[int, set[tuple[int, ...]]] = {}
-    for row in frame.iter_rows():
-        city_id = int(row[1]) if has_city else 0
-        codes = tuple(int(value) for value in row[1 + has_city :])
-        mapping[int(row[0])] = (torch.tensor(codes, dtype=torch.long), city_id)
+    for placekey_id, city_id, *prefix in frame.iter_rows():
+        codes = tuple(int(value) for value in prefix)
+        mapping[int(placekey_id)] = (
+            torch.tensor(codes, dtype=torch.long),
+            int(city_id),
+        )
         city_tuples.setdefault(city_id, set()).add(codes)
 
     ordered_tuples = sorted(set().union(*city_tuples.values()))
@@ -135,8 +135,7 @@ def _materialize_split(
             [prefix for prefix, _ in lookup_rows]
         )
         gaps[row_index, :length] = gap_tokens_from_event_time_minutes(
-            _event_minutes(list(row["_timestamps"])),
-            bucket_edges_minutes=PLANNER_GAP_BUCKET_EDGES_MINUTES,
+            _event_minutes(list(row["_timestamps"]))
         )
     return {
         "prefix_codes": prefixes,

@@ -11,8 +11,7 @@ DISTANCE_BUCKETS = len(DISTANCE_BUCKET_EDGES_KM) + 1
 
 
 def unit_vectors(coordinates: torch.Tensor) -> torch.Tensor:
-    if coordinates.shape[-1] != 2:
-        raise ValueError("coordinates must end with (latitude, longitude)")
+    """Unit vectors on the sphere of ``[..., (latitude, longitude)]``."""
     latitude = torch.deg2rad(coordinates[..., 0].double())
     longitude = torch.deg2rad(coordinates[..., 1].double())
     return torch.stack(
@@ -34,8 +33,8 @@ class PrefixDistancePrior(nn.Module):
         centroid_available: torch.Tensor,
     ) -> None:
         super().__init__()
-        coordinates = torch.as_tensor(centroids, dtype=torch.float32)
-        available = torch.as_tensor(centroid_available, dtype=torch.bool)
+        coordinates = centroids.float()
+        available = centroid_available.bool()
         object.__setattr__(self, "legality", legality)
         self.codebook_size = legality.codebook_size
         self.prefix_depth = legality.prefix_depth
@@ -76,11 +75,7 @@ class PrefixDistancePrior(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         codes = self.legality.codes
         parent_ids = getattr(self.legality, f"level_{level}_parent_ids")
-        if level == 0:
-            parent_rows = torch.zeros(codes.shape[0], dtype=torch.long)
-        else:
-            flat = self._flatten(codes[:, :level])
-            parent_rows = torch.searchsorted(parent_ids, flat)
+        parent_rows, _ = self.legality.parent_rows(level, codes[:, :level])
         slots = parent_rows * self.codebook_size + codes[:, level]
         total = parent_ids.shape[0] * self.codebook_size
 
@@ -97,20 +92,9 @@ class PrefixDistancePrior(nn.Module):
             (counts > 0.0).reshape(parent_ids.shape[0], self.codebook_size),
         )
 
-    def _flatten(self, codes: torch.Tensor) -> torch.Tensor:
-        depth = codes.shape[-1]
-        weights = torch.tensor(
-            [self.codebook_size ** (depth - i - 1) for i in range(depth)],
-            dtype=torch.long,
-            device=codes.device,
-        )
-        return (codes * weights).sum(dim=-1)
-
     def source_state(
         self, prefix_codes: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if prefix_codes.shape[-1] != self.prefix_depth:
-            raise ValueError("source prefixes must end with prefix_depth")
         token_ids, contained = self.legality.resolve_token_ids(prefix_codes)
         units = self.leaf_units[token_ids]
         valid = contained & self.leaf_available[token_ids]
@@ -141,26 +125,9 @@ class PrefixDistancePrior(nn.Module):
         source_units: torch.Tensor,
         source_valid: torch.Tensor,
     ) -> torch.Tensor:
-        if not 0 <= level < self.prefix_depth:
-            raise ValueError("level is outside prefix_depth")
-        if parents.shape[-1] != level:
-            raise ValueError("parents must contain exactly `level` codes")
         units = getattr(self, f"level_{level}_child_units")
         covered = getattr(self, f"level_{level}_child_available")
-        if level == 0:
-            rows = torch.zeros(
-                parents.shape[0], dtype=torch.long, device=parents.device
-            )
-            found = torch.ones_like(rows, dtype=torch.bool)
-        else:
-            parent_ids = getattr(self.legality, f"level_{level}_parent_ids")
-            in_range = ((parents >= 0) & (parents < self.codebook_size)).all(
-                dim=-1
-            )
-            safe = parents.clamp(min=0, max=self.codebook_size - 1)
-            positions = torch.searchsorted(parent_ids, self._flatten(safe))
-            rows = positions.clamp(max=parent_ids.shape[0] - 1)
-            found = in_range & (parent_ids[rows] == self._flatten(safe))
+        rows, found = self.legality.parent_rows(level, parents)
         return self._bias(
             units[rows],
             covered[rows] & found[..., None],

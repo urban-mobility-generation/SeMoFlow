@@ -92,12 +92,12 @@ def _transition_edges(
     poi_col: str,
     ts_col: str,
     poi_lookup: pl.DataFrame,
-    train_fraction: float | None,
+    train_fraction: float,
     seed: int,
-) -> tuple[dict[str, torch.Tensor], torch.Tensor | None, int]:
+) -> tuple[dict[str, torch.Tensor], torch.Tensor, int]:
     """Consecutive-visit POI edges keyed by the arrival's time of day.
 
-    With ``train_fraction``, a seeded share of the transitions is held out
+    A seeded ``1 - train_fraction`` share of the transitions is held out
     and returned as validation edges instead.
     """
     seq = (
@@ -111,8 +111,6 @@ def _transition_edges(
         .drop_nulls("dst_pk")
         .filter(pl.col(poi_col) != pl.col("dst_pk"))
     )
-    if seq.is_empty():
-        return {}, None, 0
     arrival = pl.col("dst_ts").cast(pl.Datetime)
     seq = seq.with_columns(
         arrival.dt.hour().alias("dst_hour"),
@@ -123,26 +121,24 @@ def _transition_edges(
     hour = seq["dst_hour"].to_numpy()
     weekday = seq["dst_weekday"].to_numpy()
 
-    val_edge_index = None
-    if train_fraction is not None:
-        n = len(src)
-        generator = torch.Generator().manual_seed(seed)
-        perm = torch.randperm(n, generator=generator).numpy()
-        train_rows = np.zeros(n, dtype=bool)
-        train_rows[perm[: int(n * train_fraction)]] = True
-        val_rows = ~train_rows
-        val_edge_index = torch.tensor(
-            np.stack([src[val_rows], dst[val_rows]]), dtype=torch.long
-        )
-        logger.info(
-            "  temporal edge split  train=%d  val=%d  fraction=%.2f  seed=%d",
-            train_rows.sum(),
-            val_rows.sum(),
-            train_fraction,
-            seed,
-        )
-        src, dst = src[train_rows], dst[train_rows]
-        hour, weekday = hour[train_rows], weekday[train_rows]
+    n = len(src)
+    generator = torch.Generator().manual_seed(seed)
+    perm = torch.randperm(n, generator=generator).numpy()
+    train_rows = np.zeros(n, dtype=bool)
+    train_rows[perm[: int(n * train_fraction)]] = True
+    val_rows = ~train_rows
+    val_edge_index = torch.tensor(
+        np.stack([src[val_rows], dst[val_rows]]), dtype=torch.long
+    )
+    logger.info(
+        "  temporal edge split  train=%d  val=%d  fraction=%.2f  seed=%d",
+        train_rows.sum(),
+        val_rows.sum(),
+        train_fraction,
+        seed,
+    )
+    src, dst = src[train_rows], dst[train_rows]
+    hour, weekday = hour[train_rows], weekday[train_rows]
 
     weekend = weekday >= 6
     masks = (
@@ -165,13 +161,13 @@ def build_hetero_data(
     stays_df: pl.DataFrame,
     places_index_df: pl.DataFrame,
     text_embeddings_path: Path,
-    train_fraction: float | None = None,
-    seed: int = 42,
-) -> tuple[HeteroData, torch.Tensor | None]:
+    train_fraction: float,
+    seed: int,
+) -> tuple[HeteroData, torch.Tensor]:
     """POI graph with user, category and CBG nodes plus transition edges.
 
-    Returns the graph and, when ``train_fraction`` is set, the held-out
-    transition edges for link-prediction validation.
+    Returns the graph and the held-out transition edges for link-prediction
+    validation.
     """
     t0 = time.perf_counter()
     logger.info(
@@ -307,11 +303,9 @@ def _edge_keys(edge_index: torch.Tensor, n_nodes: int) -> torch.Tensor:
     return torch.unique(src[keep] * n_nodes + dst[keep])
 
 
-def _category_ids(data: HeteroData) -> torch.Tensor | None:
-    edge_type = ("poi", "has_category", "category")
-    if edge_type not in data.edge_types:
-        return None
-    edge_index = data[edge_type].edge_index
+def _category_ids(data: HeteroData) -> torch.Tensor:
+    """Each POI's category node, or ``-1`` without a category."""
+    edge_index = data["poi", "has_category", "category"].edge_index
     result = torch.full((int(data["poi"].num_nodes),), -1, dtype=torch.long)
     result[edge_index[0]] = edge_index[1]
     return result
@@ -398,10 +392,8 @@ def build_graph_supervision(
         dst = torch.randint(
             n_pois, (take,), generator=generator, dtype=torch.int64
         )
-        mask = src != dst
-        if categories is not None:
-            src_cat = categories[src]
-            mask &= (src_cat < 0) | (src_cat == categories[dst])
+        src_cat = categories[src]
+        mask = (src != dst) & ((src_cat < 0) | (src_cat == categories[dst]))
         accept(torch.unique(src[mask] * n_pois + dst[mask]))
 
     if int(accepted.numel()) < n_negative:
@@ -421,30 +413,6 @@ def build_graph_supervision(
     return GraphSupervision(positives, negatives)
 
 
-def resolve_num_neighbors(
-    data: HeteroData,
-    num_neighbors: list[int] | dict[str, list[int]],
-) -> list[int] | dict[tuple[str, str, str], list[int]]:
-    if not isinstance(num_neighbors, dict):
-        return num_neighbors
-    default = num_neighbors["default"]
-    resolved: dict[tuple[str, str, str], list[int]] = {}
-    for edge_type in data.metadata()[1]:
-        resolved[edge_type] = num_neighbors.get("__".join(edge_type), default)
-    unknown = {
-        key
-        for key in num_neighbors
-        if key != "default"
-        and tuple(key.split("__")) not in set(data.metadata()[1])
-    }
-    if unknown:
-        raise ValueError(
-            "num_neighbors names relations absent from the graph: "
-            f"{sorted(unknown)}"
-        )
-    return resolved
-
-
 def supervision_edge_types(
     data: HeteroData,
 ) -> list[tuple[str, str, str]]:
@@ -460,24 +428,19 @@ def supervision_edge_types(
 
 def get_train_loader(
     data: HeteroData,
-    batch_size: int = 1024,
-    num_neighbors: list[int] | dict[str, list[int]] | None = None,
-    num_workers: int = 0,
-    train_edge_index: torch.Tensor | None = None,
-    pin_memory: bool = False,
-    seed: int = 0,
-    rank: int = 0,
-    world_size: int = 1,
+    *,
+    batch_size: int,
+    num_neighbors: list[int],
+    num_workers: int,
+    train_edge_index: torch.Tensor | None,
+    pin_memory: bool,
+    seed: int,
+    rank: int,
+    world_size: int,
 ) -> LinkNeighborLoader:
-    fanout = resolve_num_neighbors(
-        data, [10, 10] if num_neighbors is None else num_neighbors
-    )
-
+    """Link-prediction batches over ``train_edge_index``, or over every
+    temporal POI-POI edge when it is ``None``."""
     target_edges = supervision_edge_types(data)
-
-    if not target_edges:
-        raise ValueError("No temporal POI-POI edges found for supervision.")
-
     supervision_edge_type = target_edges[0]
     if len(target_edges) > 1:
         logger.info(
@@ -512,7 +475,7 @@ def get_train_loader(
     started = time.perf_counter()
     loader = LinkNeighborLoader(
         data,
-        num_neighbors=fanout,
+        num_neighbors=num_neighbors,
         edge_label_index=(supervision_edge_type, edge_label_index),
         edge_label=edge_label,
         neg_sampling=None,

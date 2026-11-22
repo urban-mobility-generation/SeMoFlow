@@ -35,7 +35,6 @@ from semoflow.realizer.time_tokens import N_TIME_TOKENS
 from semoflow.tokenization.sids import (
     load_codebooks,
     sid_code_columns,
-    sid_code_names,
 )
 from semoflow.utils.serialization import write_json
 from semoflow.utils.training import (
@@ -61,12 +60,9 @@ class _BankSplit(Dataset[dict[str, torch.Tensor]]):
         self.codes = payload["sid_codes"][rows]
         self.times = payload["time_tokens"][rows]
         self.valid = payload["valid_mask"][rows].bool()
-        self.city: torch.Tensor | None = None
-        if city_vocab > 0:
-            city = bank_split_city_ids(payload, split)
-            if int(city.min()) < 0 or int(city.max()) >= city_vocab:
-                raise ValueError("bank city ids are outside city_vocab")
-            self.city = city
+        self.city = (
+            bank_split_city_ids(payload, split) if city_vocab > 0 else None
+        )
 
     def __len__(self) -> int:
         return int(self.codes.shape[0])
@@ -77,7 +73,7 @@ class _BankSplit(Dataset[dict[str, torch.Tensor]]):
     def __getitems__(self, indices: torch.Tensor) -> dict[str, torch.Tensor]:
         index = torch.as_tensor(indices, dtype=torch.long)
         valid = self.valid.index_select(0, index)
-        width = max(1, int(valid.sum(dim=1).max().item()))
+        width = int(valid.sum(dim=1).max().item())
         batch = {
             "sid_codes": self.codes.index_select(0, index)[:, :width],
             "time_tokens": self.times.index_select(0, index)[:, :width],
@@ -176,14 +172,8 @@ def _loader(
     )
 
 
-def _catalog_codes(path: Path, *, n_codebooks: int) -> torch.Tensor:
+def _catalog_codes(path: Path) -> torch.Tensor:
     fields = sid_code_columns(pl.read_parquet_schema(path))
-    expected = sid_code_names(n_codebooks)
-    if fields != expected:
-        raise ValueError(
-            "catalog SID columns must match the codebooks: "
-            f"expected {expected}, got {fields}"
-        )
     frame = pl.read_parquet(path, columns=list(fields))
     return torch.tensor(frame.to_numpy(), dtype=torch.long).contiguous()
 
@@ -251,8 +241,6 @@ def train_prefix_time_suffix_latent_flow_realizer(
     rank = dist.get_rank() if distributed else 0
     world_size = dist.get_world_size() if distributed else 1
     is_main = rank == 0
-    if distributed and device.type != "cuda":
-        raise ValueError("distributed realizer training requires CUDA")
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -266,8 +254,6 @@ def train_prefix_time_suffix_latent_flow_realizer(
         for split in ("train", "val")
     )
     num_codebooks = int(train.codes.shape[-1])
-    if codebooks.shape[0] != num_codebooks:
-        raise ValueError("codebooks and bank have different SID widths")
     latent_dim = int(codebooks.shape[-1])
     loader = functools.partial(
         _loader, config=config, device=device, rank=rank, world_size=world_size
@@ -287,11 +273,10 @@ def train_prefix_time_suffix_latent_flow_realizer(
         )
     )
     candidate_bank = CatalogCandidateBank.from_codes(
-        _catalog_codes(tokenizer.placekey_lookup, n_codebooks=num_codebooks),
+        _catalog_codes(tokenizer.placekey_lookup),
         codebooks,
         prefix_depth=config.prefix_depth,
-        observed_codes=train.codes,
-        observed_valid_mask=train.valid,
+        observed_codes=train.codes[train.valid],
         count_device=device,
         max_candidates=config.catalog_candidate_count,
     ).to(device)
@@ -323,8 +308,6 @@ def train_prefix_time_suffix_latent_flow_realizer(
         fused=device.type == "cuda",
     )
     total_updates = len(train_loader) * config.epochs
-    if config.warmup_steps >= total_updates:
-        raise ValueError("warmup_steps must be smaller than total updates")
     scheduler = build_lr_scheduler(
         optimizer,
         schedule=config.lr_scheduler,
@@ -357,10 +340,6 @@ def train_prefix_time_suffix_latent_flow_realizer(
         "tail_mean": tail_mean.cpu(),
         "tail_whitener": tail_whitener.cpu(),
         "codebooks": codebooks,
-        "catalog_candidate_count": config.catalog_candidate_count,
-        "endpoint_loss_weight": config.endpoint_loss_weight,
-        "population_loss_weight": config.population_loss_weight,
-        "catalog_prior_weight": config.catalog_prior_weight,
         "config": asdict(config),
     }
 
@@ -444,7 +423,7 @@ def train_prefix_time_suffix_latent_flow_realizer(
         "val_rows": len(val),
         "num_codebooks": num_codebooks,
         "latent_dim": latent_dim,
-        "parameter_count": raw_model.count_parameters(),
+        "parameter_count": sum(p.numel() for p in raw_model.parameters()),
         "world_size": world_size,
         "global_batch_size": config.batch_size * world_size,
         "stopped_early": stopped_early,

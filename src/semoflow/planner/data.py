@@ -14,6 +14,7 @@ from torch.utils.data import (
     SequentialSampler,
 )
 
+from semoflow.planner.artifacts import OccurrencePlannerSplit
 from semoflow.planner.config import OccurrencePlannerConfig
 from semoflow.planner.gap_codec import reconstruct_event_time_minutes
 from semoflow.planner.legality import LegalPrefixIndex
@@ -33,14 +34,13 @@ def _shift_right(
 
 
 def collate_occurrence_tensors(
-    prefix_codes: torch.Tensor,
-    gap_tokens: torch.Tensor,
-    lengths: torch.Tensor,
-    city_ids: torch.Tensor,
+    tensors: tuple[torch.Tensor, ...],
     *,
     config: OccurrencePlannerConfig,
     legality: LegalPrefixIndex,
 ) -> OccurrenceBatch:
+    """Teacher-forcing inputs and targets of one batch of split rows."""
+    prefix_codes, gap_tokens, lengths, city_ids = tensors
     batch_size = prefix_codes.shape[0]
     device = prefix_codes.device
     max_len = int(lengths.max().item())
@@ -62,9 +62,9 @@ def collate_occurrence_tensors(
     target_gaps = torch.where(valid_mask, sub_gaps, 0)
     event_times = reconstruct_event_time_minutes(
         target_gaps,
+        valid_mask,
         representative_minutes=config.gap_duration_minutes,
         observation_window_minutes=config.observation_window_minutes,
-        valid_mask=valid_mask,
     )
     return OccurrenceBatch(
         previous_prefix_codes=_shift_right(sub_prefix, valid_mask, -1),
@@ -79,14 +79,16 @@ def collate_occurrence_tensors(
 
 
 class OccurrencePlannerTensorDataset(Dataset[Any]):
-    def __init__(
-        self,
-        prefix_codes: torch.Tensor,
-        gap_tokens: torch.Tensor,
-        lengths: torch.Tensor,
-        city_ids: torch.Tensor,
-    ) -> None:
-        self.tensors = (prefix_codes, gap_tokens, lengths, city_ids)
+    """A planner split; indexing with a batch of indices slices every
+    tensor at once."""
+
+    def __init__(self, split: OccurrencePlannerSplit) -> None:
+        self.tensors = (
+            split.prefix_codes,
+            split.gap_tokens,
+            split.lengths,
+            split.city_ids,
+        )
 
     def __len__(self) -> int:
         return int(self.tensors[2].shape[0])
@@ -107,17 +109,6 @@ class _SeededShuffleSampler(Sampler[int]):
 
     def __len__(self) -> int:
         return self._size
-
-
-def _collate(
-    batch_tensors: tuple[torch.Tensor, ...],
-    *,
-    config: OccurrencePlannerConfig,
-    legality: LegalPrefixIndex,
-) -> OccurrenceBatch:
-    return collate_occurrence_tensors(
-        *batch_tensors, config=config, legality=legality
-    )
 
 
 def build_occurrence_tensor_dataloader(
@@ -142,7 +133,9 @@ def build_occurrence_tensor_dataloader(
         dataset,
         batch_size=None,
         sampler=BatchSampler(sampler, batch_size=batch_size, drop_last=False),
-        collate_fn=partial(_collate, config=config, legality=legality),
+        collate_fn=partial(
+            collate_occurrence_tensors, config=config, legality=legality
+        ),
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=(num_workers > 0),

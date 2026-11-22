@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -20,7 +20,6 @@ from torch.utils.data.distributed import DistributedSampler
 from semoflow.config import PlannerConfig, RunLayout
 from semoflow.planner.artifacts import (
     OccurrencePlannerDataset,
-    OccurrencePlannerSplit,
     load_occurrence_planner_dataset,
     save_occurrence_planner_checkpoint,
 )
@@ -116,14 +115,6 @@ def _prefixed(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
     return {f"{prefix}_{name}": value for name, value in metrics.items()}
 
 
-def _split_dataset(
-    split: OccurrencePlannerSplit,
-) -> OccurrencePlannerTensorDataset:
-    return OccurrencePlannerTensorDataset(
-        split.prefix_codes, split.gap_tokens, split.lengths, split.city_ids
-    )
-
-
 def _evaluate(
     model: OccurrenceARPlanner, loader: DataLoader, rank: _Rank
 ) -> dict[str, float]:
@@ -150,33 +141,14 @@ def _evaluate(
 def _planner_config(
     dataset: OccurrencePlannerDataset, settings: PlannerConfig
 ) -> OccurrencePlannerConfig:
-    data, architecture = dataset.config, settings.architecture
     return OccurrencePlannerConfig(
-        codebook_size=data.codebook_size,
-        gap_vocab=data.gap_vocab,
-        prefix_depth=data.prefix_depth,
-        max_occurrences=data.max_occurrences,
-        city_conditioning=data.city_conditioning,
-        model_dim=architecture.model_dim,
-        n_heads=architecture.n_heads,
-        n_layers=architecture.n_layers,
-        dropout=architecture.dropout,
-        gap_codec_version=data.gap_codec_version,
-        use_distance_prior=architecture.use_distance_prior,
-        gap_bucket_edges_minutes=data.gap_bucket_edges_minutes,
-        gap_duration_minutes=data.gap_duration_minutes,
-        observation_window_minutes=data.observation_window_minutes,
+        **asdict(dataset.config), **asdict(settings.architecture)
     )
 
 
 def _catalog_tensors(
     config: OccurrencePlannerConfig, dataset: OccurrencePlannerDataset
 ) -> dict[str, torch.Tensor | None]:
-    if config.use_distance_prior and dataset.legal_prefix_centroids is None:
-        raise ValueError(
-            "architecture.use_distance_prior requires a planner dataset "
-            "whose places carry coordinates"
-        )
     centroids = config.use_distance_prior
     return {
         "legal_prefixes": dataset.legal_prefixes,
@@ -189,59 +161,6 @@ def _catalog_tensors(
             dataset.legal_prefix_centroid_available if centroids else None
         ),
     }
-
-
-def check_planner_settings(
-    settings: PlannerConfig, layout: RunLayout, *, force: bool = False
-) -> None:
-    """Fail fast on unusable GPUs or outputs that would be overwritten."""
-    _, device_ids = parse_device_spec(settings.training.device)
-    if device_ids:
-        if len(set(device_ids)) != len(device_ids) or min(device_ids) < 0:
-            raise ValueError("device IDs must be unique non-negative integers")
-        if not torch.cuda.is_available():
-            raise ValueError("a GPU device list requires CUDA")
-        if max(device_ids) >= torch.cuda.device_count():
-            raise ValueError(
-                f"device IDs {device_ids} exceed the "
-                f"{torch.cuda.device_count()} visible CUDA devices"
-            )
-    existing = [
-        str(path)
-        for name in _OUTPUT_NAMES
-        if (path := layout.planner_dir / name).exists()
-    ]
-    if existing and not force:
-        raise FileExistsError(
-            f"refusing to overwrite {', '.join(existing)}; pass --force"
-        )
-
-
-def _log_step(
-    loss: Any,
-    *,
-    step: int,
-    total_steps: int,
-    epoch: int,
-    total_epochs: int,
-    lr: float,
-    samples_per_sec: float,
-) -> None:
-    log_training_step(
-        logger,
-        step=step,
-        total_steps=total_steps,
-        epoch=epoch,
-        total_epochs=total_epochs,
-        metrics={
-            "loss": float(loss.total.detach()),
-            "prefix_loss": float(loss.prefix.detach()),
-            "gap_loss": float(loss.gap.detach()),
-            "length_loss": float(loss.length.detach()),
-        },
-        lr=lr,
-        samples_per_sec=samples_per_sec,
-    )
 
 
 def _should_log(step: int, steps_per_epoch: int, total_steps: int) -> bool:
@@ -260,10 +179,7 @@ def _synchronize(device: torch.device) -> None:
 
 
 def train_occurrence_planner(
-    settings: PlannerConfig,
-    layout: RunLayout,
-    *,
-    force: bool = False,
+    settings: PlannerConfig, layout: RunLayout
 ) -> dict[str, Any]:
     """Train on one device, or as one rank of an initialized process group."""
     options, seed = settings.training, settings.seed
@@ -287,7 +203,6 @@ def train_occurrence_planner(
             dataset.config.gap_vocab,
         )
     config = _planner_config(dataset, settings)
-    check_planner_settings(settings, layout, force=force)
     best_path, last_path, metrics_path = (
         layout.planner_dir / name for name in _OUTPUT_NAMES
     )
@@ -341,7 +256,7 @@ def train_occurrence_planner(
         num_workers=options.num_workers,
         pin_memory=device.type == "cuda",
     )
-    train_set = _split_dataset(dataset.train)
+    train_set = OccurrencePlannerTensorDataset(dataset.train)
     sampler = (
         DistributedSampler(
             train_set,
@@ -357,7 +272,9 @@ def train_occurrence_planner(
     train_loader = build(
         train_set, shuffle=sampler is None, seed=seed, sampler=sampler
     )
-    val_loader = build(_split_dataset(dataset.validation), shuffle=False)
+    val_loader = build(
+        OccurrencePlannerTensorDataset(dataset.validation), shuffle=False
+    )
     train_eval_loader = build(train_set, shuffle=False)
 
     steps_per_epoch = len(train_loader)
@@ -378,14 +295,14 @@ def train_occurrence_planner(
         **catalog,
     )
 
-    stopper = EarlyStopper(patience=options.early_stopping_patience or None)
+    stopper = EarlyStopper(patience=options.early_stopping_patience)
     history: list[dict[str, float]] = []
     validation: dict[str, float] = {}
     step = 0
     epoch = 0
     for epoch in range(1, options.epochs + 1):
         if device.type == "cuda":
-            torch.cuda.synchronize(device)
+            _synchronize(device)
             torch.cuda.reset_peak_memory_stats(device)
         started = time.perf_counter()
         if sampler is not None:
@@ -407,12 +324,18 @@ def train_occurrence_planner(
             if ctx.primary and _should_log(step, steps_per_epoch, total_steps):
                 _synchronize(device)
                 now = time.perf_counter()
-                _log_step(
-                    loss,
+                log_training_step(
+                    logger,
                     step=step,
                     total_steps=total_steps,
                     epoch=epoch,
                     total_epochs=options.epochs,
+                    metrics={
+                        "loss": float(loss.total.detach()),
+                        "prefix_loss": float(loss.prefix.detach()),
+                        "gap_loss": float(loss.gap.detach()),
+                        "length_loss": float(loss.length.detach()),
+                    },
                     lr=float(optimizer.param_groups[0]["lr"]),
                     samples_per_sec=window_samples
                     / max(now - window_start, 1e-6),
@@ -499,7 +422,7 @@ def train_occurrence_planner(
             model_state=model.state_dict(),
             epoch=epoch,
             validation_metric=validation["nll"],
-            force=force,
+            force=True,
         )
         write_json(metrics_path, {**summary, "epochs": history})
         logger.info(
@@ -523,23 +446,18 @@ def _spawn_worker(
     layout: RunLayout,
     log_level: str,
     log_file: Path | None,
-    force: bool,
 ) -> None:
     with ddp_worker(rank, device_ids, port, log_level, log_file):
-        train_occurrence_planner(settings, layout, force=force)
+        train_occurrence_planner(settings, layout)
 
 
 def train_planner(
-    settings: PlannerConfig,
-    layout: RunLayout,
-    *,
-    force: bool = False,
-    log_level: str = "INFO",
+    settings: PlannerConfig, layout: RunLayout, *, log_level: str = "INFO"
 ) -> dict[str, Any]:
     """Train in this process, or spawn one DDP rank per listed GPU."""
     _, device_ids = parse_device_spec(settings.training.device)
     if len(device_ids) < 2:
-        return train_occurrence_planner(settings, layout, force=force)
+        return train_occurrence_planner(settings, layout)
     mp.spawn(
         _spawn_worker,
         args=(
@@ -549,7 +467,6 @@ def train_planner(
             layout,
             log_level,
             get_configured_log_file(),
-            force,
         ),
         nprocs=len(device_ids),
         join=True,
@@ -559,8 +476,4 @@ def train_planner(
     return metrics
 
 
-__all__ = [
-    "check_planner_settings",
-    "train_occurrence_planner",
-    "train_planner",
-]
+__all__ = ["train_occurrence_planner", "train_planner"]

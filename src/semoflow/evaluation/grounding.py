@@ -17,12 +17,9 @@ from semoflow.evaluation.geo import (
     spatial_jsd,
     travel_distance_jsd,
 )
-from semoflow.evaluation.motifs import mobility_motif_metrics
+from semoflow.evaluation.motifs import mobility_motif_jsd
 from semoflow.tokenization.sids import pack_code_rows
 
-_CANDIDATE_SELECTION_POLICIES = frozenset(
-    {"first", "train_prior_argmax", "train_prior_sample"}
-)
 _CANDIDATE_SELECTION_SEED = 20260830
 _CANDIDATE_WEIGHT_SMOOTHING = 1.0
 
@@ -30,97 +27,36 @@ _CANDIDATE_WEIGHT_SMOOTHING = 1.0
 def _vectorized_lookup(
     code_rows: np.ndarray, grounding_index: Any
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    """Each SID row's index into the packed payload table.
-
-    Rows with a negative code or no catalog SID get ``-1``.
-    """
+    """Each SID row's index into the packed payload table; ``-1`` for a
+    SID with no catalog POI."""
     table_keys, table_payloads = grounding_index.packed_lookup_table()
-    payload_indices = np.full(code_rows.shape[0], -1, dtype=np.int64)
-    row_indices = np.flatnonzero(~np.any(code_rows < 0, axis=1))
-    if row_indices.size:
-        packed = pack_code_rows(code_rows[row_indices])
-        positions = np.searchsorted(table_keys, packed, side="left")
-        safe_positions = np.minimum(positions, table_keys.size - 1)
-        found = (positions < table_keys.size) & (
-            table_keys[safe_positions] == packed
-        )
-        payload_indices[row_indices[found]] = safe_positions[found]
-    return payload_indices, table_payloads
-
-
-def _placekey(payload: Mapping[str, Any]) -> int:
-    placekey = payload.get("placekey_id")
-    return PAD_ID if placekey is None else int(placekey)
+    packed = pack_code_rows(code_rows)
+    positions = np.searchsorted(table_keys, packed, side="left")
+    safe_positions = np.minimum(positions, table_keys.size - 1)
+    found = (positions < table_keys.size) & (
+        table_keys[safe_positions] == packed
+    )
+    return np.where(found, safe_positions, -1), table_payloads
 
 
 def _candidate_probabilities(
     group: Sequence[Mapping[str, Any]], weights: Mapping[int, float]
 ) -> np.ndarray:
     raw = np.array(
-        [
-            float(weights.get(int(payload["placekey_id"]), 0.0))
-            if payload.get("placekey_id") is not None
-            else 0.0
-            for payload in group
-        ],
+        [weights.get(int(payload["placekey_id"]), 0.0) for payload in group],
         dtype=np.float64,
     )
     raw += _CANDIDATE_WEIGHT_SMOOTHING
     return raw / raw.sum()
 
 
-def _preferred_payloads(
-    preferred_placekey_ids: np.ndarray,
-    active_codes: np.ndarray,
-    grounding_index: Any,
-) -> list[Mapping[str, Any]]:
-    """Each active position's preferred POI payload.
-
-    The preferred POI must be a candidate of the position's SID.
-    """
-    by_placekey: dict[int, tuple[tuple[int, ...], dict[str, Any]]] = {}
-    for key, payloads in grounding_index.groups.items():
-        for payload in payloads:
-            placekey_id = payload.get("placekey_id")
-            if placekey_id is not None:
-                by_placekey[int(placekey_id)] = (
-                    tuple(int(value) for value in key),
-                    dict(payload),
-                )
-    payloads: list[Mapping[str, Any]] = []
-    for offset, placekey_id in enumerate(preferred_placekey_ids.tolist()):
-        selected = by_placekey.get(placekey_id)
-        if selected is None:
-            raise ValueError(
-                f"preferred placekey_id {placekey_id} is not in the "
-                "grounding index"
-            )
-        key, payload = selected
-        row = tuple(int(value) for value in active_codes[offset])
-        if key != row:
-            raise ValueError(
-                f"preferred placekey_id {placekey_id} does not belong "
-                f"to SID row {row}"
-            )
-        payloads.append(payload)
-    return payloads
-
-
-def _unique_code_rows(
-    codes: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Distinct code rows, each row's index into them, and their counts."""
-    if np.any(codes < 0) or np.any(codes > 255):
-        return np.unique(
-            codes, axis=0, return_inverse=True, return_counts=True
-        )
-    packed, inverse, counts = np.unique(
-        pack_code_rows(codes), return_inverse=True, return_counts=True
-    )
+def _unique_code_rows(codes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Distinct byte-sized code rows and each row's index into them."""
+    packed, inverse = np.unique(pack_code_rows(codes), return_inverse=True)
     unique = np.empty((packed.shape[0], codes.shape[1]), dtype=np.int64)
     for column in range(codes.shape[1]):
         unique[:, column] = (packed >> (8 * column)) & 255
-    return unique, inverse, counts
+    return unique, inverse
 
 
 def ground_sid_codes(
@@ -141,11 +77,6 @@ def ground_sid_codes(
     ``train_prior_sample`` chooses per occurrence. ``preferred_placekey_ids``
     pins every position to a known POI of its SID instead.
     """
-    if candidate_selection not in _CANDIDATE_SELECTION_POLICIES:
-        raise ValueError(
-            f"unknown candidate_selection {candidate_selection!r}; "
-            f"expected one of {sorted(_CANDIDATE_SELECTION_POLICIES)}"
-        )
     if candidate_selection != "first" and candidate_weights is None:
         raise ValueError(
             f"candidate_selection={candidate_selection!r} requires "
@@ -157,15 +88,13 @@ def ground_sid_codes(
     active_codes = codes[active]
     encoded = np.full(len(codes), PAD_ID, dtype=np.int64)
     if preferred_placekey_ids is not None:
-        preferred = _preferred_payloads(
-            preferred_placekey_ids.long().reshape(-1).cpu().numpy()[active],
-            active_codes,
-            grounding_index,
+        # Reference positions keep their own POI, a candidate of their SID.
+        encoded[active] = (
+            preferred_placekey_ids.reshape(-1).cpu().numpy()[active]
         )
-        encoded[active] = [_placekey(payload) for payload in preferred]
         return torch.from_numpy(encoded).view(*shape)
 
-    unique_codes, inverse, _counts = _unique_code_rows(active_codes)
+    unique_codes, inverse = _unique_code_rows(active_codes)
     payload_indices, first_payloads = _vectorized_lookup(
         unique_codes, grounding_index
     )
@@ -184,7 +113,7 @@ def ground_sid_codes(
             group = groups[index]
             weights = _candidate_probabilities(group, candidate_weights)
             payload = group[int(np.argmax(weights))]
-        unique_encoded[row] = _placekey(payload)
+        unique_encoded[row] = int(payload["placekey_id"])
     encoded[active] = unique_encoded[inverse]
 
     if groups is not None and candidate_selection == "train_prior_sample":
@@ -198,7 +127,7 @@ def ground_sid_codes(
             if len(group) < 2:
                 continue
             group_encoded = np.array(
-                [_placekey(payload) for payload in group], dtype=np.int64
+                [payload["placekey_id"] for payload in group], dtype=np.int64
             )
             picks = rng.choice(
                 len(group),
@@ -262,13 +191,12 @@ def grounded_poi_metrics(
         "radius_jsd": radius_of_gyration_jsd(
             real, generated, coordinates, pad_id=PAD_ID
         ),
-        "mobility_motif_jsd": mobility_motif_metrics(
+        "mobility_motif_jsd": mobility_motif_jsd(
             real,
             generated,
             day_keys_real=day_keys_real,
             day_keys_generated=day_keys_generated,
-            pad_id=PAD_ID,
-        )["mobility_motif_jsd"],
+        ),
         "mobility_recurrence_pattern_jsd": jensen_shannon_divergence(
             real_gaps, generated_gaps
         ),

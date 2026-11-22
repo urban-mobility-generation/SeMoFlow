@@ -69,6 +69,11 @@ def _load(
         raise typer.BadParameter(str(exc)) from exc
 
 
+def _refuse_overwrite(path: Path, force: bool) -> None:
+    if path.exists() and not force:
+        raise typer.BadParameter(f"{path} exists; pass --force to overwrite")
+
+
 def _is_rank_zero() -> bool:
     return int(os.environ.get("RANK", "0")) == 0
 
@@ -89,12 +94,10 @@ def _git(*args: str) -> str:
 
 def _write_manifest(directory: Path, **fields: Any) -> None:
     """Record the command, code revision and environment of a stage run."""
-    packages = {}
-    for name in ("torch", "polars", "numpy", "pyyaml"):
-        try:
-            packages[name] = metadata.version(name)
-        except metadata.PackageNotFoundError:
-            packages[name] = "not installed"
+    packages = {
+        name: metadata.version(name)
+        for name in ("torch", "polars", "numpy", "pyyaml")
+    }
     write_json(
         directory / "run_manifest.json",
         {
@@ -174,19 +177,12 @@ def encoder(
     help="Train the RQ-VAE tokenizer and assign every POI a semantic ID."
 )
 def tokenizer(
-    config: Config,
-    sets: Sets = None,
-    force: Force = False,
-    log_level: LogLevel = "INFO",
+    config: Config, sets: Sets = None, log_level: LogLevel = "INFO"
 ) -> None:
     from semoflow.poi.training import run_semantic_id_tokenizer
 
     cfg = _load(config, sets, log_level)
-    artifacts = cfg.layout.tokenizer
-    if artifacts.is_complete() and not force:
-        logger.info("tokenizer already complete: %s", artifacts.run_dir)
-        return
-    with _run(cfg, "tokenizer", artifacts.run_dir, log_level):
+    with _run(cfg, "tokenizer", cfg.layout.tokenizer.run_dir, log_level):
         run_semantic_id_tokenizer(cfg)
 
 
@@ -217,17 +213,12 @@ def planner(
     force: Force = False,
     log_level: LogLevel = "INFO",
 ) -> None:
-    from semoflow.planner.training import check_planner_settings, train_planner
+    from semoflow.planner.training import train_planner
 
     cfg = _load(config, sets, log_level)
-    try:
-        check_planner_settings(cfg.planner, cfg.layout, force=force)
-    except (FileExistsError, ValueError) as exc:
-        raise typer.BadParameter(str(exc)) from exc
+    _refuse_overwrite(cfg.layout.planner_dir / "best.pt", force)
     with _run(cfg, "planner", cfg.layout.planner_dir, log_level):
-        result = train_planner(
-            cfg.planner, cfg.layout, force=force, log_level=log_level
-        )
+        result = train_planner(cfg.planner, cfg.layout, log_level=log_level)
     _echo(result)
 
 
@@ -301,17 +292,10 @@ def evaluate(
 
     cfg = _load(config, sets, log_level)
     layout, cities = cfg.layout, cfg.evaluation_cities
-    existing = [
-        path
-        for city in cities
-        if (path := layout.evaluation_dir / city).exists()
-    ]
-    if existing and not force:
-        raise typer.BadParameter(
-            f"{existing[0]} exists; pass --force to overwrite"
-        )
+    for city in cities:
+        _refuse_overwrite(layout.evaluation_dir / city, force)
     with _run(cfg, "evaluate", layout.evaluation_dir, log_level):
-        result = evaluate_cities(cfg.evaluation, layout, cities, force=force)
+        result = evaluate_cities(cfg.evaluation, layout, cities)
     _echo(result)
 
 

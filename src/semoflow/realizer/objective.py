@@ -3,16 +3,11 @@ from __future__ import annotations
 import dataclasses
 import functools
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 import torch.nn.functional as F
 
-from semoflow.realizer.flow_matching import (
-    compute_target_velocity,
-    linear_interpolate,
-    sample_logit_normal_timesteps,
-    velocity_from_x0,
-)
 from semoflow.realizer.model import (
     LatentSuffixConditioning,
     PrefixTimeSuffixLatentFlowRealizer,
@@ -22,45 +17,45 @@ from semoflow.tokenization.sids import (
     find_sorted,
     packed_code_keys,
 )
+from semoflow.utils.training import unwrap_ddp
+
+
+def sample_logit_normal_timesteps(
+    batch_size: int,
+    device: torch.device | str,
+    *,
+    p_mean: float = -0.5,
+    p_std: float = 1.2,
+) -> torch.Tensor:
+    z = torch.randn(batch_size, device=device) * p_std + p_mean
+    return torch.sigmoid(z)
+
+
+def velocity_from_x0(
+    zt: torch.Tensor, x0_pred: torch.Tensor, t: torch.Tensor
+) -> torch.Tensor:
+    """The flow velocity implied by a clean-data prediction at time ``t``."""
+    return (zt - x0_pred) / t[:, None, None].clamp_min(1e-6)
 
 
 def count_catalog_occurrences(
     catalog_keys: torch.Tensor,
     observed_codes: torch.Tensor,
-    observed_valid_mask: torch.BoolTensor | None = None,
     *,
     codebook_size: int,
-    count_device: torch.device | str | None = None,
+    count_device: torch.device | str = "cpu",
     chunk_size: int = 1_048_576,
 ) -> torch.Tensor:
-    """Count how often each catalog SID occurs among the observed codes."""
-
-    device = (
-        observed_codes.device
-        if count_device is None
-        else torch.device(count_device)
-    )
+    """Count how often each catalog SID occurs among ``[N, M]`` observed
+    code rows."""
     catalog_order = torch.argsort(catalog_keys, stable=True)
-    sorted_catalog_keys = catalog_keys[catalog_order].to(device)
+    sorted_catalog_keys = catalog_keys[catalog_order].to(count_device)
     sorted_counts = torch.zeros(
-        catalog_keys.numel(), dtype=torch.long, device=device
+        catalog_keys.numel(), dtype=torch.long, device=count_device
     )
-    flat_observed = observed_codes.reshape(-1, observed_codes.shape[-1])
-    flat_mask = (
-        None
-        if observed_valid_mask is None
-        else observed_valid_mask.reshape(-1)
-    )
-    for start in range(0, flat_observed.size(0), chunk_size):
-        end = min(start + chunk_size, flat_observed.size(0))
-        chunk = flat_observed[start:end]
-        if flat_mask is not None:
-            chunk_mask = flat_mask[start:end]
-            if not chunk_mask.any():
-                continue
-            chunk = chunk[chunk_mask]
+    for chunk in observed_codes.split(chunk_size):
         chunk_keys = packed_code_keys(
-            chunk.to(device, dtype=torch.long, non_blocking=True),
+            chunk.to(count_device, dtype=torch.long, non_blocking=True),
             codebook_size=codebook_size,
         )
         safe, matched = find_sorted(sorted_catalog_keys, chunk_keys)
@@ -135,11 +130,11 @@ class CatalogCandidateBank:
         *,
         prefix_depth: int,
         observed_codes: torch.Tensor,
-        observed_valid_mask: torch.BoolTensor,
-        count_device: torch.device | str | None = None,
-        count_chunk_size: int = 1_048_576,
-        max_candidates: int = 64,
+        count_device: torch.device | str,
+        max_candidates: int,
     ) -> CatalogCandidateBank:
+        """Each legal prefix's candidate table over ``catalog_codes``, with
+        log-count priors from the ``[N, M]`` observed train SIDs."""
         codebook_size = int(codebooks.shape[1])
 
         catalog = torch.unique(catalog_codes.long().cpu(), dim=0).contiguous()
@@ -150,10 +145,8 @@ class CatalogCandidateBank:
         catalog_counts = count_catalog_occurrences(
             catalog_keys,
             observed_codes,
-            observed_valid_mask,
             codebook_size=codebook_size,
             count_device=count_device,
-            chunk_size=count_chunk_size,
         )
         catalog_log_prior = torch.log1p(catalog_counts.float())
         full_order = torch.argsort(catalog_keys, stable=True)
@@ -256,12 +249,10 @@ def suffix_tail_level_embeddings(
 ) -> torch.Tensor:
     """Per-level codebook embeddings ``[..., S, D]`` after ``prefix_depth``."""
     suffix_codes = clean_codes[..., prefix_depth:].long()
-    suffix_codebooks = codebooks.to(clean_codes.device)[prefix_depth:]
-    suffix_depth = suffix_codes.shape[-1]
-    flat_codes = suffix_codes.reshape(-1, suffix_depth)
-    level_idx = torch.arange(suffix_depth, device=clean_codes.device)
-    selected = suffix_codebooks[level_idx[None, :], flat_codes]
-    return selected.reshape(*suffix_codes.shape, codebooks.shape[-1])
+    levels = torch.arange(suffix_codes.shape[-1], device=clean_codes.device)
+    return codebooks.to(clean_codes.device)[prefix_depth:][
+        levels, suffix_codes
+    ]
 
 
 def normalize_tail(
@@ -499,8 +490,7 @@ def prefix_time_suffix_latent_flow_loss(
 ) -> torch.Tensor:
     """Flow-matching loss on whitened suffix tails plus the weighted
     endpoint, calibrated-catalog and population terms."""
-    core = getattr(model, "module", model)
-    core = getattr(core, "_orig_mod", core)
+    core = cast(PrefixTimeSuffixLatentFlowRealizer, unwrap_ddp(model))
 
     clean_tail = normalize_tail(
         suffix_tail_embeddings(
@@ -515,9 +505,8 @@ def prefix_time_suffix_latent_flow_loss(
     timesteps = sample_logit_normal_timesteps(
         clean_codes.size(0), clean_codes.device, p_mean=p_mean, p_std=p_std
     )
-    noisy_tail = linear_interpolate(clean_tail, noise, timesteps).masked_fill(
-        padding, 0.0
-    )
+    t = timesteps[:, None, None]
+    noisy_tail = ((1.0 - t) * clean_tail + t * noise).masked_fill(padding, 0.0)
     conditioning = core.encode_conditioning(
         clean_codes[..., : core.prefix_depth].long(),
         time_tokens.long(),
@@ -530,7 +519,7 @@ def prefix_time_suffix_latent_flow_loss(
         conditioning,
         valid_mask=valid_mask,
     )
-    target_velocity = compute_target_velocity(clean_tail, noise)
+    target_velocity = noise - clean_tail
     predicted_velocity = velocity_from_x0(noisy_tail, x0_pred, timesteps)
     per_event = (predicted_velocity - target_velocity).square().mean(dim=-1)
     loss = per_event[valid_mask].mean()
@@ -538,27 +527,25 @@ def prefix_time_suffix_latent_flow_loss(
         loss = loss + endpoint_loss_weight * F.smooth_l1_loss(
             x0_pred[valid_mask], clean_tail[valid_mask]
         )
-    if catalog_loss_weight > 0.0:
-        catalog_loss, population_loss = _catalog_losses(
-            core,
-            conditioning,
-            x0_pred,
-            clean_codes,
-            valid_mask,
-            codebooks,
-            candidate_bank,
-            tail_mean,
-            tail_whitener,
-            catalog_prior_weight=catalog_prior_weight,
-            catalog_temperature=catalog_temperature,
-            population_loss_weight=population_loss_weight,
-        )
-        loss = (
-            loss
-            + catalog_loss_weight * catalog_loss
-            + population_loss_weight * population_loss
-        )
-    return loss
+    catalog_loss, population_loss = _catalog_losses(
+        core,
+        conditioning,
+        x0_pred,
+        clean_codes,
+        valid_mask,
+        codebooks,
+        candidate_bank,
+        tail_mean,
+        tail_whitener,
+        catalog_prior_weight=catalog_prior_weight,
+        catalog_temperature=catalog_temperature,
+        population_loss_weight=population_loss_weight,
+    )
+    return (
+        loss
+        + catalog_loss_weight * catalog_loss
+        + population_loss_weight * population_loss
+    )
 
 
 __all__ = [

@@ -37,8 +37,6 @@ class SwiGLU(nn.Module):
 class RotaryEmbedding(nn.Module):
     def __init__(self, head_dim: int, max_seq_len: int) -> None:
         super().__init__()
-        if head_dim % 2:
-            raise ValueError("RoPE requires an even attention head dimension")
         inv_freq = 1.0 / (
             10_000.0
             ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
@@ -67,18 +65,13 @@ def _apply_rope(
     return torch.stack((rotated_even, rotated_odd), dim=-1).flatten(-2)
 
 
+_POSITION_BUCKET_STARTS = (1, 2, 3, 4, 5, 9, 17, 33)
+
+
 def _relative_position_bucket(delta: torch.Tensor) -> torch.Tensor:
-    delta = delta.clamp_min(0)
-    result = torch.zeros_like(delta, dtype=torch.long)
-    result = torch.where(delta == 1, 1, result)
-    result = torch.where(delta == 2, 2, result)
-    result = torch.where(delta == 3, 3, result)
-    result = torch.where(delta == 4, 4, result)
-    result = torch.where((delta >= 5) & (delta <= 8), 5, result)
-    result = torch.where((delta >= 9) & (delta <= 16), 6, result)
-    result = torch.where((delta >= 17) & (delta <= 32), 7, result)
-    result = torch.where(delta >= 33, 8, result)
-    return result
+    """Exact buckets for offsets 0-4, then 5-8, 9-16, 17-32 and 33+."""
+    starts = torch.tensor(_POSITION_BUCKET_STARTS, device=delta.device)
+    return torch.bucketize(delta.clamp_min(0), starts, right=True)
 
 
 _TIME_BUCKET_BOUNDARIES_MINUTES = (
@@ -103,7 +96,9 @@ class SpatioTemporalRelationBias(nn.Module):
         super().__init__()
         self.n_heads = int(n_heads)
         self.prefix_depth = int(prefix_depth)
-        self.position_bias = nn.Embedding(9, n_heads)
+        self.position_bias = nn.Embedding(
+            len(_POSITION_BUCKET_STARTS) + 1, n_heads
+        )
         self.time_bias = nn.Embedding(
             len(_TIME_BUCKET_BOUNDARIES_MINUTES) + 1, n_heads
         )
@@ -209,8 +204,6 @@ class SpatioTemporalTransformerLayer(nn.Module):
         max_seq_len: int,
     ) -> None:
         super().__init__()
-        if model_dim % n_heads:
-            raise ValueError("model_dim must be divisible by n_heads")
         self.model_dim = int(model_dim)
         self.n_heads = int(n_heads)
         self.head_dim = model_dim // n_heads

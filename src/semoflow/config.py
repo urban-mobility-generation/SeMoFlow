@@ -15,7 +15,7 @@ from typing import Any, Final
 
 import yaml
 
-from semoflow.utils.serialization import to_yaml_string, write_json
+from semoflow.utils.serialization import to_yaml_string
 
 logger = logging.getLogger(__name__)
 
@@ -71,30 +71,6 @@ class TokenizerArtifacts:
     @property
     def grounding_index(self) -> Path:
         return self.run_dir / "grounding_index.pkl"
-
-    @property
-    def _completion_marker(self) -> Path:
-        return self.run_dir / "completion.json"
-
-    def _outputs(self) -> tuple[Path, ...]:
-        return (
-            self.augmented_processed_visits,
-            self.placekey_lookup,
-            self.tokenizer_model,
-            self.tokenizer_codebooks,
-            self.grounding_index,
-        )
-
-    def mark_complete(self) -> None:
-        missing = [str(path) for path in self._outputs() if not path.exists()]
-        if missing:
-            raise RuntimeError(f"tokenizer outputs missing: {missing}")
-        write_json(self._completion_marker, {"status": "complete"})
-
-    def is_complete(self) -> bool:
-        return self._completion_marker.exists() and all(
-            path.exists() for path in self._outputs()
-        )
 
 
 @dataclass(frozen=True)
@@ -322,9 +298,7 @@ class GraphEncoderConfig:
     batch_size: int = 1024
     lr: float = 0.001
     num_workers: int = 0
-    num_neighbors: list[int] | dict[str, list[int]] = field(
-        default_factory=lambda: [10, 10]
-    )
+    num_neighbors: list[int] = field(default_factory=lambda: [10, 10])
     hash_train_fraction: float = 0.70
     seed: int = 42
     temperature: float = 0.07
@@ -341,17 +315,9 @@ class GraphEncoderConfig:
     variance_target: float = 1.0
 
     def __post_init__(self) -> None:
-        hops = self.num_neighbors
-        entries = list(hops.values()) if isinstance(hops, dict) else [hops]
         _require(
-            not isinstance(hops, dict) or "default" in hops,
-            "encoder.graph.num_neighbors needs a 'default' relation",
-        )
-        _require(
-            len({len(entry) for entry in entries}) == 1
-            and all(entry and min(entry) >= 1 for entry in entries),
-            "encoder.graph.num_neighbors entries must be non-empty lists "
-            "of positive counts with the same number of hops",
+            bool(self.num_neighbors) and min(self.num_neighbors) >= 1,
+            "encoder.graph.num_neighbors must be positive per-hop counts",
         )
         _require(self.temperature > 0, "encoder.graph.temperature must be > 0")
         _choice("encoder.graph.aggr", self.aggr, {"sum", "mean", "max", "min"})
@@ -445,7 +411,7 @@ class PlannerTrainingConfig:
     warmup_steps: int = 0
     min_lr: float = 0.0
     num_workers: int = 0
-    early_stopping_patience: int = 0
+    early_stopping_patience: int | None = None
     compile_model: bool = False
 
     def __post_init__(self) -> None:
@@ -553,6 +519,14 @@ class CompositionConfig:
     catalog_noise_coupling: str = "independent"
 
     def __post_init__(self) -> None:
+        _choice(
+            "evaluation.composition.solver", self.solver, {"euler", "heun"}
+        )
+        _choice(
+            "evaluation.composition.candidate_selection",
+            self.candidate_selection,
+            {"first", "train_prior_argmax", "train_prior_sample"},
+        )
         _choice(
             "evaluation.composition.catalog_noise_coupling",
             self.catalog_noise_coupling,
