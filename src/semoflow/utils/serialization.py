@@ -4,7 +4,7 @@ import dataclasses
 import json
 import math
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -16,13 +16,6 @@ def normalize_value(value: object) -> object:
         return None
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return normalize_value(dataclasses.asdict(value))
-    if (
-        not isinstance(value, type)
-        and hasattr(value, "to_dict")
-        and callable(value.to_dict)
-    ):
-        to_dict = cast(Callable[[], object], value.to_dict)
-        return normalize_value(to_dict())
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, Mapping):

@@ -31,20 +31,6 @@ from semoflow.realizer.time_tokens import (
 from semoflow.tokenization.decoding.grounding_index import (
     SemanticIDGroundingIndex,
 )
-from semoflow.tokenization.token_space import sid_code_columns
-
-
-def load_lookup(path: Path) -> np.ndarray:
-    columns = list(
-        sid_code_columns(pl.scan_parquet(path).collect_schema().names())
-    )
-    if not columns:
-        raise ValueError(f"lookup carries no sem_code_* columns: {path}")
-    frame = pl.read_parquet(path, columns=columns)
-    return np.stack(
-        [frame[name].to_numpy() for name in columns],
-        axis=1,
-    ).astype(np.int64)
 
 
 def load_places(
@@ -210,22 +196,9 @@ def plan_from_planner_samples(
     )
 
 
-CANDIDATE_PRIOR_FORMAT = "grounding_candidate_prior_v1"
-
-
 def load_candidate_prior(path: Path) -> dict[int, float]:
-    payload = json.loads(Path(path).read_text())
-    if payload.get("format") != CANDIDATE_PRIOR_FORMAT:
-        raise ValueError(
-            f"{path} is not a {CANDIDATE_PRIOR_FORMAT} artifact; "
-            f"got {payload.get('format')!r}"
-        )
-    if payload.get("split") != "train":
-        raise ValueError(
-            f"candidate prior must be fitted on the train split; "
-            f"{path} declares {payload.get('split')!r}"
-        )
-    counts = payload.get("counts")
+    """Per-POI train visit counts written by ``build_prior``."""
+    counts = json.loads(Path(path).read_text())["counts"]
     return {int(key): float(value) for key, value in counts.items()}
 
 
@@ -309,7 +282,7 @@ __all__ = [
     "SampledPlan",
     "aligned_reference_event_hours",
     "elapsed_recurrence_block",
-    "load_lookup",
+    "load_candidate_prior",
     "load_places",
     "load_reference",
     "metric_block",

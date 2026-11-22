@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -12,14 +11,7 @@ from semoflow.tokenization.residual_vq import ResidualVQ
 if TYPE_CHECKING:
     from semoflow.config.schema import TokenizerConfig
 
-__all__ = ["RQVAE", "SemanticIDOutput", "build_tokenizer_model"]
-
-
-@dataclass
-class SemanticIDOutput:
-    loss: torch.Tensor | None
-    codes: torch.Tensor
-    losses: dict[str, torch.Tensor] | None = None
+__all__ = ["RQVAE", "build_tokenizer_model"]
 
 
 def _mlp(input_dim: int, hidden_dim: int, output_dim: int) -> nn.Sequential:
@@ -87,33 +79,20 @@ class RQVAE(nn.Module):
         self.codebook_size = quantizer.codebook_size
         self.commit_weight = commit_weight
 
-    def forward(
-        self,
-        batch: dict[str, torch.Tensor],
-        *,
-        return_loss: bool = True,
-    ) -> SemanticIDOutput:
-        x = batch["x"].float()
-        z_q, codes, vq_loss = self.quantizer(self.encoder(x))
-        if not return_loss:
-            return SemanticIDOutput(loss=None, codes=codes.long())
+    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Reconstruction, quantization and total losses for a batch."""
+        x = x.float()
+        z_q, _, vq_loss = self.quantizer(self.encoder(x))
         recon_loss = F.mse_loss(self.decoder(z_q), x)
         loss = recon_loss + self.commit_weight * vq_loss
-        return SemanticIDOutput(
-            loss=loss,
-            codes=codes.long(),
-            losses={
-                "recon_loss": recon_loss,
-                "vq_loss": vq_loss,
-                "loss": loss,
-            },
-        )
+        return {"recon_loss": recon_loss, "vq_loss": vq_loss, "loss": loss}
 
     @torch.no_grad()
-    def encode(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """The [N, n_codebooks] semantic codes of each row."""
         was_training = self.training
         self.eval()
-        codes = self.forward(batch, return_loss=False).codes
+        codes = self.quantizer(self.encoder(x.float()))[1].long()
         self.train(was_training)
         return codes
 

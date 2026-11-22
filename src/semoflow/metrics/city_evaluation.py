@@ -16,12 +16,12 @@ from semoflow.metrics.city_inputs import (
     extract_city_inputs,
 )
 from semoflow.metrics.grounding_candidate_prior import build_prior
-from semoflow.metrics.planner_realizer_composition import (
+from semoflow.planner.sampling import sample_occurrence_planner
+from semoflow.realizer.bank import build_bank
+from semoflow.realizer.evaluation import (
     evaluate_planner_realizer,
     realizer_max_events,
 )
-from semoflow.planner.sampling_run import sample_occurrence_planner
-from semoflow.realizer.bank import build_bank
 from semoflow.utils.serialization import write_json
 
 logger = logging.getLogger(__name__)
@@ -108,7 +108,6 @@ def _evaluate_city(
         realizer_checkpoint=layout.realizer_dir / "best.pt",
         planner_samples=plans,
         bank=bank,
-        codebooks=tokenizer.tokenizer_codebooks,
         lookup=output_dir / LOOKUP_NAME,
         grounding_index=output_dir / GROUNDING_NAME,
         places=layout.preprocessing.places_index,

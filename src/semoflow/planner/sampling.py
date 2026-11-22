@@ -1,10 +1,21 @@
 from __future__ import annotations
 
-import torch
+import logging
+from pathlib import Path
+from typing import Any
 
+import torch
+import torch.nn.functional as F
+
+from semoflow.planner.artifacts import (
+    load_occurrence_planner_checkpoint,
+    save_occurrence_planner_samples,
+)
 from semoflow.planner.decoders import sample_categorical_logits
 from semoflow.planner.model import OccurrenceARPlanner
 from semoflow.planner.types import OccurrenceBatch
+
+logger = logging.getLogger(__name__)
 
 
 @torch.no_grad()
@@ -102,3 +113,92 @@ def sample_occurrence_sequences(
         "lengths": lengths.cpu(),
         "city_ids": city.cpu(),
     }
+
+
+def _concat_padded(
+    chunks: list[dict[str, torch.Tensor]],
+) -> dict[str, torch.Tensor]:
+    """Concatenate sample chunks, zero-padding the step axis."""
+    width = max(int(chunk["lengths"].max()) for chunk in chunks)
+    merged: dict[str, torch.Tensor] = {}
+    for name in chunks[0]:
+        parts = []
+        for chunk in chunks:
+            value = chunk[name]
+            if value.ndim > 1:
+                pad = [0, 0] * (value.ndim - 2) + [0, width - value.shape[1]]
+                value = F.pad(value, pad)
+            parts.append(value)
+        merged[name] = torch.cat(parts)
+    return merged
+
+
+def sample_occurrence_planner(
+    *,
+    checkpoint_path: Path,
+    output_path: Path,
+    num_samples: int,
+    city_id: int | None = None,
+    batch_size: int = 1024,
+    device: str = "cpu",
+    seed: int = 0,
+    temperature: float = 1.0,
+    route_temperature: float | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Sample ``num_samples`` plans for one city into ``output_path``;
+    ``city_id`` may be omitted for a single-city checkpoint."""
+    output_path = Path(output_path)
+    if output_path.exists() and not force:
+        raise FileExistsError(
+            f"refusing to overwrite existing artifact: {output_path}"
+        )
+    model, payload = load_occurrence_planner_checkpoint(checkpoint_path)
+    cities = model.catalog_city_ids.tolist()
+    if city_id is None:
+        if len(cities) != 1:
+            raise ValueError(
+                f"the planner covers cities {cities}; pass a city id"
+            )
+        city_id = cities[0]
+    elif city_id not in cities:
+        raise ValueError(
+            f"city {city_id} is not in the planner catalog {cities}"
+        )
+    logger.info(
+        "sampling  checkpoint=%s  epoch=%d  num_samples=%d  city_id=%d  "
+        "batch_size=%d  device=%s  seed=%d  temperature=%g",
+        checkpoint_path,
+        payload["epoch"],
+        num_samples,
+        city_id,
+        batch_size,
+        device,
+        seed,
+        temperature,
+    )
+    model = model.to(torch.device(device))
+    chunks = []
+    for start in range(0, num_samples, batch_size):
+        stop = min(start + batch_size, num_samples)
+        chunks.append(
+            sample_occurrence_sequences(
+                model,
+                city_ids=torch.full((stop - start,), city_id),
+                temperature=temperature,
+                route_temperature=route_temperature,
+                seed=seed + start,
+            )
+        )
+        logger.info("sampling progress samples=%d/%d", stop, num_samples)
+    save_occurrence_planner_samples(
+        output_path,
+        **_concat_padded(chunks),
+        seed=seed,
+        temperature=temperature,
+        route_temperature=(
+            temperature if route_temperature is None else route_temperature
+        ),
+        force=force,
+    )
+    return {"output_path": output_path, "num_samples": num_samples}

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
 
 import polars as pl
 
@@ -11,7 +10,7 @@ from semoflow.config import ExperimentConfig
 logger = logging.getLogger(__name__)
 
 
-def run_encoder_pipeline(cfg: ExperimentConfig) -> dict[str, Any]:
+def run_encoder_pipeline(cfg: ExperimentConfig) -> None:
     """Embed POI text, then train the graph encoder on those features."""
     from semoflow.encoder.text.sentence_t5 import build_text_embeddings
     from semoflow.training.graph_encoder import train_heterosage
@@ -29,11 +28,10 @@ def run_encoder_pipeline(cfg: ExperimentConfig) -> dict[str, Any]:
         time.perf_counter() - started,
     )
     started = time.perf_counter()
-    result = train_heterosage(cfg)
+    train_heterosage(cfg)
     logger.info(
         "graph encoder done  elapsed=%.1fs", time.perf_counter() - started
     )
-    return result
 
 
 __all__ = ["run_encoder_pipeline"]

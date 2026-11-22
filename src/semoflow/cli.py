@@ -78,9 +78,6 @@ def _echo(payload: object) -> None:
         typer.echo(dump_json(payload))
 
 
-_RECORDED_PACKAGES = ("torch", "polars", "numpy", "pyyaml")
-
-
 def _git(*args: str) -> str:
     try:
         return subprocess.check_output(
@@ -90,43 +87,29 @@ def _git(*args: str) -> str:
         return "unknown"
 
 
-def _git_info() -> dict[str, str | bool]:
-    return {
-        "commit": _git("rev-parse", "HEAD"),
-        "branch": _git("rev-parse", "--abbrev-ref", "HEAD"),
-        "dirty": _git("status", "--porcelain") != "",
-        "origin": _git("remote", "get-url", "origin"),
-    }
-
-
-def _package_version(name: str) -> str:
-    try:
-        return metadata.version(name)
-    except metadata.PackageNotFoundError:
-        return "not installed"
-
-
-def _environment_info() -> dict[str, Any]:
-    return {
-        "python": sys.version,
-        "platform": platform.platform(),
-        "packages": {
-            name: _package_version(name) for name in _RECORDED_PACKAGES
-        },
-    }
-
-
 def _write_manifest(directory: Path, **fields: Any) -> None:
-    argv = [str(part) for part in sys.argv]
-    manifest = {
-        "command": shlex.join(argv),
-        "argv": argv,
-        "cwd": str(Path.cwd()),
-        "git": _git_info(),
-        "environment": _environment_info(),
-        **fields,
-    }
-    write_json(directory / "run_manifest.json", manifest)
+    """Record the command, code revision and environment of a stage run."""
+    packages = {}
+    for name in ("torch", "polars", "numpy", "pyyaml"):
+        try:
+            packages[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            packages[name] = "not installed"
+    write_json(
+        directory / "run_manifest.json",
+        {
+            "command": shlex.join(sys.argv),
+            "cwd": str(Path.cwd()),
+            "git": {
+                "commit": _git("rev-parse", "HEAD"),
+                "dirty": _git("status", "--porcelain") != "",
+            },
+            "python": sys.version,
+            "platform": platform.platform(),
+            "packages": packages,
+            **fields,
+        },
+    )
 
 
 @contextmanager
@@ -196,7 +179,7 @@ def tokenizer(
     force: Force = False,
     log_level: LogLevel = "INFO",
 ) -> None:
-    from semoflow.training.tokenizer_run import run_semantic_id_tokenizer
+    from semoflow.training.tokenizer import run_semantic_id_tokenizer
 
     cfg = _load(config, sets, log_level)
     artifacts = cfg.layout.tokenizer
@@ -356,7 +339,7 @@ def sample_plans(
     force: Force = False,
     log_level: LogLevel = "INFO",
 ) -> None:
-    from semoflow.planner.sampling_run import sample_occurrence_planner
+    from semoflow.planner.sampling import sample_occurrence_planner
 
     configure_logging(level=log_level)
     if temperature <= 0 or (
@@ -375,13 +358,7 @@ def sample_plans(
         route_temperature=route_temperature,
         force=force,
     )
-    _echo(
-        {
-            "output_path": result.output_path,
-            "num_samples": result.num_samples,
-            "batch_size": result.batch_size,
-        }
-    )
+    _echo(result)
 
 
 @app.command(help="Compose planner samples with the realizer and score them.")
@@ -395,7 +372,6 @@ def compose(
     bank: Annotated[
         Path, typer.Option(help="Realizer bank with the reference split.")
     ],
-    codebooks: Annotated[Path, typer.Option(help="Tokenizer codebooks.")],
     lookup: Annotated[Path, typer.Option(help="Semantic-ID POI lookup.")],
     grounding_index: Annotated[
         Path, typer.Option(help="Semantic-ID grounding index.")
@@ -434,16 +410,13 @@ def compose(
     ] = "independent",
     log_level: LogLevel = "INFO",
 ) -> None:
-    from semoflow.metrics.planner_realizer_composition import (
-        evaluate_planner_realizer,
-    )
+    from semoflow.realizer.evaluation import evaluate_planner_realizer
 
     configure_logging(level=log_level)
     report = evaluate_planner_realizer(
         realizer_checkpoint=realizer_checkpoint,
         planner_samples=planner_samples,
         bank=bank,
-        codebooks=codebooks,
         lookup=lookup,
         grounding_index=grounding_index,
         places=places,

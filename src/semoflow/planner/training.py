@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass
 from functools import partial
@@ -33,12 +32,11 @@ from semoflow.planner.data import (
 )
 from semoflow.planner.loss import occurrence_planner_loss
 from semoflow.planner.model import OccurrenceARPlanner
-from semoflow.training.utils.distributed import find_free_port
+from semoflow.training.utils.distributed import ddp_worker, find_free_port
 from semoflow.training.utils.early_stopping import EarlyStopper
 from semoflow.training.utils.lr_schedule import build_lr_scheduler
 from semoflow.training.utils.runtime import parse_device_spec, set_seed_all
 from semoflow.utils.log import (
-    configure_logging,
     get_configured_log_file,
     log_epoch_summary,
     log_training_step,
@@ -263,20 +261,14 @@ def train_occurrence_planner(
     layout: RunLayout,
     *,
     force: bool = False,
-    rank: int = 0,
-    device_ids: list[int] | None = None,
 ) -> dict[str, Any]:
-    """Train on one device, or as one rank of ``device_ids``."""
+    """Train on one device, or as one rank of an initialized process group."""
     options, seed = settings.training, settings.seed
-    world_size = len(device_ids) if device_ids else 1
-    if world_size > 1:
-        assert device_ids is not None
-        device = torch.device("cuda", device_ids[rank])
-        torch.cuda.set_device(device)
-        dist.init_process_group(
-            backend="nccl", rank=rank, world_size=world_size, device_id=device
-        )
+    if dist.is_available() and dist.is_initialized():
+        rank, world_size = dist.get_rank(), dist.get_world_size()
+        device = torch.device("cuda", torch.cuda.current_device())
     else:
+        rank, world_size = 0, 1
         device = parse_device_spec(options.device)[0]
     ctx = _Rank(rank, world_size, device)
 
@@ -517,7 +509,6 @@ def train_occurrence_planner(
         )
     if ctx.distributed:
         dist.barrier()
-        dist.destroy_process_group()
     return summary
 
 
@@ -531,16 +522,8 @@ def _spawn_worker(
     log_file: Path | None,
     force: bool,
 ) -> None:
-    if rank == 0:
-        configure_logging(level=log_level, log_file=log_file)
-    else:
-        logging.disable(logging.CRITICAL)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    train_occurrence_planner(
-        settings, layout, force=force, rank=rank, device_ids=device_ids
-    )
+    with ddp_worker(rank, device_ids, port, log_level, log_file):
+        train_occurrence_planner(settings, layout, force=force)
 
 
 def train_planner(

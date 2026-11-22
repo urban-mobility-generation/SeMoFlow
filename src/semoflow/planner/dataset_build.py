@@ -21,7 +21,7 @@ from semoflow.planner.gap_codec import (
     gap_tokens_from_event_time_minutes,
 )
 from semoflow.preprocess.weekly_segments import build_weekly_segment_cache
-from semoflow.tokenization.decoding.codebooks import extract_codebook_bundle
+from semoflow.tokenization.decoding.codebooks import load_codebooks
 from semoflow.tokenization.token_space import sid_code_columns
 
 OBSERVATION_WINDOW_MINUTES = 7.0 * 24.0 * 60.0
@@ -166,9 +166,7 @@ def build_planner_data(
         force=force,
     )
     lookup_path = tokenizer.placekey_lookup
-    codebook_size = extract_codebook_bundle(
-        tokenizer.tokenizer_codebooks
-    ).codebook_size
+    codebook_size = int(load_codebooks(tokenizer.tokenizer_codebooks).shape[1])
     lookup, legal_prefixes, catalog_city_ids, city_legal_prefix_mask = (
         _load_prefix_lookup(lookup_path, prefix_depth=PREFIX_DEPTH)
     )

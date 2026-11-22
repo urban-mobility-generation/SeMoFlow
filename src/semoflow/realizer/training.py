@@ -32,11 +32,7 @@ from semoflow.realizer.objective import (
     prefix_time_suffix_latent_flow_loss,
 )
 from semoflow.realizer.time_tokens import N_TIME_TOKENS
-from semoflow.tokenization.decoding.codebooks import (
-    MAX_STANDALONE_CODEBOOK_ARTIFACT_BYTES,
-    codebook_bundle_metadata,
-    extract_codebook_bundle,
-)
+from semoflow.tokenization.decoding.codebooks import load_codebooks
 from semoflow.tokenization.token_space import sid_code_columns, sid_code_names
 from semoflow.training.utils.distributed import unwrap_ddp
 from semoflow.training.utils.early_stopping import EarlyStopper
@@ -180,7 +176,7 @@ def _catalog_codes(path: Path, *, n_codebooks: int) -> torch.Tensor:
     expected = sid_code_names(n_codebooks)
     if fields != expected:
         raise ValueError(
-            "catalog SID columns must match the codebook bundle: "
+            "catalog SID columns must match the codebooks: "
             f"expected {expected}, got {fields}"
         )
     frame = pl.read_parquet(path, columns=list(fields))
@@ -258,19 +254,15 @@ def train_prefix_time_suffix_latent_flow_realizer(
         torch.set_float32_matmul_precision("high")
 
     tokenizer, output_dir = layout.tokenizer, layout.realizer_dir
-    bundle = extract_codebook_bundle(
-        tokenizer.tokenizer_codebooks,
-        max_artifact_bytes=MAX_STANDALONE_CODEBOOK_ARTIFACT_BYTES,
-    )
+    codebooks = load_codebooks(tokenizer.tokenizer_codebooks)
     payload = load_bank_payload(layout.bank)
     train, val = (
         _BankSplit(payload, split, config.city_vocab)
         for split in ("train", "val")
     )
     num_codebooks = int(train.codes.shape[-1])
-    if bundle.n_codebooks != num_codebooks:
+    if codebooks.shape[0] != num_codebooks:
         raise ValueError("codebooks and bank have different SID widths")
-    codebooks = bundle.codebooks.float()
     latent_dim = int(codebooks.shape[-1])
     loader = functools.partial(
         _loader, config=config, device=device, rank=rank, world_size=world_size
@@ -278,7 +270,7 @@ def train_prefix_time_suffix_latent_flow_realizer(
     train_loader = loader(train, shuffle=True)
     val_loader = loader(val, shuffle=False)
 
-    tail_mean, tail_whitener, tail_dewhitener = (
+    tail_mean, tail_whitener = (
         stat.to(device)
         for stat in compute_tail_whitening_stats(
             train.codes,
@@ -302,7 +294,7 @@ def train_prefix_time_suffix_latent_flow_realizer(
         max_seq_len=int(train.codes.shape[1]),
         prefix_depth=config.prefix_depth,
         num_codebooks=num_codebooks,
-        codebook_size=bundle.codebook_size,
+        codebook_size=int(codebooks.shape[1]),
         time_vocab=N_TIME_TOKENS,
         latent_dim=latent_dim,
         model_dim=config.model_dim,
@@ -349,28 +341,17 @@ def train_prefix_time_suffix_latent_flow_realizer(
             total_updates,
         )
 
-    codebook_record = {
-        "codebooks": codebooks.cpu().contiguous(),
-        "codebook_fields": list(bundle.code_fields),
-        "codebook_metadata": codebook_bundle_metadata(bundle),
-    }
-    tail = {
-        "mean": tail_mean.cpu(),
-        "whitener": tail_whitener.cpu(),
-        "dewhitener": tail_dewhitener.cpu(),
-    }
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_extra = {
         "model_type": MODEL_TYPE,
         "prefix_depth": config.prefix_depth,
         "num_codebooks": num_codebooks,
-        "codebook_size": bundle.codebook_size,
+        "codebook_size": int(codebooks.shape[1]),
         "time_vocab": N_TIME_TOKENS,
         "latent_dim": latent_dim,
-        "tail_mean": tail["mean"],
-        "tail_whitener": tail["whitener"],
-        "tail_dewhitener": tail["dewhitener"],
-        **codebook_record,
+        "tail_mean": tail_mean.cpu(),
+        "tail_whitener": tail_whitener.cpu(),
+        "codebooks": codebooks,
         "catalog_candidate_count": config.catalog_candidate_count,
         "endpoint_loss_weight": config.endpoint_loss_weight,
         "population_loss_weight": config.population_loss_weight,

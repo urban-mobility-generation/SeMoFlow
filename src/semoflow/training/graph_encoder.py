@@ -1,7 +1,8 @@
+"""Train the HeteroSAGE POI graph encoder and export its POI embeddings."""
+
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
 import os
 import tempfile
@@ -13,11 +14,11 @@ import polars as pl
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import torch.optim as optim
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
 from semoflow.config import ExperimentConfig
+from semoflow.config.schema import GraphEncoderConfig
 from semoflow.encoder.graph.data import build_hetero_data, build_key_index
 from semoflow.encoder.graph.heterosage import HeteroSAGE
 from semoflow.encoder.graph.losses import (
@@ -25,432 +26,182 @@ from semoflow.encoder.graph.losses import (
     variance_covariance_penalty,
 )
 from semoflow.encoder.graph.sampler import get_train_loader
-from semoflow.training.encoder.cache import (
-    graph_data_cache_dir as _graph_data_cache_dir,
-)
-from semoflow.training.encoder.cache import (
-    load_graph_data_cache as _load_graph_data_cache,
-)
-from semoflow.training.encoder.cache import (
-    write_graph_data_cache as _write_graph_data_cache,
-)
 from semoflow.training.utils.distributed import (
     ddp_worker,
     find_free_port,
     unwrap_ddp,
 )
-from semoflow.training.utils.runtime import (
-    parse_device_spec,
-    set_seed_all,
-)
+from semoflow.training.utils.runtime import parse_device_spec, set_seed_all
+from semoflow.utils.log import get_configured_log_file, log_ddp_summary
 from semoflow.utils.serialization import write_json
 
 logger = logging.getLogger(__name__)
 
 
-class GraphBatch:
-    def __init__(self, raw: Any) -> None:
-        self._raw = raw
-
-    def to(
-        self, device: torch.device, *, non_blocking: bool = False
-    ) -> GraphBatch:
-        return GraphBatch(self._raw.to(device, non_blocking=non_blocking))
-
-    @property
-    def node_features(self) -> dict[str, torch.Tensor]:
-        return self._raw.x_dict
-
-    @property
-    def node_ids(self) -> dict[str, torch.Tensor]:
-        ids: dict[str, torch.Tensor] = {}
-        for node_type in getattr(self._raw, "node_types", ()):
-            store = self._raw[node_type]
-            n_id = getattr(store, "n_id", None)
-            if n_id is not None:
-                ids[node_type] = n_id
-        return ids
-
-    @property
-    def edge_indices(self) -> dict[tuple[str, str, str], torch.Tensor]:
-        return self._raw.edge_index_dict
-
-    @property
-    def edge_types(self) -> list[tuple[str, str, str]]:
-        return list(self._raw.edge_types)
-
-    def first_labelled_edge_type(self) -> tuple[str, str, str] | None:
-        for edge_type in self.edge_types:
-            edge_store = self._raw[edge_type]
-            if (
-                hasattr(edge_store, "edge_label_index")
-                and edge_store.edge_label_index is not None
-            ):
-                return edge_type
-        return None
-
-    def edge_labels(
-        self, edge_type: tuple[str, str, str]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        edge_store = self._raw[edge_type]
-        return edge_store.edge_label_index, edge_store.edge_label
+def _autocast(device: torch.device) -> contextlib.AbstractContextManager:
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
 
 
-def _as_graph_batch(batch: Any) -> GraphBatch:
-    if isinstance(batch, GraphBatch):
-        return batch
-    return GraphBatch(batch)
-
-
-class GraphEncoderTrainer:
-    def __init__(
-        self,
-        *,
-        model: torch.nn.Module,
-        optimizer: optim.Optimizer,
-        device: torch.device,
-        variance_weight: float = 0.0,
-        covariance_weight: float = 0.0,
-        variance_target: float = 1.0,
-        temperature: float = 0.07,
-        max_negatives: int = 2048,
-        max_queries: int = 65536,
-    ) -> None:
-        self.model = model
-        self.optimizer = optimizer
-        self.device = device
-        self.amp_ctx = (
-            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-            if device.type == "cuda"
-            else contextlib.nullcontext()
-        )
-        self.variance_weight = float(variance_weight)
-        self.covariance_weight = float(covariance_weight)
-        self.variance_target = float(variance_target)
-        self.temperature = float(temperature)
-        self.max_negatives = int(max_negatives)
-        self.max_queries = int(max_queries)
-
-    def train_batch_tensor(self, batch: Any) -> torch.Tensor:
-        graph_batch = _as_graph_batch(batch).to(
-            self.device, non_blocking=self.device.type == "cuda"
-        )
-        self.optimizer.zero_grad(set_to_none=True)
-        with self.amp_ctx:
-            poi_emb, target_edge = self._forward_with_target_edge(graph_batch)
-
-        if target_edge is None:
-            dummy_loss = poi_emb.sum() * 0.0
-            dummy_loss.backward()
-            self.optimizer.step()
-            return dummy_loss.detach()
-
-        with self.amp_ctx:
-            loss = self._total_loss(graph_batch, poi_emb, target_edge)
-        loss.backward()
-        self.optimizer.step()
-        return loss.detach()
-
-    def eval_epoch_totals(self, val_loader: Any) -> tuple[float, float]:
-        self.model.eval()
-        total_loss = torch.zeros((), device=self.device)
-        n_batches = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                graph_batch = _as_graph_batch(batch).to(
-                    self.device, non_blocking=self.device.type == "cuda"
-                )
-                with self.amp_ctx:
-                    poi_emb, target_edge = self._forward_with_target_edge(
-                        graph_batch
-                    )
-                if target_edge is None:
-                    continue
-                with self.amp_ctx:
-                    total_loss += self._total_loss(
-                        graph_batch, poi_emb, target_edge
-                    ).detach()
-                n_batches += 1
-        self.model.train()
-        return float(total_loss.item()), float(n_batches)
-
-    def _forward_with_target_edge(
-        self, batch: GraphBatch
-    ) -> tuple[torch.Tensor, tuple[str, str, str] | None]:
-        raw = unwrap_ddp(self.model)
-        node_ids = batch.node_ids
-        ids = (
-            node_ids
-            if node_ids and getattr(raw, "id_embeddings", None)
-            else None
-        )
-        z_dict = self.model(batch.node_features, batch.edge_indices, ids)
-        poi_emb = z_dict["poi"]
-        return poi_emb, batch.first_labelled_edge_type()
-
-    def _link_loss(
-        self,
-        batch: GraphBatch,
-        poi_emb: torch.Tensor,
-        target_edge: tuple[str, str, str],
-    ) -> torch.Tensor:
-        edge_label_index, edge_label = batch.edge_labels(target_edge)
-
-        pos_mask = edge_label == 1
-        neg_mask = edge_label == 0
-
-        pos_edges = (
-            edge_label_index[0, pos_mask],
-            edge_label_index[1, pos_mask],
-        )
-        neg_edges = (
-            edge_label_index[0, neg_mask],
-            edge_label_index[1, neg_mask],
-        )
-        return contrastive_link_loss(
-            poi_emb,
-            pos_edges,
-            neg_edges=neg_edges,
-            temperature=self.temperature,
-            max_negatives=self.max_negatives,
-            max_queries=self.max_queries,
-        )
-
-    def _total_loss(
-        self,
-        batch: GraphBatch,
-        poi_emb: torch.Tensor,
-        target_edge: tuple[str, str, str],
-    ) -> torch.Tensor:
-        loss = self._link_loss(batch, poi_emb, target_edge)
-        if self.variance_weight == 0.0 and self.covariance_weight == 0.0:
-            return loss
-        variance_loss, covariance_loss = variance_covariance_penalty(
-            poi_emb.float(), variance_target=self.variance_target
-        )
-        return (
-            loss
-            + self.variance_weight * variance_loss
-            + self.covariance_weight * covariance_loss
-        )
-
-
-def _evaluate_validation(
-    trainer: Any,
-    val_loader: Any,
-    device: torch.device,
-    world_size: int,
-) -> float:
-    total, batches = trainer.eval_epoch_totals(val_loader)
-    if world_size <= 1:
-        return float(total / max(batches, 1.0))
-    packed = torch.tensor([total, batches], dtype=torch.float64, device=device)
-    dist.all_reduce(packed, op=dist.ReduceOp.SUM)
-    combined_total = float(packed[0].item())
-    combined_batches = float(packed[1].item())
-    return combined_total / max(combined_batches, 1.0)
-
-
-def _wrap_graph_model_for_ddp(
+def _batch_loss(
     model: torch.nn.Module,
+    batch: Any,
+    graph_cfg: GraphEncoderConfig,
     device: torch.device,
-    world_size: int,
-) -> torch.nn.Module:
-    if world_size > 1 and device.type == "cuda":
-        return DDP(
-            model,
-            device_ids=[device.index],
-            find_unused_parameters=True,
+) -> torch.Tensor:
+    """Contrastive link loss over the batch's labelled POI-POI edges, plus
+    the optional variance/covariance penalty on the POI embeddings."""
+    batch = batch.to(device, non_blocking=device.type == "cuda")
+    ids = (
+        {ntype: batch[ntype].n_id for ntype in batch.node_types}
+        if unwrap_ddp(model).id_embeddings
+        else None
+    )
+    with _autocast(device):
+        poi = model(batch.x_dict, batch.edge_index_dict, ids)["poi"]
+        (target,) = (
+            batch[edge_type]
+            for edge_type in batch.edge_types
+            if "edge_label_index" in batch[edge_type]
         )
-    return model
+        index, label = target.edge_label_index, target.edge_label
+        loss = contrastive_link_loss(
+            poi,
+            (index[0, label == 1], index[1, label == 1]),
+            neg_edges=(index[0, label == 0], index[1, label == 0]),
+            temperature=graph_cfg.temperature,
+            max_negatives=graph_cfg.max_negatives,
+            max_queries=graph_cfg.max_queries,
+        )
+        if graph_cfg.variance_weight or graph_cfg.covariance_weight:
+            variance, covariance = variance_covariance_penalty(
+                poi.float(), variance_target=graph_cfg.variance_target
+            )
+            loss = (
+                loss
+                + graph_cfg.variance_weight * variance
+                + graph_cfg.covariance_weight * covariance
+            )
+    return loss
+
+
+def _mean_over_ranks(
+    total: torch.Tensor, batches: int, world_size: int
+) -> float:
+    packed = torch.stack(
+        [total.double(), torch.tensor(batches, device=total.device).double()]
+    )
+    if world_size > 1:
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+    return float(packed[0] / packed[1].clamp(min=1))
 
 
 def _build_graph_data(
     cfg: ExperimentConfig,
 ) -> tuple[Any, torch.Tensor | None]:
+    """The train-split heterogeneous POI graph and its held-out edges."""
     graph_cfg = cfg.encoder.graph
-
-    processed_visits_path = cfg.layout.preprocessing.processed_visits
-    places_index_path = cfg.layout.preprocessing.places_index
-    text_emb_path = cfg.layout.text_embeddings
-
-    if not processed_visits_path.exists():
-        raise FileNotFoundError(
-            f"Missing stays path for the graph encoder: {processed_visits_path}"
-        )
-    if not places_index_path.exists():
-        raise FileNotFoundError(
-            f"Missing POI index for the graph encoder: {places_index_path}"
-        )
-
-    cache_dir = _graph_data_cache_dir(cfg)
-    cached = _load_graph_data_cache(cache_dir, cfg)
-    if cached is not None:
-        return cached
-
     logger.info("Loading processed visits and POI index...")
-    stays_df = pl.read_parquet(processed_visits_path)
-    if "split" in stays_df.columns:
-        n_all = stays_df.height
-        stays_df = stays_df.filter(pl.col("split") == "train")
-        logger.info(
-            "graph build restricted to train split: %s/%s stays",
-            f"{stays_df.height:,}",
-            f"{n_all:,}",
-        )
-    places_index_df = pl.read_parquet(places_index_path)
-
-    data, val_edges = build_hetero_data(
-        stays_df=stays_df,
-        places_index_df=places_index_df,
-        text_embeddings_path=text_emb_path,
+    stays = pl.read_parquet(cfg.layout.preprocessing.processed_visits)
+    n_all = stays.height
+    stays = stays.filter(pl.col("split") == "train")
+    logger.info(
+        "graph build restricted to train split: %s/%s stays",
+        f"{stays.height:,}",
+        f"{n_all:,}",
+    )
+    return build_hetero_data(
+        stays_df=stays,
+        places_index_df=pl.read_parquet(cfg.layout.preprocessing.places_index),
+        text_embeddings_path=cfg.layout.text_embeddings,
         hidden_dim=graph_cfg.hidden_dim,
         train_fraction=graph_cfg.hash_train_fraction,
         seed=graph_cfg.seed,
     )
-    _write_graph_data_cache(cfg, cache_dir, data, val_edges)
-
-    return data, val_edges
 
 
-def _id_embedding_counts(graph_cfg: Any, data: Any) -> dict[str, int] | None:
+def _id_embedding_counts(
+    graph_cfg: GraphEncoderConfig, data: Any
+) -> dict[str, int] | None:
     """Node count per node type that gets a learned ID embedding table."""
     if graph_cfg.id_embedding_dim <= 0:
         return None
-    selected_types = graph_cfg.id_embedding_node_types
-    if selected_types is None:
-        embedded_types = list(data.node_types)
-    else:
-        unknown = sorted(set(selected_types).difference(data.node_types))
+    selected = graph_cfg.id_embedding_node_types
+    if selected is not None:
+        unknown = sorted(set(selected).difference(data.node_types))
         if unknown:
             raise ValueError(
-                "encoder_pipeline.graph.id_embedding_node_types names "
-                f"node types absent from the graph: {unknown}; graph has "
+                "encoder.graph.id_embedding_node_types names node types "
+                f"absent from the graph: {unknown}; graph has "
                 f"{sorted(data.node_types)}"
             )
-        embedded_types = [
-            ntype for ntype in data.node_types if ntype in selected_types
-        ]
-    id_counts = {ntype: int(data[ntype].num_nodes) for ntype in embedded_types}
+    counts = {
+        ntype: int(data[ntype].num_nodes)
+        for ntype in data.node_types
+        if selected is None or ntype in selected
+    }
     logger.info(
         "id embedding tables: %s  parameters=%s",
         ", ".join(
             f"{ntype}={count:,}x{graph_cfg.id_embedding_dim}"
-            for ntype, count in id_counts.items()
+            for ntype, count in counts.items()
         ),
-        f"{sum(id_counts.values()) * graph_cfg.id_embedding_dim:,}",
+        f"{sum(counts.values()) * graph_cfg.id_embedding_dim:,}",
     )
-    return id_counts
-
-
-def _resume_graph_training(
-    best_path: Path,
-    raw_model: torch.nn.Module,
-    optimizer: optim.Optimizer,
-    *,
-    device: torch.device,
-    is_main: bool,
-) -> tuple[int, float]:
-    """Restore an existing checkpoint; return (start epoch, best val loss)."""
-    if not best_path.exists():
-        return 0, float("inf")
-    start_epoch, best_val_loss = 0, float("inf")
-    ckpt = torch.load(best_path, map_location=device, weights_only=False)
-    raw_model.load_state_dict(_model_state(ckpt))
-    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        start_epoch = ckpt.get("epoch", 0) + 1
-        best_val_loss = ckpt.get("best_val_loss", float("inf"))
-    if is_main:
-        logger.info(
-            "Resumed from %s — starting at epoch %d, best_val=%.4f",
-            best_path,
-            start_epoch + 1,
-            best_val_loss,
-        )
-    return start_epoch, best_val_loss
-
-
-def _model_state(checkpoint: Any) -> Any:
-    """The model state of a full training checkpoint or a bare state dict."""
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        return checkpoint["model_state_dict"]
-    return checkpoint
+    return counts
 
 
 def _export_poi_embeddings(
-    cfg: ExperimentConfig,
-    raw_model: torch.nn.Module,
-    data: Any,
-    out_dir: Path,
-) -> tuple[torch.Tensor, Path, Path]:
+    cfg: ExperimentConfig, model: torch.nn.Module, data: Any, out_dir: Path
+) -> torch.Tensor:
     """Write CPU POI embeddings and the places index aligned to their rows."""
     logger.info("Extracting final POI embeddings...")
-    raw_model.eval()
-    raw_model.to("cpu")
-    with torch.no_grad():
-        data_cpu = data.to("cpu")
-        ids = (
-            {
-                ntype: torch.arange(
-                    int(data_cpu[ntype].num_nodes), dtype=torch.long
-                )
-                for ntype in data_cpu.node_types
-            }
-            if getattr(raw_model, "id_embeddings", None)
-            else None
-        )
-        poi_graph_emb = raw_model(
-            data_cpu.x_dict, data_cpu.edge_index_dict, ids
-        )["poi"]
-    emb_path = out_dir / "poi_graph_emb.pt"
-    torch.save(poi_graph_emb, emb_path)
-
-    places_index_df = pl.read_parquet(cfg.layout.preprocessing.places_index)
-    identity_cols = [
-        c for c in ("placekey_id", "placekey") if c in places_index_df.columns
-    ]
-    poi_col = (
-        "placekey_id"
-        if "placekey_id" in places_index_df.columns
-        else "placekey"
+    model.eval()
+    model.to("cpu")
+    data = data.to("cpu")
+    ids = (
+        {
+            ntype: torch.arange(int(data[ntype].num_nodes), dtype=torch.long)
+            for ntype in data.node_types
+        }
+        if model.id_embeddings
+        else None
     )
-    index_path = out_dir / "places_index.parquet"
+    with torch.no_grad():
+        embeddings = model(data.x_dict, data.edge_index_dict, ids)["poi"]
+    torch.save(embeddings, out_dir / "poi_graph_emb.pt")
+    places = pl.read_parquet(cfg.layout.preprocessing.places_index)
     (
-        build_key_index(places_index_df[poi_col], poi_col)
+        build_key_index(places["placekey_id"], "placekey_id")
         .rename({"idx": "embedding_row"})
         .join(
-            places_index_df.select(identity_cols).unique(
-                poi_col, keep="first"
-            ),
-            on=poi_col,
+            places.select("placekey_id", "placekey"),
+            on="placekey_id",
             how="left",
             maintain_order="left",
         )
-        .write_parquet(index_path)
+        .write_parquet(out_dir / "places_index.parquet")
     )
-    return poi_graph_emb, emb_path, index_path
+    return embeddings
 
 
-def _train_graph_single(
+def _train(
     cfg: ExperimentConfig,
     data: Any,
     val_edges: torch.Tensor | None,
     device: torch.device,
     rank: int = 0,
     world_size: int = 1,
-) -> dict[str, Any]:
+) -> None:
     is_main = rank == 0
     graph_cfg = cfg.encoder.graph
     out_dir = cfg.layout.graph_dir
-    checkpoints_dir = out_dir / "checkpoints"
-    best_path = checkpoints_dir / "best.pt"
+    best_path = out_dir / "checkpoints" / "best.pt"
     if is_main:
-        checkpoints_dir.mkdir(parents=True, exist_ok=True)
+        best_path.parent.mkdir(parents=True, exist_ok=True)
 
-    seed = graph_cfg.seed
-    torch.manual_seed(seed + rank)
+    torch.manual_seed(graph_cfg.seed + rank)
     if is_main:
         logger.info("Initializing LinkNeighborLoader...")
     loader, val_loader = (
@@ -461,17 +212,16 @@ def _train_graph_single(
             train_edge_index=edges,
             num_workers=graph_cfg.num_workers,
             pin_memory=device.type == "cuda",
-            seed=seed,
+            seed=graph_cfg.seed,
             rank=rank,
             world_size=world_size,
         )
         for edges in (None, val_edges)
     )
 
-    in_dims = {ntype: data[ntype].x.size(1) for ntype in data.node_types}
-    model: torch.nn.Module = HeteroSAGE(
+    raw_model = HeteroSAGE(
         metadata=data.metadata(),
-        in_dims=in_dims,
+        in_dims={ntype: data[ntype].x.size(1) for ntype in data.node_types},
         hidden_dim=graph_cfg.hidden_dim,
         out_dim=graph_cfg.out_dim,
         num_layers=graph_cfg.num_layers,
@@ -482,33 +232,38 @@ def _train_graph_single(
         id_embedding_dim=graph_cfg.id_embedding_dim,
         id_embedding_counts=_id_embedding_counts(graph_cfg, data),
     ).to(device)
-    model = _wrap_graph_model_for_ddp(model, device, world_size)
-    raw_model = unwrap_ddp(model)
+    model: torch.nn.Module = (
+        DistributedDataParallel(
+            raw_model, device_ids=[device.index], find_unused_parameters=True
+        )
+        if world_size > 1
+        else raw_model
+    )
     n_parameters = sum(p.numel() for p in raw_model.parameters())
-    optimizer = optim.Adam(raw_model.parameters(), lr=graph_cfg.lr)
-    trainer = GraphEncoderTrainer(
-        model=model,
-        optimizer=optimizer,
-        device=device,
-        variance_weight=graph_cfg.variance_weight,
-        covariance_weight=graph_cfg.covariance_weight,
-        variance_target=graph_cfg.variance_target,
-        temperature=graph_cfg.temperature,
-        max_negatives=graph_cfg.max_negatives,
-        max_queries=graph_cfg.max_queries,
-    )
-    start_epoch, best_val_loss = _resume_graph_training(
-        best_path, raw_model, optimizer, device=device, is_main=is_main
-    )
+    optimizer = torch.optim.Adam(raw_model.parameters(), lr=graph_cfg.lr)
+
+    # An existing best checkpoint resumes training after its epoch.
+    start_epoch, best_val_loss = 0, float("inf")
+    if best_path.exists():
+        checkpoint = torch.load(best_path, map_location=device)
+        raw_model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = checkpoint["epoch"] + 1
+        best_val_loss = checkpoint["best_val_loss"]
+        if is_main:
+            logger.info(
+                "Resumed from %s — starting at epoch %d, best_val=%.4f",
+                best_path,
+                start_epoch + 1,
+                best_val_loss,
+            )
 
     epochs = graph_cfg.epochs
     history: list[dict[str, float]] = []
-    model.train()
     if is_main:
         logger.info(
-            "Starting %s  epochs=%d  lr=%g  device=%s  "
+            "Starting HeteroSAGE  epochs=%d  lr=%g  device=%s  "
             "params=%d  world_size=%d",
-            type(raw_model).__name__,
             epochs,
             graph_cfg.lr,
             device,
@@ -516,29 +271,34 @@ def _train_graph_single(
             world_size,
         )
     for epoch in range(start_epoch, epochs):
-        t_epoch = time.perf_counter()
-        epoch_loss = torch.tensor(0.0, device=device)
-        epoch_batches = torch.tensor(0, device=device, dtype=torch.long)
+        started = time.perf_counter()
+        model.train()
+        total, batches = torch.zeros((), device=device), 0
         desc = f"Epoch {epoch + 1}/{epochs}"
         for batch in tqdm(loader, desc=desc) if is_main else loader:
-            epoch_loss += trainer.train_batch_tensor(batch)
-            epoch_batches += 1
-        if world_size > 1:
-            dist.all_reduce(epoch_loss, op=dist.ReduceOp.SUM)
-            dist.all_reduce(epoch_batches, op=dist.ReduceOp.SUM)
-        train_loss = float(epoch_loss.item()) / max(
-            int(epoch_batches.item()), 1
-        )
-        val_loss = _evaluate_validation(
-            trainer, val_loader, device, world_size
-        )
-        epoch_secs = time.perf_counter() - t_epoch
+            optimizer.zero_grad(set_to_none=True)
+            loss = _batch_loss(model, batch, graph_cfg, device)
+            loss.backward()
+            optimizer.step()
+            total += loss.detach()
+            batches += 1
+        train_loss = _mean_over_ranks(total, batches, world_size)
+
+        model.eval()
+        total, batches = torch.zeros((), device=device), 0
+        with torch.no_grad():
+            for batch in val_loader:
+                total += _batch_loss(model, batch, graph_cfg, device)
+                batches += 1
+        val_loss = _mean_over_ranks(total, batches, world_size)
+
+        elapsed = time.perf_counter() - started
         history.append(
             {
                 "epoch": epoch + 1,
                 "train_loss": train_loss,
                 "val_loss": val_loss,
-                "elapsed_s": round(epoch_secs, 1),
+                "elapsed_s": round(elapsed, 1),
             }
         )
         if val_loss < best_val_loss:
@@ -562,34 +322,23 @@ def _train_graph_single(
                 train_loss,
                 val_loss,
                 best_val_loss,
-                epoch_secs,
+                elapsed,
             )
-
-    result: dict[str, Any] = {
-        "best_val_loss": best_val_loss,
-        "n_parameters": n_parameters,
-        "checkpoint_path": str(best_path),
-    }
     if not is_main:
-        return result
+        return
 
     if best_path.exists():
         raw_model.load_state_dict(
-            _model_state(
-                torch.load(best_path, map_location="cpu", weights_only=False)
-            )
+            torch.load(best_path, map_location="cpu")["model_state_dict"]
         )
-    poi_graph_emb, emb_path, index_path = _export_poi_embeddings(
-        cfg, raw_model, data, out_dir
-    )
-    metrics_path = out_dir / "metrics.json"
+    embeddings = _export_poi_embeddings(cfg, raw_model, data, out_dir)
     write_json(
-        metrics_path,
+        out_dir / "metrics.json",
         {
-            "model": type(raw_model).__name__,
+            "model": "HeteroSAGE",
             "n_parameters": n_parameters,
-            "n_pois": int(poi_graph_emb.shape[0]),
-            "embedding_dim": int(poi_graph_emb.shape[1]),
+            "n_pois": int(embeddings.shape[0]),
+            "embedding_dim": int(embeddings.shape[1]),
             "best_val_loss": best_val_loss,
             "epochs": epochs,
             "world_size": world_size,
@@ -597,80 +346,33 @@ def _train_graph_single(
         },
     )
     logger.info(
-        "Saved GraphSAGE artifacts to %s  "
-        "embeddings=%s  index=%s  metrics=%s  checkpoint=%s",
-        out_dir,
-        emb_path,
-        index_path,
-        metrics_path,
-        best_path,
+        "Saved GraphSAGE artifacts to %s  checkpoint=%s", out_dir, best_path
     )
-    result.update(
-        {
-            "n_pois": int(poi_graph_emb.shape[0]),
-            "embedding_dim": int(poi_graph_emb.shape[1]),
-            "embedding_path": str(emb_path),
-        }
-    )
-    return result
 
 
-def _train_graph_worker(
+def _train_worker(
     rank: int,
     device_ids: list[int],
     port: int,
     cfg: ExperimentConfig,
     graph_data_path: str,
-    tmp_result_path: str,
-    log_level: str = "INFO",
-    log_file: Path | None = None,
+    log_level: str,
+    log_file: Path | None,
 ) -> None:
-    try:
-        with ddp_worker(rank, device_ids, port, log_level, log_file) as device:
-            logger.info(
-                "DDP worker started  rank=%d  device=%s  world_size=%d",
-                rank,
-                device,
-                len(device_ids),
-            )
-            data, val_edges = torch.load(
-                graph_data_path,
-                map_location="cpu",
-                weights_only=False,
-            )
-            result = _train_graph_single(
-                cfg, data, val_edges, device, rank, len(device_ids)
-            )
-            del data, val_edges
-            if rank == 0:
-                Path(tmp_result_path).write_text(
-                    json.dumps(result, default=str), encoding="utf-8"
-                )
-    except Exception:
-        logger.exception(
-            "DDP worker failed  rank=%d  device=cuda:%d",
-            rank,
-            device_ids[rank],
-        )
-        raise
+    with ddp_worker(rank, device_ids, port, log_level, log_file) as device:
+        data, val_edges = torch.load(graph_data_path, weights_only=False)
+        _train(cfg, data, val_edges, device, rank, len(device_ids))
 
 
-def train_heterosage(
-    cfg: ExperimentConfig,
-) -> dict[str, Any]:
+def train_heterosage(cfg: ExperimentConfig) -> None:
+    """Train on one device, or spawn one DDP rank per listed GPU."""
     graph_cfg = cfg.encoder.graph
     set_seed_all(graph_cfg.seed)
-
-    primary_device, device_ids = parse_device_spec(graph_cfg.device)
-
+    device, device_ids = parse_device_spec(graph_cfg.device)
     data, val_edges = _build_graph_data(cfg)
-
     if not device_ids:
-        return _train_graph_single(
-            cfg, data, val_edges, primary_device, rank=0, world_size=1
-        )
-
-    from semoflow.utils.log import get_configured_log_file, log_ddp_summary
+        _train(cfg, data, val_edges, device)
+        return
 
     port = find_free_port()
     log_ddp_summary(
@@ -679,41 +381,26 @@ def train_heterosage(
         port=port,
         batch_per_rank=graph_cfg.batch_size,
     )
-    _log_level = logging.getLevelName(logging.getLogger().level)
-    _log_file = get_configured_log_file()
-
-    fd_graph, tmp_graph = tempfile.mkstemp(suffix=".pt")
-    os.close(fd_graph)
-    torch.save((data, val_edges), tmp_graph)
-    del data, val_edges
-    logger.info("Graph data saved to %s for DDP workers", tmp_graph)
-
-    fd, tmp = tempfile.mkstemp(suffix=".json")
+    fd, graph_data_path = tempfile.mkstemp(suffix=".pt")
     os.close(fd)
     try:
+        torch.save((data, val_edges), graph_data_path)
+        del data, val_edges
         mp.spawn(
-            _train_graph_worker,
+            _train_worker,
             args=(
                 device_ids,
                 port,
                 cfg,
-                tmp_graph,
-                tmp,
-                _log_level,
-                _log_file,
+                graph_data_path,
+                logging.getLevelName(logging.getLogger().level),
+                get_configured_log_file(),
             ),
             nprocs=len(device_ids),
             join=True,
         )
-        raw = Path(tmp).read_text(encoding="utf-8").strip()
-        if not raw:
-            raise RuntimeError(
-                "DDP result file is empty — rank-0 worker "
-                "likely crashed before writing results"
-            )
-        return json.loads(raw)
     finally:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp)
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_graph)
+        os.unlink(graph_data_path)
+
+
+__all__ = ["train_heterosage"]

@@ -58,7 +58,10 @@ class OccurrencePlannerDataset:
     legal_prefix_centroid_available: torch.Tensor | None = None
 
 
-def _publish_atomic(path: Path, write: Any, *, force: bool) -> None:
+def save_torch_atomic(
+    path: Path, payload: object, *, force: bool = False
+) -> None:
+    """Write ``payload`` via a temporary file, refusing to overwrite."""
     path = Path(path)
     if path.exists() and not force:
         raise FileExistsError(
@@ -67,16 +70,10 @@ def _publish_atomic(path: Path, write: Any, *, force: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
     try:
-        write(tmp)
+        torch.save(payload, tmp)
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
-
-
-def save_torch_atomic(
-    path: Path, payload: object, *, force: bool = False
-) -> None:
-    _publish_atomic(path, lambda tmp: torch.save(payload, tmp), force=force)
 
 
 def _load_artifact(path: Path, artifact_type: str) -> dict[str, Any]:
@@ -103,17 +100,10 @@ def load_occurrence_planner_dataset(path: Path) -> OccurrencePlannerDataset:
     )
 
 
-@dataclass(frozen=True, slots=True)
-class OccurrencePlannerCheckpoint:
-    config: OccurrencePlannerConfig
-    legal_prefixes: torch.Tensor
-    catalog_city_ids: torch.Tensor
-    city_legal_prefix_mask: torch.Tensor
-    model: OccurrenceARPlanner
-    epoch: int
-    validation_metric: float
-    legal_prefix_centroids: torch.Tensor | None
-    legal_prefix_centroid_available: torch.Tensor | None
+def _cpu(
+    tensor: torch.Tensor | None, dtype: torch.dtype
+) -> torch.Tensor | None:
+    return None if tensor is None else tensor.detach().to("cpu", dtype).clone()
 
 
 def save_occurrence_planner_checkpoint(
@@ -135,28 +125,12 @@ def save_occurrence_planner_checkpoint(
     payload = {
         "artifact_type": CHECKPOINT_ARTIFACT_TYPE,
         "config": asdict(config),
-        "legal_prefixes": legal_prefixes.detach()
-        .to("cpu", torch.long)
-        .clone(),
-        "catalog_city_ids": catalog_city_ids.detach()
-        .to("cpu", torch.long)
-        .clone(),
-        "city_legal_prefix_mask": city_legal_prefix_mask.detach()
-        .to("cpu", torch.bool)
-        .clone(),
-        "legal_prefix_centroids": (
-            None
-            if legal_prefix_centroids is None
-            else legal_prefix_centroids.detach()
-            .to("cpu", torch.float32)
-            .clone()
-        ),
-        "legal_prefix_centroid_available": (
-            None
-            if legal_prefix_centroid_available is None
-            else legal_prefix_centroid_available.detach()
-            .to("cpu", torch.bool)
-            .clone()
+        "legal_prefixes": _cpu(legal_prefixes, torch.long),
+        "catalog_city_ids": _cpu(catalog_city_ids, torch.long),
+        "city_legal_prefix_mask": _cpu(city_legal_prefix_mask, torch.bool),
+        "legal_prefix_centroids": _cpu(legal_prefix_centroids, torch.float32),
+        "legal_prefix_centroid_available": _cpu(
+            legal_prefix_centroid_available, torch.bool
         ),
         "model_state": model_state,
         "epoch": int(epoch),
@@ -167,6 +141,8 @@ def save_occurrence_planner_checkpoint(
     save_torch_atomic(path, payload, force=force)
 
 
+# Settings of earlier planner families that released checkpoints still
+# record; only the value this planner implements is accepted.
 _RETIRED_CONFIG = {
     "context_dim": 0,
     "context_schema": (),
@@ -176,44 +152,30 @@ _RETIRED_CONFIG = {
 }
 
 
-def _checkpoint_config(raw: dict[str, Any]) -> OccurrencePlannerConfig:
-    config = dict(raw)
+def load_occurrence_planner_checkpoint(
+    path: Path,
+) -> tuple[OccurrenceARPlanner, dict[str, Any]]:
+    """The planner in eval mode, and the raw checkpoint payload."""
+    payload = _load_artifact(path, CHECKPOINT_ARTIFACT_TYPE)
+    config = dict(payload["config"])
     for key, supported in _RETIRED_CONFIG.items():
         if key in config and config.pop(key) != supported:
             raise ValueError(
                 f"unsupported planner checkpoint: {key} != {supported!r}"
             )
-    return OccurrencePlannerConfig(**config)
-
-
-def load_occurrence_planner_checkpoint(
-    path: Path,
-) -> OccurrencePlannerCheckpoint:
-    payload = _load_artifact(path, CHECKPOINT_ARTIFACT_TYPE)
-    config = _checkpoint_config(payload["config"])
-    centroids = payload["legal_prefix_centroids"]
-    centroid_available = payload["legal_prefix_centroid_available"]
     model = OccurrenceARPlanner(
-        config,
+        OccurrencePlannerConfig(**config),
         payload["legal_prefixes"],
         catalog_city_ids=payload["catalog_city_ids"],
         city_legal_prefix_mask=payload["city_legal_prefix_mask"],
-        legal_prefix_centroids=centroids,
-        legal_prefix_centroid_available=centroid_available,
+        legal_prefix_centroids=payload["legal_prefix_centroids"],
+        legal_prefix_centroid_available=payload[
+            "legal_prefix_centroid_available"
+        ],
     )
     model.load_state_dict(payload["model_state"])
     model.eval()
-    return OccurrencePlannerCheckpoint(
-        config=config,
-        legal_prefixes=payload["legal_prefixes"],
-        catalog_city_ids=payload["catalog_city_ids"],
-        city_legal_prefix_mask=payload["city_legal_prefix_mask"],
-        model=model,
-        epoch=payload["epoch"],
-        validation_metric=payload["validation_metric"],
-        legal_prefix_centroids=centroids,
-        legal_prefix_centroid_available=centroid_available,
-    )
+    return model, payload
 
 
 def save_occurrence_planner_samples(
@@ -247,7 +209,6 @@ __all__ = [
     "CHECKPOINT_ARTIFACT_TYPE",
     "DATASET_ARTIFACT_TYPE",
     "SAMPLES_ARTIFACT_TYPE",
-    "OccurrencePlannerCheckpoint",
     "OccurrencePlannerDataConfig",
     "OccurrencePlannerDataset",
     "OccurrencePlannerSplit",

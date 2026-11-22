@@ -17,34 +17,18 @@ from semoflow.realizer.model import (
     LatentSuffixConditioning,
     PrefixTimeSuffixLatentFlowRealizer,
 )
-from semoflow.tokenization.decoding.codebooks import (
-    codes_to_embeddings_from_codebooks,
-)
+from semoflow.tokenization.decoding.codebooks import codes_to_embeddings
+from semoflow.tokenization.token_space import find_sorted, packed_code_keys
 
 
-def _sid_keys(
-    codes: torch.Tensor,
-    *,
-    codebook_size: int,
-    width: int,
-) -> torch.LongTensor:
-    powers = torch.tensor(
-        [codebook_size**power for power in range(width - 1, -1, -1)],
-        dtype=torch.long,
-        device=codes.device,
-    )
-    return (codes.long() * powers).sum(dim=-1)
-
-
-def _count_catalog_occurrences(
+def count_catalog_occurrences(
     catalog_keys: torch.Tensor,
     observed_codes: torch.Tensor,
-    observed_valid_mask: torch.BoolTensor | None,
+    observed_valid_mask: torch.BoolTensor | None = None,
     *,
     codebook_size: int,
-    width: int,
-    count_device: torch.device | str | None,
-    chunk_size: int,
+    count_device: torch.device | str | None = None,
+    chunk_size: int = 1_048_576,
 ) -> torch.Tensor:
     """Count how often each catalog SID occurs among the observed codes."""
 
@@ -58,7 +42,7 @@ def _count_catalog_occurrences(
     sorted_counts = torch.zeros(
         catalog_keys.numel(), dtype=torch.long, device=device
     )
-    flat_observed = observed_codes.reshape(-1, width)
+    flat_observed = observed_codes.reshape(-1, observed_codes.shape[-1])
     flat_mask = (
         None
         if observed_valid_mask is None
@@ -72,15 +56,11 @@ def _count_catalog_occurrences(
             if not chunk_mask.any():
                 continue
             chunk = chunk[chunk_mask]
-        chunk_keys = _sid_keys(
+        chunk_keys = packed_code_keys(
             chunk.to(device, dtype=torch.long, non_blocking=True),
             codebook_size=codebook_size,
-            width=width,
         )
-        positions = torch.searchsorted(sorted_catalog_keys, chunk_keys)
-        in_range = positions < sorted_catalog_keys.numel()
-        safe = positions.clamp_max(sorted_catalog_keys.numel() - 1)
-        matched = in_range & sorted_catalog_keys[safe].eq(chunk_keys)
+        safe, matched = find_sorted(sorted_catalog_keys, chunk_keys)
         sorted_counts.scatter_add_(
             0, safe[matched], torch.ones_like(safe[matched])
         )
@@ -160,17 +140,15 @@ class CatalogCandidateBank:
         codebook_size = int(codebooks.shape[1])
 
         catalog = torch.unique(catalog_codes.long().cpu(), dim=0).contiguous()
-        catalog_keys = _sid_keys(
+        catalog_keys = packed_code_keys(
             catalog,
             codebook_size=codebook_size,
-            width=catalog.shape[1],
         )
-        catalog_counts = _count_catalog_occurrences(
+        catalog_counts = count_catalog_occurrences(
             catalog_keys,
             observed_codes,
             observed_valid_mask,
             codebook_size=codebook_size,
-            width=catalog.shape[1],
             count_device=count_device,
             chunk_size=count_chunk_size,
         )
@@ -184,10 +162,9 @@ class CatalogCandidateBank:
                 row_index
             )
         sorted_prefixes = sorted(prefix_groups)
-        prefix_keys = _sid_keys(
+        prefix_keys = packed_code_keys(
             torch.tensor(sorted_prefixes, dtype=torch.long),
             codebook_size=codebook_size,
-            width=prefix_depth,
         )
         groups = [
             _prefix_candidate_rows(
@@ -229,14 +206,11 @@ class CatalogCandidateBank:
         )
 
     def _prefix_indices(self, prefixes: torch.Tensor) -> torch.LongTensor:
-        keys = _sid_keys(
-            prefixes, codebook_size=self.codebook_size, width=self.prefix_depth
+        keys = packed_code_keys(
+            prefixes[..., : self.prefix_depth],
+            codebook_size=self.codebook_size,
         )
-        indices = torch.searchsorted(self.prefix_keys, keys)
-        valid = indices < self.prefix_keys.numel()
-        valid = valid & self.prefix_keys[
-            indices.clamp_max(max(self.prefix_keys.numel() - 1, 0))
-        ].eq(keys)
+        indices, valid = find_sorted(self.prefix_keys, keys)
         if not valid.all():
             missing = prefixes[~valid][0].tolist()
             raise ValueError(
@@ -246,15 +220,11 @@ class CatalogCandidateBank:
         return indices
 
     def log_prior_for_codes(self, codes: torch.Tensor) -> torch.Tensor:
-        keys = _sid_keys(
+        keys = packed_code_keys(
             codes,
             codebook_size=self.codebook_size,
-            width=codes.shape[-1],
         )
-        indices = torch.searchsorted(self.full_code_keys, keys)
-        valid = indices < self.full_code_keys.numel()
-        safe = indices.clamp_max(max(self.full_code_keys.numel() - 1, 0))
-        valid = valid & self.full_code_keys[safe].eq(keys)
+        safe, valid = find_sorted(self.full_code_keys, keys)
         return torch.where(
             valid,
             self.full_log_prior[safe],
@@ -269,7 +239,7 @@ def suffix_tail_embeddings(
     prefix_depth: int,
 ) -> torch.Tensor:
     """Summed codebook embeddings of the levels after ``prefix_depth``."""
-    return codes_to_embeddings_from_codebooks(
+    return codes_to_embeddings(
         clean_codes[..., prefix_depth:].long(),
         codebooks.to(clean_codes.device)[prefix_depth:],
     )
@@ -307,7 +277,8 @@ def compute_tail_whitening_stats(
     eps: float = 1e-4,
     chunk_size: int = 16384,
     compute_device: torch.device | str | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mean and shrunk-covariance whitener of the train suffix tails."""
     flat_codes = clean_codes.reshape(-1, clean_codes.shape[-1])
     flat_valid = valid_mask.reshape(-1)
     stats_device = (
@@ -355,14 +326,10 @@ def compute_tail_whitening_stats(
     ) * covariance + shrinkage * average_variance * identity
     eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
     eigenvalues = eigenvalues.clamp_min(eps)
-    root = eigenvalues.sqrt()
     whitener = (
         eigenvectors * eigenvalues.rsqrt().unsqueeze(0)
     ) @ eigenvectors.transpose(0, 1)
-    dewhitener = (eigenvectors * root.unsqueeze(0)) @ eigenvectors.transpose(
-        0, 1
-    )
-    return mean.float(), whitener.float(), dewhitener.float()
+    return mean.float(), whitener.float()
 
 
 def _catalog_features(
@@ -594,6 +561,7 @@ def prefix_time_suffix_latent_flow_loss(
 __all__ = [
     "CatalogCandidateBank",
     "compute_tail_whitening_stats",
+    "count_catalog_occurrences",
     "normalize_tail",
     "prefix_time_suffix_latent_flow_loss",
     "suffix_tail_embeddings",
