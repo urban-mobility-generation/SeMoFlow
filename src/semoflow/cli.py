@@ -152,7 +152,7 @@ def config(config: Config, sets: Sets = None) -> None:
 def preprocess(
     config: Config, sets: Sets = None, log_level: LogLevel = "INFO"
 ) -> None:
-    from semoflow.preprocess.foursquare import run_foursquare_pipeline
+    from semoflow.preprocess import run_foursquare_pipeline
 
     cfg = _load(config, sets, log_level)
     with _run(cfg, "preprocess", cfg.layout.preprocessing.run_dir, log_level):
@@ -297,7 +297,7 @@ def evaluate(
     force: Force = False,
     log_level: LogLevel = "INFO",
 ) -> None:
-    from semoflow.metrics.city_evaluation import evaluate_cities
+    from semoflow.metrics.cities import evaluate_cities
 
     cfg = _load(config, sets, log_level)
     layout, cities = cfg.layout, cfg.evaluation_cities
@@ -432,7 +432,7 @@ def compose(
         catalog_temperature=catalog_temperature,
         catalog_noise_coupling=catalog_noise_coupling,
     )
-    _echo({"output": output, "rows": report.get("rows"), **report["summary"]})
+    _echo({"output": output, "rows": report["rows"], **report["summary"]})
 
 
 def main() -> None:

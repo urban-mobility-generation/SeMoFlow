@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from semoflow.config.schema import (
+from semoflow.config import (
     PlannerTrainingConfig,
 )
 from semoflow.planner.config import OccurrencePlannerConfig

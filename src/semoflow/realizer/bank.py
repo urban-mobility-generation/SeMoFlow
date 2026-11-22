@@ -14,11 +14,11 @@ import numpy as np
 import polars as pl
 import torch
 
-from semoflow.config.artifacts import RunLayout
-from semoflow.config.schema import (
+from semoflow.config import (
     RealizerConfig,
+    RunLayout,
 )
-from semoflow.preprocess.weekly_segments import SEGMENT_CITY_COLUMN
+from semoflow.preprocess import SEGMENT_CITY_COLUMN
 from semoflow.realizer.time_tokens import time_tokens_from_timestamps
 from semoflow.tokenization.token_space import sid_code_columns
 

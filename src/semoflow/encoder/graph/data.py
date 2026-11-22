@@ -203,11 +203,7 @@ def build_hetero_data(
         stays_df.height,
         places_index_df.height,
     )
-    ts_col = next(
-        (c for c in ("local_ts", "timestamp") if c in stays_df.columns), None
-    )
-    if ts_col is None:
-        raise ValueError("stays_df must have a local_ts or timestamp column")
+    ts_col = "timestamp"
 
     poi_col = _poi_key_column(stays_df, places_index_df)
     poi_lookup = build_key_index(places_index_df[poi_col], "key")

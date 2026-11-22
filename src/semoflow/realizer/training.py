@@ -13,9 +13,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, Sampler
 
-from semoflow.config.artifacts import RunLayout
-from semoflow.config.schema import (
+from semoflow.config import (
     RealizerConfig,
+    RunLayout,
 )
 from semoflow.realizer.bank import (
     bank_split_city_ids,

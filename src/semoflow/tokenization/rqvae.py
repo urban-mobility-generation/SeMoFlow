@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from semoflow.tokenization.residual_vq import ResidualVQ
 
 if TYPE_CHECKING:
-    from semoflow.config.schema import TokenizerConfig
+    from semoflow.config import TokenizerConfig
 
 __all__ = ["RQVAE", "build_tokenizer_model"]
 

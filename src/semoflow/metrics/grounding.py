@@ -7,15 +7,17 @@ from typing import Any
 import numpy as np
 import torch
 
-from semoflow.config.constants import PAD_ID
-from semoflow.metrics.divergence import jensen_shannon_divergence
-from semoflow.metrics.trajectory.distribution import token_marginal_jsd
-from semoflow.metrics.trajectory.geo import (
+from semoflow.config import PAD_ID
+from semoflow.metrics.distribution import (
+    jensen_shannon_divergence,
+    token_marginal_jsd,
+)
+from semoflow.metrics.geo import (
     radius_of_gyration_jsd,
     spatial_jsd,
     travel_distance_jsd,
 )
-from semoflow.metrics.trajectory.mobility_motifs import mobility_motif_metrics
+from semoflow.metrics.motifs import mobility_motif_metrics
 from semoflow.tokenization.decoding.grounding_index import pack_code_rows
 
 _CANDIDATE_SELECTION_POLICIES = frozenset(

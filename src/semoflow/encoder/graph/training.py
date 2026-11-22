@@ -17,8 +17,7 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
-from semoflow.config import ExperimentConfig
-from semoflow.config.schema import GraphEncoderConfig
+from semoflow.config import ExperimentConfig, GraphEncoderConfig
 from semoflow.encoder.graph.data import build_hetero_data, build_key_index
 from semoflow.encoder.graph.heterosage import HeteroSAGE
 from semoflow.encoder.graph.losses import (

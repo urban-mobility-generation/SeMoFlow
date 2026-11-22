@@ -6,8 +6,8 @@ from typing import Any
 import numpy as np
 import torch
 
-from semoflow.config.constants import PAD_ID
-from semoflow.metrics.trajectory.distribution import jsd
+from semoflow.config import PAD_ID
+from semoflow.metrics.distribution import jsd
 
 _EARTH_RADIUS_KM = 6371.0
 _DISTANCE_BINS = 50

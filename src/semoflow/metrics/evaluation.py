@@ -11,15 +11,15 @@ import polars as pl
 import torch
 import torch.nn.functional as F
 
-from semoflow.metrics.trajectory.elapsed_recurrence import (
+from semoflow.metrics.elapsed_recurrence import (
     ReturnEvents,
     elapsed_recurrence_jsd,
 )
-from semoflow.metrics.trajectory.grounding import (
+from semoflow.metrics.grounding import (
     ground_sid_codes,
     grounded_poi_metrics,
 )
-from semoflow.metrics.trajectory.temporal_spatial import (
+from semoflow.metrics.temporal_spatial import (
     events_from_place_ids,
     temporal_spatial_jsd,
 )
@@ -197,7 +197,7 @@ def plan_from_planner_samples(
 
 
 def load_candidate_prior(path: Path) -> dict[int, float]:
-    """Per-POI train visit counts written by ``build_prior``."""
+    """Per-POI train visit counts written by ``semoflow evaluate``."""
     counts = json.loads(Path(path).read_text())["counts"]
     return {int(key): float(value) for key, value in counts.items()}
 

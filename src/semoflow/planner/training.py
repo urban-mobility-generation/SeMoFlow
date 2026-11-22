@@ -17,8 +17,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from semoflow.config.artifacts import RunLayout
-from semoflow.config.schema import PlannerConfig
+from semoflow.config import PlannerConfig, RunLayout
 from semoflow.planner.artifacts import (
     OccurrencePlannerDataset,
     OccurrencePlannerSplit,

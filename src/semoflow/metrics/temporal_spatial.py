@@ -26,7 +26,7 @@ from typing import Any
 
 import numpy as np
 
-from semoflow.metrics.divergence import (
+from semoflow.metrics.distribution import (
     jensen_shannon_divergence,
 )
 from semoflow.realizer.time_tokens import (

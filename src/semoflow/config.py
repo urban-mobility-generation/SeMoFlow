@@ -1,20 +1,258 @@
-"""Every stage's settings, in the order of ``configs/foursquare.yaml``."""
+"""Experiment configuration: every stage's settings, in the order of
+``configs/foursquare.yaml``, the YAML/``--set`` parsing that builds them, and
+the fixed run-directory layout."""
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+import types
+import typing
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Final
 
 import yaml
 
-from semoflow.config.artifacts import RunLayout
-from semoflow.config.overrides import apply_override, from_dict
-from semoflow.utils.serialization import normalize_value, to_yaml_string
+from semoflow.utils.serialization import to_yaml_string, write_json
 
 logger = logging.getLogger(__name__)
+
+PAD_ID: Final[int] = 0
+
+CITY_ID: Final[dict[str, int]] = {
+    "boston": 0,
+    "chicago": 1,
+    "dallas": 2,
+    "new_york_city": 3,
+    "pittsburgh": 4,
+    "los_angeles": 7,
+    "washington_dc": 8,
+    "atlanta": 9,
+    "san_francisco": 10,
+    "milwaukee": 11,
+}
+
+
+@dataclass(frozen=True)
+class PreprocessingArtifacts:
+    run_dir: Path
+
+    @property
+    def processed_visits(self) -> Path:
+        return self.run_dir / "processed_visits.parquet"
+
+    @property
+    def places_index(self) -> Path:
+        return self.run_dir / "places_index.parquet"
+
+
+@dataclass(frozen=True)
+class TokenizerArtifacts:
+    run_dir: Path
+
+    @property
+    def augmented_processed_visits(self) -> Path:
+        return self.run_dir / "augmented_processed_visits.parquet"
+
+    @property
+    def placekey_lookup(self) -> Path:
+        return self.run_dir / "placekey_lookup.parquet"
+
+    @property
+    def tokenizer_model(self) -> Path:
+        return self.run_dir / "tokenizer_model.pt"
+
+    @property
+    def tokenizer_codebooks(self) -> Path:
+        return self.run_dir / "tokenizer_codebooks.pt"
+
+    @property
+    def grounding_index(self) -> Path:
+        return self.run_dir / "grounding_index.pkl"
+
+    @property
+    def _completion_marker(self) -> Path:
+        return self.run_dir / "completion.json"
+
+    def _outputs(self) -> tuple[Path, ...]:
+        return (
+            self.augmented_processed_visits,
+            self.placekey_lookup,
+            self.tokenizer_model,
+            self.tokenizer_codebooks,
+            self.grounding_index,
+        )
+
+    def mark_complete(self) -> None:
+        missing = [str(path) for path in self._outputs() if not path.exists()]
+        if missing:
+            raise RuntimeError(f"tokenizer outputs missing: {missing}")
+        write_json(self._completion_marker, {"status": "complete"})
+
+    def is_complete(self) -> bool:
+        return self._completion_marker.exists() and all(
+            path.exists() for path in self._outputs()
+        )
+
+
+@dataclass(frozen=True)
+class RunLayout:
+    """Where each stage of one experiment reads and writes, under ``root``."""
+
+    root: Path
+
+    @property
+    def preprocessing(self) -> PreprocessingArtifacts:
+        return PreprocessingArtifacts(self.root / "preprocessing")
+
+    @property
+    def encoder_dir(self) -> Path:
+        return self.root / "encoder"
+
+    @property
+    def text_embeddings(self) -> Path:
+        return self.encoder_dir / "text" / "text_embeddings.npy"
+
+    @property
+    def graph_dir(self) -> Path:
+        return self.encoder_dir / "graph"
+
+    @property
+    def tokenizer(self) -> TokenizerArtifacts:
+        return TokenizerArtifacts(self.root / "tokenization")
+
+    @property
+    def segments(self) -> Path:
+        return self.root / "segments.parquet"
+
+    @property
+    def planner_dataset(self) -> Path:
+        return self.root / "planner_dataset.pt"
+
+    @property
+    def planner_dir(self) -> Path:
+        return self.root / "planner"
+
+    @property
+    def bank(self) -> Path:
+        return self.root / "bank.pt"
+
+    @property
+    def realizer_dir(self) -> Path:
+        return self.root / "realizer"
+
+    @property
+    def evaluation_dir(self) -> Path:
+        return self.root / "evaluation"
+
+
+# --- YAML and --set parsing ---
+
+_NULL = {"", "null", "none", "~"}
+_TRUE = {"1", "true", "yes", "y", "on"}
+_FALSE = {"0", "false", "no", "n", "off"}
+
+
+def _non_null_types(annotation: Any) -> tuple[list[Any], bool]:
+    """Union members other than ``None``, and whether ``None`` is allowed."""
+    if typing.get_origin(annotation) in (typing.Union, types.UnionType):
+        members = typing.get_args(annotation)
+        kinds = [kind for kind in members if kind is not type(None)]
+        return kinds, len(kinds) < len(members)
+    return [annotation], False
+
+
+def _dataclass_type(annotation: Any) -> type | None:
+    kinds, _ = _non_null_types(annotation)
+    if len(kinds) == 1 and dataclasses.is_dataclass(kinds[0]):
+        return kinds[0]
+    return None
+
+
+def _coerce(text: str, annotation: Any) -> object:
+    """Parse ``text`` as a value of the field type ``annotation``.
+
+    Used for ``--set`` values and for YAML strings, which PyYAML also
+    produces for exponent floats written without a dot (``2e-4``).
+    """
+    kinds, optional = _non_null_types(annotation)
+    if optional and text.strip().lower() in _NULL:
+        return None
+    kind = kinds[0] if len(kinds) == 1 else None
+    if kind is str:
+        return text
+    if kind is Path:
+        return Path(text)
+    if kind is bool:
+        if text.strip().lower() in _TRUE | _FALSE:
+            return text.strip().lower() in _TRUE
+        raise ValueError(f"expected a boolean, got {text!r}")
+    if kind in (int, float):
+        return kind(text)
+    if typing.get_origin(kind) in (list, tuple) and not text.startswith("["):
+        text = f"[{text}]"
+    return yaml.safe_load(text)
+
+
+def apply_override(data: dict[str, Any], override: str, cls: type) -> None:
+    """Set ``field=value`` or ``section.field=value`` in raw config
+    ``data`` for dataclass ``cls``."""
+    key, sep, raw_value = override.partition("=")
+    parts = key.strip().split(".")
+    if not sep or not key.strip():
+        raise ValueError(f"Override must be field=value, got {override!r}")
+    target, owner = data, cls
+    for depth, part in enumerate(parts):
+        types_by_name = typing.get_type_hints(owner)
+        if part not in types_by_name:
+            where = ".".join(parts[:depth]) or "config"
+            raise ValueError(
+                f"Unknown field {part!r} in {where!r}. "
+                f"Valid fields: {sorted(types_by_name)}"
+            )
+        if depth == len(parts) - 1:
+            try:
+                target[part] = _coerce(raw_value.strip(), types_by_name[part])
+            except ValueError as exc:
+                raise ValueError(f"Cannot set {key.strip()}: {exc}") from exc
+            return
+        section = _dataclass_type(types_by_name[part])
+        if section is None:
+            raise ValueError(f"{'.'.join(parts[: depth + 1])!r} is a field")
+        if not isinstance(target.get(part), dict):
+            target[part] = {}
+        target, owner = target[part], section
+
+
+def from_dict[T](cls: type[T], data: dict[str, Any]) -> T:
+    """Build dataclass ``cls`` from parsed YAML, recursing into sections."""
+    if not dataclasses.is_dataclass(cls):
+        raise TypeError(f"{cls.__name__} must be a dataclass")
+    types_by_name = typing.get_type_hints(cls)
+    unknown = set(data) - set(types_by_name)
+    if unknown:
+        raise ValueError(
+            f"Unknown keys for {cls.__name__}: {sorted(unknown)}. "
+            f"Valid keys: {sorted(types_by_name)}"
+        )
+    kwargs: dict[str, Any] = {}
+    for name, value in data.items():
+        annotation = types_by_name[name]
+        section = _dataclass_type(annotation)
+        if section is not None and isinstance(value, dict):
+            value = from_dict(section, value)
+        elif isinstance(value, str):
+            try:
+                value = _coerce(value, annotation)
+            except ValueError as exc:
+                raise ValueError(f"{cls.__name__}.{name}: {exc}") from exc
+        kwargs[name] = value
+    return cls(**kwargs)
+
+
+# --- Settings ---
 
 
 def _require(condition: bool, message: str) -> None:
@@ -373,7 +611,7 @@ class ExperimentConfig:
         return list(self.evaluation.cities or self.data.cities)
 
     def to_yaml(self) -> str:
-        return to_yaml_string(cast(dict[str, Any], normalize_value(self)))
+        return to_yaml_string(self)
 
     def save_yaml(self, path: str | Path) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -399,6 +637,8 @@ def load_config(
 
 
 __all__ = [
+    "CITY_ID",
+    "PAD_ID",
     "CompositionConfig",
     "DataConfig",
     "EncoderConfig",
@@ -409,9 +649,12 @@ __all__ = [
     "PlannerConfig",
     "PlannerDataConfig",
     "PlannerTrainingConfig",
+    "PreprocessingArtifacts",
     "RealizerConfig",
+    "RunLayout",
     "SamplingConfig",
     "TextEncoderConfig",
+    "TokenizerArtifacts",
     "TokenizerConfig",
     "load_config",
 ]
