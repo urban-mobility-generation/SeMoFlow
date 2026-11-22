@@ -1,4 +1,4 @@
-"""Per-city sampling and composition behind ``semoflow-eval evaluate``."""
+"""Per-city sampling and composition behind ``semoflow evaluate``."""
 
 from __future__ import annotations
 

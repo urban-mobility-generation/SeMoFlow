@@ -38,7 +38,7 @@ class CompositionOptions:
 
 @dataclass(frozen=True, slots=True)
 class EvaluationConfig:
-    """Per-city sampling and composition for ``semoflow-eval evaluate``.
+    """Per-city sampling and composition for ``semoflow evaluate``.
 
     Each city samples one plan per week in ``reference_split``. ``cities``
     defaults to every city in ``data.cities``.

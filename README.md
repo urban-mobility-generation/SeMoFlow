@@ -67,7 +67,7 @@ data/foursquare_global_2015/
 ```
 
 ```bash
-uv run semoflow-preprocess --config configs/foursquare.yaml
+uv run semoflow preprocess --config configs/foursquare.yaml
 ```
 
 This prepares **Los Angeles, Washington DC, Atlanta, San Francisco, and
@@ -84,14 +84,14 @@ root, passing the same file to each:
 export CUDA_VISIBLE_DEVICES=0
 C=configs/foursquare.yaml
 
-uv run semoflow-train encoder --config $C
-uv run semoflow-train tokenizer --config $C
+uv run semoflow encoder --config $C
+uv run semoflow tokenizer --config $C
 
-uv run semoflow-artifacts planner --config $C
-uv run semoflow-train planner --config $C
+uv run semoflow planner-data --config $C
+uv run semoflow planner --config $C
 
-uv run semoflow-artifacts realizer --config $C
-uv run semoflow-train realizer --config $C
+uv run semoflow realizer-data --config $C
+uv run semoflow realizer --config $C
 ```
 
 | Stage | Output under `run_dir` (default `outputs/`) |
@@ -105,8 +105,9 @@ uv run semoflow-train realizer --config $C
 
 Override any setting with `--set`, for example `--set run_dir=/data/run1` to
 place a whole experiment elsewhere or `--set planner.training.epochs=20`.
-Each stage writes its resolved config to `config_resolved.yaml` in its output
-directory. Every stage defaults to `cuda:0`; select the physical GPU with
+`semoflow config --config $C` prints the config with your overrides applied,
+and each stage saves it as `config_resolved.yaml` in its output directory.
+`semoflow --help` lists every stage. Every stage defaults to `cuda:0`; select the physical GPU with
 `CUDA_VISIBLE_DEVICES`. The text encoder reuses
 `encoder/text/text_embeddings.npy` when it already covers the POI catalog.
 
@@ -114,8 +115,8 @@ For multi-GPU training, give the planner a device list, which starts one DDP
 rank per GPU, and launch the realizer under `torchrun`:
 
 ```bash
-uv run semoflow-train planner --config $C --set 'planner.training.device=[0,1]'
-uv run torchrun --nproc_per_node=2 -m semoflow.cli.train realizer --config $C
+uv run semoflow planner --config $C --set 'planner.training.device=[0,1]'
+uv run torchrun --nproc_per_node=2 -m semoflow.cli realizer --config $C
 ```
 
 ## Sampling
@@ -124,7 +125,7 @@ uv run torchrun --nproc_per_node=2 -m semoflow.cli.train realizer --config $C
 are sampled; the test set supplies the number of trajectories to generate.
 
 ```bash
-uv run semoflow-eval evaluate --config configs/foursquare.yaml
+uv run semoflow evaluate --config configs/foursquare.yaml
 ```
 
 Results are saved under `outputs/evaluation/<city>/`:
@@ -156,7 +157,7 @@ plans. A plan without a clock reports them as unavailable.
 **Catalog noise coupling.** By default each visit draws its POI
 independently from the realizer's catalog posterior. Setting
 `composition.catalog_noise_coupling: trajectory_prefix` (or
-`--catalog-noise-coupling trajectory_prefix` on `semoflow-eval compose`)
+`--catalog-noise-coupling trajectory_prefix` on `semoflow compose`)
 shares the sampling noise among a trajectory's visits with the same planned
 prefix. Each visit keeps its own probabilities, but repeated visits to an area
 tend to return to the same place. It applies only to the calibrated catalog
@@ -168,7 +169,7 @@ Evaluation covers every city in `data.cities`; to run one city, append
 ### Sample a released planner
 
 ```bash
-uv run semoflow-eval sample-plans \
+uv run semoflow sample-plans \
   --checkpoint veraset_checkpoints/chicago/planner.pt \
   --output outputs/samples/chicago_plans.pt --num-samples 1000
 ```

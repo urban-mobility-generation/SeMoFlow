@@ -52,7 +52,7 @@ class OccurrencePlannerTrainingOptions:
 
 @dataclass(frozen=True, slots=True)
 class OccurrencePlannerDataOptions:
-    """How ``semoflow-artifacts planner`` derives the planner dataset from
+    """How ``semoflow planner-data`` derives the planner dataset from
     the tokenizer's visits; the codebook size comes from its codebooks."""
 
     min_active_days: int = 5

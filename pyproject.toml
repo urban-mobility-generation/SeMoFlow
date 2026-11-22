@@ -24,10 +24,7 @@ dependencies = [
 ]
 
 [project.scripts]
-semoflow-train = "semoflow.cli.train:main"
-semoflow-eval = "semoflow.cli.eval:main"
-semoflow-preprocess = "semoflow.cli.preprocess:main"
-semoflow-artifacts = "semoflow.cli.artifacts:main"
+semoflow = "semoflow.cli:main"
 
 [dependency-groups]
 lint = [
