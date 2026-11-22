@@ -34,11 +34,13 @@ from semoflow.realizer.objective import (
 from semoflow.realizer.time_tokens import N_TIME_TOKENS
 from semoflow.tokenization.decoding.codebooks import load_codebooks
 from semoflow.tokenization.token_space import sid_code_columns, sid_code_names
-from semoflow.training.utils.distributed import unwrap_ddp
-from semoflow.training.utils.early_stopping import EarlyStopper
-from semoflow.training.utils.lr_schedule import build_lr_scheduler
-from semoflow.training.utils.runtime import set_seed_all
 from semoflow.utils.serialization import write_json
+from semoflow.utils.training import (
+    EarlyStopper,
+    build_lr_scheduler,
+    set_seed_all,
+    unwrap_ddp,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -397,7 +399,7 @@ def train_prefix_time_suffix_latent_flow_realizer(
                 "learning_rate": learning_rate,
             }
         )
-        decision = stopper.step(val_loss, epoch=epoch)
+        improved = stopper.step(val_loss, epoch=epoch)
         if is_main:
             logger.info(
                 "latent suffix-flow epoch=%d train_loss=%.6f val_loss=%.6f "
@@ -416,9 +418,9 @@ def train_prefix_time_suffix_latent_flow_realizer(
                 **checkpoint_extra,
             }
             torch.save(checkpoint, output_dir / "last.pt")
-            if decision.improved:
+            if improved:
                 torch.save(checkpoint, output_dir / "best.pt")
-        if decision.should_stop:
+        if stopper.should_stop:
             stopped_early = True
             if is_main:
                 logger.info(

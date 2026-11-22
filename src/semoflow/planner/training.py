@@ -32,16 +32,20 @@ from semoflow.planner.data import (
 )
 from semoflow.planner.loss import occurrence_planner_loss
 from semoflow.planner.model import OccurrenceARPlanner
-from semoflow.training.utils.distributed import ddp_worker, find_free_port
-from semoflow.training.utils.early_stopping import EarlyStopper
-from semoflow.training.utils.lr_schedule import build_lr_scheduler
-from semoflow.training.utils.runtime import parse_device_spec, set_seed_all
 from semoflow.utils.log import (
     get_configured_log_file,
     log_epoch_summary,
     log_training_step,
 )
 from semoflow.utils.serialization import write_json
+from semoflow.utils.training import (
+    EarlyStopper,
+    build_lr_scheduler,
+    ddp_worker,
+    find_free_port,
+    parse_device_spec,
+    set_seed_all,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -423,9 +427,9 @@ def train_occurrence_planner(
         validation = _evaluate(model, val_loader, ctx)
         _synchronize(device)
         validation_elapsed = time.perf_counter() - validation_started
-        decision = stopper.step(validation["nll"], epoch=epoch)
+        improved = stopper.step(validation["nll"], epoch=epoch)
         if ctx.primary:
-            if decision.improved:
+            if improved:
                 save(
                     best_path,
                     model_state=model.state_dict(),
@@ -470,9 +474,9 @@ def train_occurrence_planner(
                 validation["length_nll"],
                 validation["gap_nll"],
                 validation["prefix_nll"],
-                "  (best)" if decision.improved else "",
+                "  (best)" if improved else "",
             )
-        if decision.should_stop:
+        if stopper.should_stop:
             if ctx.primary:
                 logger.info(
                     "early stopping after epoch %d: best epoch %d, "

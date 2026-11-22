@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 def run_encoder_pipeline(cfg: ExperimentConfig) -> None:
     """Embed POI text, then train the graph encoder on those features."""
+    from semoflow.encoder.graph.training import train_heterosage
     from semoflow.encoder.text.sentence_t5 import build_text_embeddings
-    from semoflow.training.graph_encoder import train_heterosage
 
     started = time.perf_counter()
     logger.info("running text encoder  model=%s", cfg.encoder.text.model)

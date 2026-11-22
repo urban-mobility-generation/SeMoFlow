@@ -179,7 +179,7 @@ def tokenizer(
     force: Force = False,
     log_level: LogLevel = "INFO",
 ) -> None:
-    from semoflow.training.tokenizer import run_semantic_id_tokenizer
+    from semoflow.tokenization.training import run_semantic_id_tokenizer
 
     cfg = _load(config, sets, log_level)
     artifacts = cfg.layout.tokenizer
