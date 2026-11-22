@@ -18,7 +18,7 @@ from semoflow.metrics.geo import (
     travel_distance_jsd,
 )
 from semoflow.metrics.motifs import mobility_motif_metrics
-from semoflow.tokenization.decoding.grounding_index import pack_code_rows
+from semoflow.tokenization.sids import pack_code_rows
 
 _CANDIDATE_SELECTION_POLICIES = frozenset(
     {"first", "train_prior_argmax", "train_prior_sample"}
@@ -38,10 +38,7 @@ def _vectorized_lookup(
     payload_indices = np.full(code_rows.shape[0], -1, dtype=np.int64)
     row_indices = np.flatnonzero(~np.any(code_rows < 0, axis=1))
     if row_indices.size:
-        lookup_rows = code_rows[row_indices]
-        if grounding_index.order_agnostic:
-            lookup_rows = np.sort(lookup_rows, axis=1)
-        packed = pack_code_rows(lookup_rows)
+        packed = pack_code_rows(code_rows[row_indices])
         positions = np.searchsorted(table_keys, packed, side="left")
         safe_positions = np.minimum(positions, table_keys.size - 1)
         found = (positions < table_keys.size) & (
@@ -82,7 +79,7 @@ def _preferred_payloads(
     The preferred POI must be a candidate of the position's SID.
     """
     by_placekey: dict[int, tuple[tuple[int, ...], dict[str, Any]]] = {}
-    for key, payloads in grounding_index.iter_key_payload_groups():
+    for key, payloads in grounding_index.groups.items():
         for payload in payloads:
             placekey_id = payload.get("placekey_id")
             if placekey_id is not None:

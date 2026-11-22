@@ -35,10 +35,10 @@ from semoflow.realizer.sampling import (
     PrefixTailCatalog,
     sample_prefix_time_suffix_latent_flow,
 )
-from semoflow.tokenization.decoding.grounding_index import (
+from semoflow.tokenization.sids import (
     SemanticIDGroundingIndex,
+    sid_code_columns,
 )
-from semoflow.tokenization.token_space import sid_code_columns
 from semoflow.utils.serialization import normalize_value, write_json
 
 LOGGER = logging.getLogger(__name__)

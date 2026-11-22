@@ -19,8 +19,11 @@ from semoflow.realizer.objective import (
     normalize_tail,
     suffix_tail_level_embeddings,
 )
-from semoflow.tokenization.decoding.codebooks import codes_to_embeddings
-from semoflow.tokenization.token_space import find_sorted, packed_code_keys
+from semoflow.tokenization.sids import (
+    codes_to_embeddings,
+    find_sorted,
+    packed_code_keys,
+)
 
 _CATALOG_DECODE_QUERY_CHUNK_SIZE = 4096
 _CATALOG_DECODE_MAX_CANDIDATE_PAIRS = 65536

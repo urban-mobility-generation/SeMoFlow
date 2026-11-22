@@ -8,7 +8,7 @@ import numpy as np
 import polars as pl
 import torch
 
-from semoflow.encoder.artifacts import load_poi_embedding_artifact
+from semoflow.encoder.embeddings import load_poi_embeddings
 
 logger = logging.getLogger(__name__)
 
@@ -35,15 +35,7 @@ def frame_to_numpy(frame: pl.DataFrame, columns: list[str]) -> np.ndarray:
 
 
 def _identity_frame(places_index: pl.DataFrame) -> pl.DataFrame:
-    if "placekey_id" not in places_index.columns:
-        raise ValueError("places index must contain placekey_id")
-    return places_index.select(
-        [
-            pl.col(c).cast(pl.Utf8) if c == "placekey" else pl.col(c)
-            for c in _ID_COLUMNS
-            if c in places_index.columns
-        ]
-    )
+    return places_index.select(_ID_COLUMNS)
 
 
 def _with_block(
@@ -57,33 +49,11 @@ def _with_block(
     )
 
 
-def text_feature_frame(
-    places_index: pl.DataFrame, embeddings_path: Path
+def _embedding_frame(
+    places_index: pl.DataFrame, path: Path, prefix: str
 ) -> pl.DataFrame:
-    embeddings = (
-        load_poi_embedding_artifact(embeddings_path, kind="text")
-        .align_to(places_index)
-        .numpy()
-    )
-    return _with_block(_identity_frame(places_index), TEXT_PREFIX, embeddings)
-
-
-def graph_feature_frame(
-    places_index: pl.DataFrame, artifact_dir: Path
-) -> pl.DataFrame:
-    emb_path = artifact_dir / "poi_graph_emb.pt"
-    index_path = artifact_dir / "places_index.parquet"
-    for path in (emb_path, index_path):
-        if not path.exists():
-            raise FileNotFoundError(f"GraphSAGE artifact not found: {path}")
-    embeddings = (
-        load_poi_embedding_artifact(
-            emb_path, index_path=index_path, kind="graph"
-        )
-        .align_to(places_index)
-        .numpy()
-    )
-    return _with_block(_identity_frame(places_index), GRAPH_PREFIX, embeddings)
+    embeddings = load_poi_embeddings(path, places_index).numpy()
+    return _with_block(_identity_frame(places_index), prefix, embeddings)
 
 
 def _pca(
@@ -178,19 +148,19 @@ def build_features(
     *,
     places_index: pl.DataFrame,
     text_embeddings_path: Path,
-    graph_dir: Path,
+    graph_embeddings_path: Path,
     pca_text_dim: int,
     pca_graph_dim: int,
     geo_relative_dim: int,
 ) -> tuple[pl.DataFrame, dict[str, Any]]:
     frame, text_pca = _pca(
-        text_feature_frame(places_index, text_embeddings_path),
+        _embedding_frame(places_index, text_embeddings_path, TEXT_PREFIX),
         TEXT_PREFIX,
         PCA_TEXT_PREFIX,
         pca_text_dim,
     )
     graph, graph_pca = _pca(
-        graph_feature_frame(places_index, graph_dir),
+        _embedding_frame(places_index, graph_embeddings_path, GRAPH_PREFIX),
         GRAPH_PREFIX,
         PCA_GRAPH_PREFIX,
         pca_graph_dim,
@@ -236,7 +206,5 @@ __all__ = [
     "city_relative_position_frame",
     "feature_columns",
     "frame_to_numpy",
-    "graph_feature_frame",
     "scale_feature_blocks",
-    "text_feature_frame",
 ]

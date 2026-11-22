@@ -17,8 +17,11 @@ from semoflow.realizer.model import (
     LatentSuffixConditioning,
     PrefixTimeSuffixLatentFlowRealizer,
 )
-from semoflow.tokenization.decoding.codebooks import codes_to_embeddings
-from semoflow.tokenization.token_space import find_sorted, packed_code_keys
+from semoflow.tokenization.sids import (
+    codes_to_embeddings,
+    find_sorted,
+    packed_code_keys,
+)
 
 
 def count_catalog_occurrences(

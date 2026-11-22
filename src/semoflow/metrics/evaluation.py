@@ -28,7 +28,7 @@ from semoflow.realizer.time_tokens import (
     N_PART_OF_DAY_BINS,
     PART_OF_DAY_START_MINUTES,
 )
-from semoflow.tokenization.decoding.grounding_index import (
+from semoflow.tokenization.sids import (
     SemanticIDGroundingIndex,
 )
 

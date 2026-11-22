@@ -1,4 +1,5 @@
-"""Train the HeteroSAGE POI graph encoder and export its POI embeddings."""
+"""The encoder stage: embed POI text, then train the HeteroSAGE POI graph
+encoder on those features and export its POI embeddings."""
 
 from __future__ import annotations
 
@@ -18,13 +19,14 @@ from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
 from semoflow.config import ExperimentConfig, GraphEncoderConfig
-from semoflow.encoder.graph.data import build_hetero_data, build_key_index
-from semoflow.encoder.graph.heterosage import HeteroSAGE
-from semoflow.encoder.graph.losses import (
+from semoflow.encoder.embeddings import write_poi_embeddings
+from semoflow.encoder.graph_data import build_hetero_data, get_train_loader
+from semoflow.encoder.graph_model import (
+    HeteroSAGE,
     contrastive_link_loss,
     variance_covariance_penalty,
 )
-from semoflow.encoder.graph.sampler import get_train_loader
+from semoflow.encoder.text import build_text_embeddings
 from semoflow.utils.log import get_configured_log_file, log_ddp_summary
 from semoflow.utils.serialization import write_json
 from semoflow.utils.training import (
@@ -115,7 +117,6 @@ def _build_graph_data(
         stays_df=stays,
         places_index_df=pl.read_parquet(cfg.layout.preprocessing.places_index),
         text_embeddings_path=cfg.layout.text_embeddings,
-        hidden_dim=graph_cfg.hidden_dim,
         train_fraction=graph_cfg.hash_train_fraction,
         seed=graph_cfg.seed,
     )
@@ -153,9 +154,9 @@ def _id_embedding_counts(
 
 
 def _export_poi_embeddings(
-    cfg: ExperimentConfig, model: torch.nn.Module, data: Any, out_dir: Path
+    cfg: ExperimentConfig, model: torch.nn.Module, data: Any
 ) -> torch.Tensor:
-    """Write CPU POI embeddings and the places index aligned to their rows."""
+    """Write the CPU POI embeddings with their placekey_id index."""
     logger.info("Extracting final POI embeddings...")
     model.eval()
     model.to("cpu")
@@ -170,18 +171,10 @@ def _export_poi_embeddings(
     )
     with torch.no_grad():
         embeddings = model(data.x_dict, data.edge_index_dict, ids)["poi"]
-    torch.save(embeddings, out_dir / "poi_graph_emb.pt")
+    # Graph POI nodes are numbered in sorted placekey_id order.
     places = pl.read_parquet(cfg.layout.preprocessing.places_index)
-    (
-        build_key_index(places["placekey_id"], "placekey_id")
-        .rename({"idx": "embedding_row"})
-        .join(
-            places.select("placekey_id", "placekey"),
-            on="placekey_id",
-            how="left",
-            maintain_order="left",
-        )
-        .write_parquet(out_dir / "places_index.parquet")
+    write_poi_embeddings(
+        cfg.layout.graph_embeddings, embeddings, places["placekey_id"].sort()
     )
     return embeddings
 
@@ -331,7 +324,7 @@ def _train(
         raw_model.load_state_dict(
             torch.load(best_path, map_location="cpu")["model_state_dict"]
         )
-    embeddings = _export_poi_embeddings(cfg, raw_model, data, out_dir)
+    embeddings = _export_poi_embeddings(cfg, raw_model, data)
     write_json(
         out_dir / "metrics.json",
         {
@@ -403,4 +396,25 @@ def train_heterosage(cfg: ExperimentConfig) -> None:
         os.unlink(graph_data_path)
 
 
-__all__ = ["train_heterosage"]
+def run_encoder_pipeline(cfg: ExperimentConfig) -> None:
+    """Embed POI text, then train the graph encoder on those features."""
+    started = time.perf_counter()
+    logger.info("running text encoder  model=%s", cfg.encoder.text.model)
+    build_text_embeddings(
+        pl.read_parquet(cfg.layout.preprocessing.places_index),
+        cfg.encoder.text,
+        path=cfg.layout.text_embeddings,
+    )
+    logger.info(
+        "text encoder done  path=%s  elapsed=%.1fs",
+        cfg.layout.text_embeddings,
+        time.perf_counter() - started,
+    )
+    started = time.perf_counter()
+    train_heterosage(cfg)
+    logger.info(
+        "graph encoder done  elapsed=%.1fs", time.perf_counter() - started
+    )
+
+
+__all__ = ["run_encoder_pipeline", "train_heterosage"]

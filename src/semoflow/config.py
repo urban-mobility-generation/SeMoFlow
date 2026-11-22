@@ -120,6 +120,10 @@ class RunLayout:
         return self.encoder_dir / "graph"
 
     @property
+    def graph_embeddings(self) -> Path:
+        return self.graph_dir / "poi_graph_emb.pt"
+
+    @property
     def tokenizer(self) -> TokenizerArtifacts:
         return TokenizerArtifacts(self.root / "tokenization")
 

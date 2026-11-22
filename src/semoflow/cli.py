@@ -163,7 +163,7 @@ def preprocess(
 def encoder(
     config: Config, sets: Sets = None, log_level: LogLevel = "INFO"
 ) -> None:
-    from semoflow.encoder.pipeline import run_encoder_pipeline
+    from semoflow.encoder.training import run_encoder_pipeline
 
     cfg = _load(config, sets, log_level)
     with _run(cfg, "encoder", cfg.layout.encoder_dir, log_level):

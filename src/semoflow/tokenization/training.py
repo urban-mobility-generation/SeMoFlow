@@ -11,9 +11,6 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from semoflow.config import ExperimentConfig
-from semoflow.tokenization.decoding.grounding_index import (
-    SemanticIDGroundingIndex,
-)
 from semoflow.tokenization.features import (
     build_features,
     feature_columns,
@@ -21,7 +18,10 @@ from semoflow.tokenization.features import (
     scale_feature_blocks,
 )
 from semoflow.tokenization.rqvae import RQVAE, build_tokenizer_model
-from semoflow.tokenization.token_space import sid_code_names
+from semoflow.tokenization.sids import (
+    SemanticIDGroundingIndex,
+    sid_code_names,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +123,7 @@ def run_semantic_id_tokenizer(cfg: ExperimentConfig) -> Path:
     features, pca_state = build_features(
         places_index=places,
         text_embeddings_path=layout.text_embeddings,
-        graph_dir=layout.graph_dir,
+        graph_embeddings_path=layout.graph_embeddings,
         pca_text_dim=tcfg.pca_text_dim,
         pca_graph_dim=tcfg.pca_graph_dim,
         geo_relative_dim=tcfg.geo_relative_dim,
@@ -154,8 +154,6 @@ def run_semantic_id_tokenizer(cfg: ExperimentConfig) -> Path:
     lookup.write_parquet(arts.placekey_lookup)
     SemanticIDGroundingIndex.from_frame(
         places.select(_GROUNDING_COLUMNS).hstack(code_frame),
-        key_columns=code_cols,
-        id_column="placekey_id",
         payload_columns=_GROUNDING_COLUMNS,
     ).save(arts.grounding_index)
 

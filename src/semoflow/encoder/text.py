@@ -10,9 +10,9 @@ import polars as pl
 import torch
 from sentence_transformers import SentenceTransformer
 
-from semoflow.encoder.artifacts import (
-    load_poi_embedding_artifact,
-    write_poi_embedding_artifact,
+from semoflow.encoder.embeddings import (
+    load_poi_embeddings,
+    write_poi_embeddings,
 )
 
 if TYPE_CHECKING:
@@ -135,10 +135,7 @@ def build_text_embeddings(
 ) -> np.ndarray:
     if path.exists():
         try:
-            cached = load_poi_embedding_artifact(path, kind="text").align_to(
-                places
-            )
-            return cached.numpy().astype(np.float32, copy=False)
+            return load_poi_embeddings(path, places).numpy()
         except (FileNotFoundError, ValueError):
             logger.info(
                 "text embedding cache identity mismatch; rebuilding path=%s",
@@ -157,11 +154,10 @@ def build_text_embeddings(
         batch_size=int(config.batch_size),
         precision=config.precision,
     )
-    write_poi_embedding_artifact(
+    write_poi_embeddings(
         path,
         torch.from_numpy(embeddings.astype(np.float32, copy=False)),
-        places,
-        kind="text",
+        places["placekey_id"],
         metadata={
             "model": config.model,
             "precision": config.precision,

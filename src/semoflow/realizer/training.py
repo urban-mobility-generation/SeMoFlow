@@ -32,8 +32,11 @@ from semoflow.realizer.objective import (
     prefix_time_suffix_latent_flow_loss,
 )
 from semoflow.realizer.time_tokens import N_TIME_TOKENS
-from semoflow.tokenization.decoding.codebooks import load_codebooks
-from semoflow.tokenization.token_space import sid_code_columns, sid_code_names
+from semoflow.tokenization.sids import (
+    load_codebooks,
+    sid_code_columns,
+    sid_code_names,
+)
 from semoflow.utils.serialization import write_json
 from semoflow.utils.training import (
     EarlyStopper,

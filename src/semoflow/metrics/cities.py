@@ -21,7 +21,7 @@ from semoflow.realizer.evaluation import (
     evaluate_planner_realizer,
     realizer_max_events,
 )
-from semoflow.tokenization.decoding.grounding_index import (
+from semoflow.tokenization.sids import (
     SemanticIDGroundingIndex,
 )
 from semoflow.utils.serialization import write_json
@@ -167,12 +167,9 @@ def _extract_city_inputs(
     joint = SemanticIDGroundingIndex.load(grounding_index)
     city_grounding = SemanticIDGroundingIndex.from_frame(
         joint.to_frame().filter(
-            pl.col(joint.id_column).is_in(city_lookup["placekey_id"].implode())
+            pl.col("placekey_id").is_in(city_lookup["placekey_id"].implode())
         ),
-        key_columns=joint.key_columns,
-        id_column=joint.id_column,
         payload_columns=joint.payload_columns,
-        order_agnostic=joint.order_agnostic,
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
