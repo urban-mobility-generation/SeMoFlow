@@ -104,84 +104,6 @@ def _as_graph_batch(batch: Any) -> GraphBatch:
     return GraphBatch(batch)
 
 
-def _resolve_resume_checkpoint(
-    graph_cfg: Any,
-) -> Path | None:
-    raw = graph_cfg.resume_checkpoint
-    if not raw:
-        return None
-    p = Path(raw)
-    if not p.exists():
-        return None
-    return p
-
-
-def apply_graph_warm_start(
-    raw_model: Any, source_path: Path, *, device: Any
-) -> dict[str, Any]:
-    raw = torch.load(source_path, map_location=device, weights_only=False)
-    source_state = (
-        raw["model_state_dict"]
-        if isinstance(raw, dict) and "model_state_dict" in raw
-        else raw
-    )
-    if not isinstance(source_state, dict):
-        raise ValueError(
-            f"graph warm-start checkpoint is not a state dict: {source_path}"
-        )
-    target_state = raw_model.state_dict()
-    copied: list[str] = []
-    reinitialized: list[str] = []
-    for name, target_tensor in target_state.items():
-        source_tensor = source_state.get(name)
-        if (
-            source_tensor is not None
-            and hasattr(source_tensor, "shape")
-            and source_tensor.shape == target_tensor.shape
-        ):
-            target_state[name] = source_tensor.to(target_tensor.dtype)
-            copied.append(name)
-        else:
-            reinitialized.append(name)
-    if not copied:
-        raise ValueError(
-            "graph warm start copied no tensors; the source checkpoint "
-            f"architecture is incompatible: {source_path}"
-        )
-    raw_model.load_state_dict(target_state)
-    return {
-        "checkpoint": str(source_path),
-        "copied_tensors": len(copied),
-        "reinitialized_tensors": sorted(reinitialized),
-        "source_only_tensors": sorted(set(source_state) - set(target_state)),
-    }
-
-
-def _load_cbg_attributes(
-    data_root: str | None,
-) -> pl.DataFrame | None:
-    if not data_root:
-        return None
-    root = Path(data_root)
-    if not root.is_dir():
-        return None
-    parts = []
-    for city_dir in sorted(root.iterdir()):
-        cbg_path = city_dir / "cbg_attributes.parquet"
-        if cbg_path.exists():
-            parts.append(pl.read_parquet(cbg_path))
-    if not parts:
-        logger.info("No cbg_attributes.parquet found under %s", root)
-        return None
-    df = pl.concat(parts, how="diagonal_relaxed")
-    logger.info(
-        "Loaded CBG attributes: %d rows from %d cities",
-        df.height,
-        len(parts),
-    )
-    return df
-
-
 class GraphEncoderTrainer:
     def __init__(
         self,
@@ -355,11 +277,11 @@ def _wrap_graph_model_for_ddp(
 def _build_graph_data(
     cfg: ExperimentConfig,
 ) -> tuple[Any, torch.Tensor | None]:
-    graph_cfg = cfg.encoder_pipeline.graph
+    graph_cfg = cfg.encoder.graph
 
-    processed_visits_path = cfg.tokenizer_config.processed_visits_output_path()
-    places_index_path = cfg.tokenizer_config.places_index_output_path()
-    text_emb_path = cfg.encoder_pipeline.text.out_path
+    processed_visits_path = cfg.layout.preprocessing.processed_visits
+    places_index_path = cfg.layout.preprocessing.places_index
+    text_emb_path = cfg.layout.text_embeddings
 
     if not processed_visits_path.exists():
         raise FileNotFoundError(
@@ -386,23 +308,14 @@ def _build_graph_data(
             f"{n_all:,}",
         )
     places_index_df = load_places_index(places_index_path)
-    cbg_df = _load_cbg_attributes(cfg.data.data_root)
 
     data, val_edges = build_hetero_data(
         stays_df=stays_df,
         places_index_df=places_index_df,
         text_embeddings_path=text_emb_path,
-        cbg_attributes_df=cbg_df,
         hidden_dim=graph_cfg.hidden_dim,
         train_fraction=graph_cfg.hash_train_fraction,
         seed=graph_cfg.seed,
-        covisit_edges=graph_cfg.covisit_edges,
-        covisit_tc_hours=graph_cfg.covisit_tc_hours,
-        covisit_ts_intermediate=graph_cfg.covisit_ts_intermediate,
-        covisit_min_shift=graph_cfg.covisit_min_shift,
-        covisit_min_covisits=graph_cfg.dependency_min_covisits,
-        covisit_top_k=graph_cfg.covisit_top_k,
-        include_user_nodes=graph_cfg.include_user_nodes,
     )
     _write_graph_data_cache(cfg, cache_dir, data, val_edges)
 
@@ -412,7 +325,7 @@ def _build_graph_data(
     )
     from semoflow.utils.splits import GLOBAL_SPLIT_SEED
 
-    out_dir = Path(graph_cfg.out_dir)
+    out_dir = cfg.layout.graph_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     write_closure(
         closure_from_stays(
@@ -456,41 +369,8 @@ def _id_embedding_counts(graph_cfg: Any, data: Any) -> dict[str, int] | None:
     return id_counts
 
 
-def _warm_start_graph_model(
-    graph_cfg: Any,
-    raw_model: torch.nn.Module,
-    *,
-    device: torch.device,
-    is_main: bool,
-) -> None:
-    if not graph_cfg.warm_start_checkpoint:
-        return
-    warm_start_path = Path(graph_cfg.warm_start_checkpoint)
-    if not warm_start_path.exists():
-        raise ValueError(
-            f"graph warm-start checkpoint not found: {warm_start_path}"
-        )
-    if _resolve_resume_checkpoint(graph_cfg) is not None:
-        raise ValueError(
-            "warm_start_checkpoint and an existing resume_checkpoint are "
-            "mutually exclusive; a warm start is initialization, not a "
-            "resume"
-        )
-    record = apply_graph_warm_start(raw_model, warm_start_path, device=device)
-    if is_main:
-        logger.info(
-            "Graph warm start from %s — copied %d tensors, "
-            "reinitialized %d (%s)",
-            warm_start_path,
-            record["copied_tensors"],
-            len(record["reinitialized_tensors"]),
-            ", ".join(record["reinitialized_tensors"]),
-        )
-        write_json(Path(graph_cfg.out_dir) / "warm_start.json", record)
-
-
 def _resume_graph_training(
-    graph_cfg: Any,
+    best_path: Path,
     raw_model: torch.nn.Module,
     optimizer: optim.Optimizer,
     *,
@@ -498,11 +378,10 @@ def _resume_graph_training(
     is_main: bool,
 ) -> tuple[int, float]:
     """Restore an existing checkpoint; return (start epoch, best val loss)."""
-    resume_path = _resolve_resume_checkpoint(graph_cfg)
-    if resume_path is None:
+    if not best_path.exists():
         return 0, float("inf")
     start_epoch, best_val_loss = 0, float("inf")
-    ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+    ckpt = torch.load(best_path, map_location=device, weights_only=False)
     raw_model.load_state_dict(_model_state(ckpt))
     if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
         if "optimizer_state_dict" in ckpt:
@@ -512,7 +391,7 @@ def _resume_graph_training(
     if is_main:
         logger.info(
             "Resumed from %s — starting at epoch %d, best_val=%.4f",
-            resume_path,
+            best_path,
             start_epoch + 1,
             best_val_loss,
         )
@@ -554,9 +433,7 @@ def _export_poi_embeddings(
     emb_path = out_dir / "poi_graph_emb.pt"
     torch.save(poi_graph_emb, emb_path)
 
-    places_index_df = load_places_index(
-        cfg.tokenizer_config.places_index_output_path()
-    )
+    places_index_df = load_places_index(cfg.layout.preprocessing.places_index)
     identity_cols = [
         c for c in ("placekey_id", "placekey") if c in places_index_df.columns
     ]
@@ -591,8 +468,8 @@ def _train_graph_single(
     world_size: int = 1,
 ) -> dict[str, Any]:
     is_main = rank == 0
-    graph_cfg = cfg.encoder_pipeline.graph
-    out_dir = Path(graph_cfg.out_dir)
+    graph_cfg = cfg.encoder.graph
+    out_dir = cfg.layout.graph_dir
     checkpoints_dir = out_dir / "checkpoints"
     best_path = checkpoints_dir / "best.pt"
     if is_main:
@@ -613,7 +490,6 @@ def _train_graph_single(
             seed=seed,
             rank=rank,
             world_size=world_size,
-            city_balanced=graph_cfg.city_balanced_supervision,
         )
         for edges in (None, val_edges)
     )
@@ -648,11 +524,8 @@ def _train_graph_single(
         max_negatives=graph_cfg.max_negatives,
         max_queries=graph_cfg.max_queries,
     )
-    _warm_start_graph_model(
-        graph_cfg, raw_model, device=device, is_main=is_main
-    )
     start_epoch, best_val_loss = _resume_graph_training(
-        graph_cfg, raw_model, optimizer, device=device, is_main=is_main
+        best_path, raw_model, optimizer, device=device, is_main=is_main
     )
 
     epochs = graph_cfg.epochs
@@ -812,7 +685,7 @@ def _train_graph_worker(
 def train_heterosage(
     cfg: ExperimentConfig,
 ) -> dict[str, Any]:
-    graph_cfg = cfg.encoder_pipeline.graph
+    graph_cfg = cfg.encoder.graph
     set_seed_all(graph_cfg.seed)
 
     primary_device, device_ids = parse_device_spec(graph_cfg.device)

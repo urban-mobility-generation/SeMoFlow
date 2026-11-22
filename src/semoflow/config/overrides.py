@@ -55,13 +55,12 @@ def _coerce(text: str, annotation: Any) -> object:
 
 
 def apply_override(data: dict[str, Any], override: str, cls: type) -> None:
-    """Set ``section.field=value`` in raw config ``data`` for dataclass ``cls``."""
+    """Set ``field=value`` or ``section.field=value`` in raw config
+    ``data`` for dataclass ``cls``."""
     key, sep, raw_value = override.partition("=")
     parts = key.strip().split(".")
-    if not sep or len(parts) < 2:
-        raise ValueError(
-            f"Override must be section.field=value, got {override!r}"
-        )
+    if not sep or not key.strip():
+        raise ValueError(f"Override must be field=value, got {override!r}")
     target, owner = data, cls
     for depth, part in enumerate(parts):
         types_by_name = typing.get_type_hints(owner)

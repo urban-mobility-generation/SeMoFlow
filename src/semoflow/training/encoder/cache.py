@@ -34,44 +34,18 @@ def path_fingerprint(path: str | Path | None) -> dict[str, Any]:
     }
 
 
-def cbg_attribute_fingerprints(data_root: str | None) -> list[dict[str, Any]]:
-    if not data_root:
-        return []
-    root = Path(data_root)
-    if not root.is_dir():
-        return []
-    infos: list[dict[str, Any]] = []
-    for city_dir in sorted(root.iterdir()):
-        cbg_path = city_dir / "cbg_attributes.parquet"
-        if cbg_path.exists():
-            infos.append(path_fingerprint(cbg_path))
-    return infos
-
-
 def graph_data_cache_payload(cfg: ExperimentConfig) -> dict[str, Any]:
-    graph_cfg = cfg.encoder_pipeline.graph
+    graph_cfg = cfg.encoder.graph
     return {
-        "version": graph_cfg.cache_version,
-        "stays": path_fingerprint(
-            cfg.tokenizer_config.processed_visits_output_path()
-        ),
+        "version": 1,
+        "stays": path_fingerprint(cfg.layout.preprocessing.processed_visits),
         "places_index": path_fingerprint(
-            cfg.tokenizer_config.places_index_output_path()
+            cfg.layout.preprocessing.places_index
         ),
-        "text_embeddings": path_fingerprint(
-            cfg.encoder_pipeline.text.out_path
-        ),
-        "cbg_attributes": cbg_attribute_fingerprints(cfg.data.data_root),
+        "text_embeddings": path_fingerprint(cfg.layout.text_embeddings),
         "hidden_dim": graph_cfg.hidden_dim,
-        "covisit_edges": graph_cfg.covisit_edges,
-        "covisit_tc_hours": graph_cfg.covisit_tc_hours,
-        "covisit_ts_intermediate": graph_cfg.covisit_ts_intermediate,
-        "covisit_min_shift": graph_cfg.covisit_min_shift,
-        "covisit_top_k": graph_cfg.covisit_top_k,
         "hash_train_fraction": graph_cfg.hash_train_fraction,
         "seed": graph_cfg.seed,
-        "city_balanced_supervision": graph_cfg.city_balanced_supervision,
-        "include_user_nodes": graph_cfg.include_user_nodes,
         "split_scope": "train",
     }
 
@@ -80,16 +54,15 @@ def graph_data_cache_dir(cfg: ExperimentConfig) -> Path:
     payload = graph_data_cache_payload(cfg)
     key = json.dumps(payload, sort_keys=True)
     digest = hashlib.sha256(key.encode()).hexdigest()[:16]
-    return Path(cfg.encoder_pipeline.graph.out_dir) / "cache" / digest
+    return cfg.layout.graph_dir / "cache" / digest
 
 
 def load_graph_data_cache(
     cache_dir: Path,
     cfg: ExperimentConfig,
 ) -> tuple[Any, torch.Tensor | None] | None:
-    graph_cfg = cfg.encoder_pipeline.graph
-    payload_path = cache_dir / graph_cfg.cache_payload
-    meta_path = cache_dir / graph_cfg.cache_meta
+    payload_path = cache_dir / "graph_data.pt"
+    meta_path = cache_dir / "meta.json"
     if not payload_path.exists() or not meta_path.exists():
         return None
     try:
@@ -116,9 +89,8 @@ def write_graph_data_cache(
     val_edges: torch.Tensor | None,
 ) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    graph_cfg = cfg.encoder_pipeline.graph
-    payload_path = cache_dir / graph_cfg.cache_payload
-    meta_path = cache_dir / graph_cfg.cache_meta
+    payload_path = cache_dir / "graph_data.pt"
+    meta_path = cache_dir / "meta.json"
 
     fd_payload, tmp_payload = tempfile.mkstemp(
         suffix=".pt", dir=str(cache_dir)
@@ -144,7 +116,6 @@ def write_graph_data_cache(
 
 
 __all__ = [
-    "cbg_attribute_fingerprints",
     "graph_data_cache_dir",
     "graph_data_cache_payload",
     "load_graph_data_cache",

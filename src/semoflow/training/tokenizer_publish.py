@@ -60,7 +60,7 @@ def publish_tokenizer_artifacts(
 
     from semoflow.tokenization.decoding.codebooks import SIDCodebookBundle
 
-    tcfg = cfg.tokenizer_config
+    tcfg = cfg.tokenizer
     stays = prepared.stays
     aug_path = artifacts.augmented_processed_visits
 
@@ -92,114 +92,96 @@ def publish_tokenizer_artifacts(
         grounding_index_path=artifacts.grounding_index,
     )
 
-    if not tcfg.skip_artifact_export:
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "feature_columns": prepared.feature_cols,
-                "n_codebooks": model.n_codebooks,
-                "codebook_size": model.codebook_size,
-                "input_dim": len(prepared.feature_cols),
-                "graph_dim": prepared.graph_dim,
-                "hidden_dim": tcfg.hidden_dim,
-                "latent_dim": tcfg.latent_dim,
-                "history": history,
-                "config": vars(tcfg),
-                "codebooks": bundle.codebooks,
-                "code_fields": bundle.code_fields,
-                "feature_mean": prepared.feature_mean,
-                "feature_std": prepared.feature_std,
-                "feature_preprocessing": prepared.feature_preprocessing,
-                "shared_codebook_fingerprint": codebook_fingerprint,
-                "lookup_fingerprint": lookup_fingerprint,
-            },
-            artifacts.tokenizer_model,
-        )
-        torch.save(
-            {
-                "codebooks": bundle.codebooks,
-                "code_fields": bundle.code_fields,
-                "shared_codebook_fingerprint": codebook_fingerprint,
-                "lookup_fingerprint": lookup_fingerprint,
-            },
-            artifacts.tokenizer_codebooks,
-        )
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "feature_columns": prepared.feature_cols,
+            "n_codebooks": model.n_codebooks,
+            "codebook_size": model.codebook_size,
+            "input_dim": len(prepared.feature_cols),
+            "graph_dim": prepared.graph_dim,
+            "hidden_dim": tcfg.hidden_dim,
+            "latent_dim": tcfg.latent_dim,
+            "history": history,
+            "config": vars(tcfg),
+            "codebooks": bundle.codebooks,
+            "code_fields": bundle.code_fields,
+            "feature_mean": prepared.feature_mean,
+            "feature_std": prepared.feature_std,
+            "feature_preprocessing": prepared.feature_preprocessing,
+            "shared_codebook_fingerprint": codebook_fingerprint,
+            "lookup_fingerprint": lookup_fingerprint,
+        },
+        artifacts.tokenizer_model,
+    )
+    torch.save(
+        {
+            "codebooks": bundle.codebooks,
+            "code_fields": bundle.code_fields,
+            "shared_codebook_fingerprint": codebook_fingerprint,
+            "lookup_fingerprint": lookup_fingerprint,
+        },
+        artifacts.tokenizer_codebooks,
+    )
 
-        stays_aug = stays.join(
-            codes_df.select(["placekey_id", *code_cols]),
-            on="placekey_id",
-            how="left",
-            maintain_order="left",
+    stays_aug = stays.join(
+        codes_df.select(["placekey_id", *code_cols]),
+        on="placekey_id",
+        how="left",
+        maintain_order="left",
+    )
+    for c in code_cols:
+        stays_aug = stays_aug.with_columns(
+            pl.col(c).fill_null(0).cast(pl.Int32)
         )
-        for c in code_cols:
-            stays_aug = stays_aug.with_columns(
-                pl.col(c).fill_null(0).cast(pl.Int32)
-            )
-        stays_aug.write_parquet(aug_path)
-        logger.info(
-            "tokenizer training complete: %s  codebooks=%s",
-            aug_path,
-            artifacts.tokenizer_codebooks,
+    stays_aug.write_parquet(aug_path)
+    logger.info(
+        "tokenizer training complete: %s  codebooks=%s",
+        aug_path,
+        artifacts.tokenizer_codebooks,
+    )
+    write_tokenizer_provenance(cfg, artifacts)
+    required = (
+        "augmented_processed_visits",
+        "placekey_lookup",
+        "tokenizer_model",
+        "tokenizer_codebooks",
+        "grounding_index",
+    )
+    missing = [
+        name
+        for name in required
+        if not artifacts.export_paths()[name].exists()
+    ]
+    if missing:
+        artifacts.write_completion(status="partial", required=required)
+        raise RuntimeError(
+            "tokenizer publication incomplete; missing " + ", ".join(missing)
         )
-        write_tokenizer_provenance(tcfg, artifacts)
-        required = (
-            "augmented_processed_visits",
-            "placekey_lookup",
-            "tokenizer_model",
-            "tokenizer_codebooks",
-            "grounding_index",
-        )
-        missing = [
-            name
-            for name in required
-            if not artifacts.export_paths()[name].exists()
-        ]
-        if missing:
-            artifacts.write_completion(status="partial", required=required)
-            raise RuntimeError(
-                "tokenizer publication incomplete; missing "
-                + ", ".join(missing)
-            )
-        artifacts.write_completion(status="complete", required=required)
-        return aug_path
-    else:
-        logger.info(
-            "skip_artifact_export=true; skipping heavy artifact writes"
-        )
-        write_tokenizer_provenance(tcfg, artifacts)
-        artifacts.write_completion(
-            status="partial",
-            required=(),
-            skipped=tuple(
-                name
-                for name in artifacts.export_paths()
-                if name != "config.yaml"
-            ),
-        )
-        return None
+    artifacts.write_completion(status="complete", required=required)
+    return aug_path
 
 
 def write_tokenizer_provenance(
-    tcfg: Any, artifacts: TokenizerArtifacts
+    cfg: ExperimentConfig, artifacts: TokenizerArtifacts
 ) -> None:
+    layout = cfg.layout
     closure = ProvenanceClosure(artifact=str(artifacts.run_dir))
     closure.components.append(
         ClosureComponent(
-            source=f"tokenizer_text:{tcfg.text_embeddings_path}",
+            source=f"tokenizer_text:{layout.text_embeddings}",
             kind="substrate",
         )
     )
-    if tcfg.graphsage_artifact_dir:
-        upstream = load_closure(Path(tcfg.graphsage_artifact_dir).resolve())
-        if upstream is not None:
-            closure.components.extend(upstream.components)
-        else:
-            closure.components.append(
-                ClosureComponent(
-                    source=f"graphsage:{tcfg.graphsage_artifact_dir}",
-                    kind="behavioral",
-                )
+    upstream = load_closure(layout.graph_dir.resolve())
+    if upstream is not None:
+        closure.components.extend(upstream.components)
+    else:
+        closure.components.append(
+            ClosureComponent(
+                source=f"graphsage:{layout.graph_dir}", kind="behavioral"
             )
+        )
 
     write_closure(closure, artifacts.run_dir)
 

@@ -167,8 +167,6 @@ def save_occurrence_planner_checkpoint(
     save_torch_atomic(path, payload, force=force)
 
 
-# Architecture options the planner no longer offers, with the one value
-# every supported checkpoint carries.
 _RETIRED_CONFIG = {
     "context_dim": 0,
     "context_schema": (),
@@ -228,9 +226,6 @@ def save_occurrence_planner_samples(
     city_ids: torch.Tensor,
     seed: int,
     temperature: float,
-    length_temperature: float,
-    gap_temperature: float,
-    prefix_temperature: float,
     route_temperature: float,
     force: bool = False,
 ) -> None:
@@ -243,9 +238,6 @@ def save_occurrence_planner_samples(
         "city_ids": city_ids.long(),
         "seed": int(seed),
         "temperature": float(temperature),
-        "length_temperature": float(length_temperature),
-        "gap_temperature": float(gap_temperature),
-        "prefix_temperature": float(prefix_temperature),
         "route_temperature": float(route_temperature),
     }
     save_torch_atomic(path, payload, force=force)

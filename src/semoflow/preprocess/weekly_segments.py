@@ -40,8 +40,6 @@ def _segment_events(
 ) -> pl.DataFrame:
     window = ["device_key", "_week"]
     stays = (
-        # Equal timestamps keep polars' default sort order, which built
-        # the released segment caches; a stable sort would reorder them.
         stays.sort(["device_key", ts_col])
         .with_columns(pl.col(ts_col).dt.truncate("1w").alias("_week"))
         .with_columns(

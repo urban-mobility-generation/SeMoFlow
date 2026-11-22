@@ -9,11 +9,6 @@ import polars as pl
 import torch
 from torch_geometric.data import HeteroData
 
-from semoflow.encoder.graph.covisit import (
-    covisit_adjacency,
-    top_k_per_row,
-)
-
 logger = logging.getLogger(__name__)
 
 
@@ -49,87 +44,9 @@ def _poi_key_column(
     )
 
 
-_CBG_NUMERIC_COLS = [
-    "total_population",
-    "median_household_income",
-    "per_capita_income",
-    "median_age",
-    "pct_white",
-    "pct_black",
-    "pct_hispanic",
-    "pct_college",
-    "unemployment_rate",
-    "median_gross_rent",
-]
-
-
-def _build_cbg_demographic_features(
-    data: HeteroData,
-    cbg_df: pl.DataFrame,
-    cbg_lookup: pl.DataFrame,
-    places_index_df: pl.DataFrame,
-    cbg_col: str,
-) -> bool:
-    available = [c for c in _CBG_NUMERIC_COLS if c in cbg_df.columns]
-    if not available:
-        logger.warning("No numeric columns in cbg_attributes; skipping.")
-        return False
-
-    has_coords = (
-        "latitude" in places_index_df.columns
-        and "longitude" in places_index_df.columns
-    )
-    if has_coords:
-        centroids = (
-            places_index_df.select([cbg_col, "latitude", "longitude"])
-            .drop_nulls()
-            .group_by(cbg_col)
-            .agg(
-                pl.col("latitude").mean().alias("centroid_lat"),
-                pl.col("longitude").mean().alias("centroid_lon"),
-            )
-        )
-    else:
-        centroids = None
-
-    aligned = cbg_lookup.rename({"key": cbg_col}).join(
-        cbg_df.rename({"cbg_geoid": cbg_col}),
-        on=cbg_col,
-        how="left",
-    )
-    if centroids is not None:
-        aligned = aligned.join(centroids, on=cbg_col, how="left")
-        feature_cols = [*available, "centroid_lat", "centroid_lon"]
-    else:
-        feature_cols = available
-
-    aligned = aligned.sort("idx")
-    arr = (
-        aligned.select(feature_cols).to_numpy().astype(np.float32, copy=False)
-    )
-
-    col_medians = np.nanmedian(arr, axis=0, keepdims=True)
-    col_medians = np.nan_to_num(col_medians, nan=0.0)
-    nan_mask = np.isnan(arr)
-    arr = np.where(nan_mask, col_medians, arr)
-
-    mean = arr.mean(axis=0, keepdims=True)
-    std = arr.std(axis=0, keepdims=True)
-    std[std < 1e-8] = 1.0
-    arr = (arr - mean) / std
-
-    data["cbg"].x = torch.from_numpy(arr)
-    logger.info(
-        "  cbg features: %d dims (demographics + centroids)",
-        arr.shape[1],
-    )
-    return True
-
-
 _UNKNOWN_LOOKUP = pl.DataFrame({"key": ["Unknown"], "idx": [0]}).cast(
     {"idx": pl.Int32}
 )
-# Rows per index_add_ call when averaging POI features into user nodes.
 _AGGREGATION_CHUNK = 500_000
 _TIME_OF_DAY_RELATIONS = (
     "next_weekend",
@@ -267,59 +184,13 @@ def _transition_edges(
     return edges, val_edge_index, seq.height
 
 
-def _add_covisit_edges(
-    data: HeteroData,
-    stays_df: pl.DataFrame,
-    poi_lookup: pl.DataFrame,
-    *,
-    tc_hours: float,
-    ts_intermediate: int,
-    min_shift: int,
-    min_covisits: int,
-    top_k: int,
-) -> None:
-    start = time.perf_counter()
-    adjacency = covisit_adjacency(
-        stays_df,
-        poi_lookup["key"].to_list(),
-        tc_hours=tc_hours,
-        ts_intermediate=ts_intermediate,
-        min_covisits=min_covisits,
-        min_shift=min_shift,
-    )
-    src, dst = top_k_per_row(adjacency, top_k)
-    if src.size:
-        _add_edges(
-            data,
-            ("poi", "covisits", "poi"),
-            "rev_covisits",
-            torch.tensor(np.stack([src, dst]), dtype=torch.long),
-        )
-    logger.info(
-        "  co-visitation edges: %d  (tc=%.1fh min_shift=%d top_k=%d)  %.1fs",
-        int(src.size),
-        tc_hours,
-        min_shift,
-        top_k,
-        time.perf_counter() - start,
-    )
-
-
 def build_hetero_data(
     stays_df: pl.DataFrame,
     places_index_df: pl.DataFrame,
     text_embeddings_path: str | Path | None = None,
-    cbg_attributes_df: pl.DataFrame | None = None,
     hidden_dim: int = 64,
     train_fraction: float | None = None,
     seed: int = 42,
-    covisit_edges: bool = False,
-    covisit_tc_hours: float = 6.0,
-    covisit_ts_intermediate: int = 1,
-    covisit_min_shift: int = 2,
-    covisit_min_covisits: int = 1,
-    covisit_top_k: int = 50,
-    include_user_nodes: bool = True,
 ) -> tuple[HeteroData, torch.Tensor | None]:
     """POI graph with user, category and CBG nodes plus transition edges.
 
@@ -340,11 +211,7 @@ def build_hetero_data(
 
     poi_col = _poi_key_column(stays_df, places_index_df)
     poi_lookup = build_key_index(places_index_df[poi_col], "key")
-    user_lookup = (
-        build_key_index(stays_df["device_key"], "key")
-        if include_user_nodes
-        else None
-    )
+    user_lookup = build_key_index(stays_df["device_key"], "key")
     columns = places_index_df.columns
     cat_col = "top_category" if "top_category" in columns else None
     cbg_col = "census_block_group" if "census_block_group" in columns else None
@@ -353,7 +220,7 @@ def build_hetero_data(
     logger.info(
         "  nodes  pois=%d  users=%d  cats=%d  cbgs=%d",
         poi_lookup.height,
-        0 if user_lookup is None else user_lookup.height,
+        user_lookup.height,
         cat_lookup.height,
         cbg_lookup.height,
     )
@@ -398,13 +265,12 @@ def build_hetero_data(
         stays_valid.height,
         stays_df.height,
     )
-    if user_lookup is not None:
-        users = _join_idx(stays_valid, "device_key", user_lookup).to_numpy()
-        pois = _join_idx(stays_valid, poi_col, poi_lookup).to_numpy()
-        visits = torch.tensor(np.stack([users, pois]), dtype=torch.long)
-        _add_edges(data, ("user", "visits", "poi"), "rev_visits", visits)
-        logger.info("  visit edges: %d", visits.shape[1])
-        data["user"].x = _mean_features(user_lookup.height, users, pois, poi_x)
+    users = _join_idx(stays_valid, "device_key", user_lookup).to_numpy()
+    pois = _join_idx(stays_valid, poi_col, poi_lookup).to_numpy()
+    visits = torch.tensor(np.stack([users, pois]), dtype=torch.long)
+    _add_edges(data, ("user", "visits", "poi"), "rev_visits", visits)
+    logger.info("  visit edges: %d", visits.shape[1])
+    data["user"].x = _mean_features(user_lookup.height, users, pois, poi_x)
 
     poi_cat_edges = _membership_edges(
         places_index_df, poi_col, poi_lookup, cat_col, cat_lookup
@@ -425,19 +291,12 @@ def build_hetero_data(
         places_index_df, poi_col, poi_lookup, cbg_col, cbg_lookup
     )
     _add_edges(data, ("poi", "located_in", "cbg"), "contains", poi_cbg_edges)
-    if not (
-        cbg_attributes_df is not None
-        and cbg_col is not None
-        and _build_cbg_demographic_features(
-            data, cbg_attributes_df, cbg_lookup, places_index_df, cbg_col
-        )
-    ):
-        data["cbg"].x = _mean_features(
-            cbg_lookup.height,
-            poi_cbg_edges[1].numpy(),
-            poi_cbg_edges[0].numpy(),
-            poi_x,
-        )
+    data["cbg"].x = _mean_features(
+        cbg_lookup.height,
+        poi_cbg_edges[1].numpy(),
+        poi_cbg_edges[0].numpy(),
+        poi_x,
+    )
 
     logger.info("  building temporal transition edges...")
     t_trans = time.perf_counter()
@@ -458,17 +317,6 @@ def build_hetero_data(
         transition_count,
         time.perf_counter() - t_trans,
     )
-    if covisit_edges:
-        _add_covisit_edges(
-            data,
-            stays_df,
-            poi_lookup,
-            tc_hours=covisit_tc_hours,
-            ts_intermediate=covisit_ts_intermediate,
-            min_shift=covisit_min_shift,
-            min_covisits=covisit_min_covisits,
-            top_k=covisit_top_k,
-        )
     logger.info(
         "HeteroData complete  %.1fs  metadata=%s",
         time.perf_counter() - t0,

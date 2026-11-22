@@ -8,8 +8,7 @@ import numpy as np
 import polars as pl
 
 from semoflow.config import constants
-from semoflow.config.artifacts import PreprocessingArtifacts
-from semoflow.config.schemas.data_config import FoursquareAdapterConfig
+from semoflow.config.schemas.data_config import DataConfig
 from semoflow.preprocess.places_index import write_places_index
 from semoflow.preprocess.quality_gate import (
     QualityGateConfig,
@@ -150,7 +149,7 @@ def read_foursquare_global_catalog(
     source: str | Path,
     *,
     cities: list[str],
-    config: FoursquareAdapterConfig,
+    config: DataConfig,
 ) -> pl.DataFrame:
     source_path = Path(source).expanduser()
     cities_path = _global_source_file(
@@ -471,13 +470,6 @@ def foursquare_place_index(events: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def _source_path(data_root: Path, config: FoursquareAdapterConfig) -> Path:
-    if config.archive_path:
-        candidate = Path(config.archive_path).expanduser()
-        return candidate if candidate.is_absolute() else data_root / candidate
-    return data_root / config.raw_dir
-
-
 def _source_readme(source: Path) -> str | None:
     for name in ("dataset_TIST2015_readme.txt", "dataset_TIST2015_README.txt"):
         if (source / name).is_file():
@@ -486,30 +478,21 @@ def _source_readme(source: Path) -> str | None:
 
 
 def run_foursquare_pipeline(cfg: ExperimentConfig) -> None:
-    if cfg.data.dataset_name != "foursquare":
-        raise ValueError(
-            "run_foursquare_pipeline requires data.dataset_name='foursquare'"
-        )
-    adapter = cfg.data.foursquare
-    adapter.validate()
-    cities = list(cfg.data.cities)
-    if not cities or any(
-        city not in FOURSQUARE_GLOBAL_CITY_NAMES for city in cities
-    ):
+    adapter = cfg.data
+    cities = list(adapter.cities)
+    if any(city not in FOURSQUARE_GLOBAL_CITY_NAMES for city in cities):
         raise ValueError(
             "Foursquare data.cities must contain only "
             f"{sorted(FOURSQUARE_GLOBAL_CITY_NAMES)}"
         )
 
-    source = _source_path(
-        Path(cfg.data.data_root).expanduser().resolve(), adapter
-    )
+    source = adapter.source_dir.resolve()
     if not source.exists():
         raise FileNotFoundError(
             f"Foursquare source not found: {source}. Download and extract the "
             f"global release from {FOURSQUARE_SOURCE_URL}"
         )
-    artifacts = PreprocessingArtifacts.from_config(cfg)
+    artifacts = cfg.layout.preprocessing
     artifacts.run_dir.mkdir(parents=True, exist_ok=True)
 
     catalog = read_foursquare_global_catalog(

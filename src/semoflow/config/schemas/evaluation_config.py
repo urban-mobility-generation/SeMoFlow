@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
 
 
 @dataclass(frozen=True, slots=True)
 class PlanSamplingOptions:
     batch_size: int = 1024
     temperature: float = 1.0
-    # None samples the Explore/Retrieve gate at ``temperature``.
     route_temperature: float | None = None
 
     def __post_init__(self) -> None:
@@ -23,12 +21,8 @@ class CompositionOptions:
     batch_size: int = 64
     solver: str = "heun"
     num_steps: int = 32
-    # None keeps the realizer's calibrated catalog temperature.
     catalog_temperature: float | None = None
     candidate_selection: str = "first"
-    # "trajectory_prefix" shares calibrated catalog sampling noise among a
-    # trajectory's events with the same planned prefix; per-event marginals
-    # are unchanged. "independent" keeps per-event draws.
     catalog_noise_coupling: str = "independent"
 
     def __post_init__(self) -> None:
@@ -46,18 +40,11 @@ class CompositionOptions:
 class EvaluationConfig:
     """Per-city sampling and composition for ``semoflow-eval evaluate``.
 
-    Each city samples one plan per week in ``reference_split`` and writes
-    its outputs to ``output_dir/<city name>``.
+    Each city samples one plan per week in ``reference_split``. ``cities``
+    defaults to every city in ``data.cities``.
     """
 
-    planner_checkpoint: Path
-    realizer_checkpoint: Path
-    tokenization_dir: Path
-    segments_path: Path
-    places_path: Path
-    output_dir: Path
-    # City name -> city_id, in evaluation order.
-    cities: dict[str, int]
+    cities: list[str] | None = None
     reference_split: str = "test"
     device: str = "cuda:0"
     seed: int = 0
@@ -65,7 +52,7 @@ class EvaluationConfig:
     composition: CompositionOptions = field(default_factory=CompositionOptions)
 
     def __post_init__(self) -> None:
-        if not self.cities:
+        if self.cities is not None and not self.cities:
             raise ValueError("evaluation.cities must name at least one city")
         if self.reference_split not in {"val", "test"}:
             raise ValueError("reference_split must be 'val' or 'test'")

@@ -66,16 +66,14 @@ def train_encoder_cmd(
     cfg = resolve_cli_config(
         config, set_args, log_level=log_level, log_file=log_file
     )
-    graph_cfg = cfg.encoder_pipeline.graph
+    graph_cfg = cfg.encoder.graph
     with cli_run(
         cfg,
         phase="encoder",
-        output_dir=cfg.output.output_dir,
-        device=(
-            graph_cfg.device
-            if graph_cfg.enabled
-            else cfg.encoder_pipeline.text.device
-        ),
+        output_dir=cfg.layout.encoder_dir,
+        device=graph_cfg.device
+        if graph_cfg.enabled
+        else cfg.encoder.text.device,
         seed=graph_cfg.seed if graph_cfg.enabled else None,
         log_level=log_level,
         log_file=log_file,
@@ -94,15 +92,15 @@ def train_tokenizer_cmd(
     log_level: LogLevelOpt = "INFO",
     log_file: LogFileOpt = None,
 ) -> None:
-    from semoflow.config.artifacts import TokenizerArtifacts
     from semoflow.training.tokenizer_run import run_semantic_id_tokenizer
 
     cfg = resolve_cli_config(
         config, set_args, log_level=log_level, log_file=log_file
     )
-    tcfg = cfg.tokenizer_config
-    run_dir = tcfg.run_dir()
-    if TokenizerArtifacts.from_run_dir(run_dir).is_complete() and not force:
+    tcfg = cfg.tokenizer
+    artifacts = cfg.layout.tokenizer
+    run_dir = artifacts.run_dir
+    if artifacts.is_complete() and not force:
         logger.info("semantic tokenizer run already complete: %s", run_dir)
         return
     with cli_run(
@@ -117,12 +115,6 @@ def train_tokenizer_cmd(
         run.result = {
             "augmented_processed_visits": run_semantic_id_tokenizer(cfg)
         }
-
-
-def _section[T](section: T | None, name: str) -> T:
-    if section is None:
-        raise typer.BadParameter(f"--config must define a {name!r} section")
-    return section
 
 
 def _is_rank_zero() -> bool:
@@ -152,8 +144,8 @@ def _torchrun_process_group() -> Generator[str | None, None, None]:
 @app.command(
     "realizer",
     help=(
-        "Train the hard-prefix latent-flow realizer from the config's "
-        "realizer section. Launch with torchrun for multi-GPU DDP."
+        "Train the hard-prefix latent-flow realizer. Launch with torchrun "
+        "for multi-GPU DDP."
     ),
 )
 def train_realizer_cmd(
@@ -170,9 +162,9 @@ def train_realizer_cmd(
     cfg = resolve_cli_config(
         config, set_args, log_level=log_level, log_file=log_file
     )
-    settings = _section(cfg.realizer, "realizer")
+    settings, layout = cfg.realizer, cfg.layout
     if dry_run_config:
-        typer.echo(cfg.to_yaml("realizer"))
+        typer.echo(cfg.to_yaml())
         return
     with (
         bad_parameter_on(OSError, RuntimeError, ValueError),
@@ -183,16 +175,18 @@ def train_realizer_cmd(
         with cli_run(
             cfg,
             phase="realizer",
-            output_dir=settings.output_dir,
+            output_dir=layout.realizer_dir,
             device=settings.device,
             seed=settings.seed,
             log_level=log_level,
             log_file=log_file,
         ) as run:
-            result = train_prefix_time_suffix_latent_flow_realizer(settings)
+            result = train_prefix_time_suffix_latent_flow_realizer(
+                settings, layout
+            )
             run.result = {
-                "checkpoint_path": settings.output_dir / "best.pt",
-                "metrics_path": settings.output_dir / "metrics.json",
+                "checkpoint_path": layout.realizer_dir / "best.pt",
+                "metrics_path": layout.realizer_dir / "metrics.json",
                 "best_val_loss": result["best_val_loss"],
             }
     if _is_rank_zero():
@@ -202,8 +196,8 @@ def train_realizer_cmd(
 @app.command(
     "planner",
     help=(
-        "Train the occurrence SID-prefix planner from the config's planner "
-        "section. training.device '[0,1,...]' spawns one DDP rank per GPU."
+        "Train the occurrence SID-prefix planner. planner.training.device "
+        "'[0,1,...]' spawns one DDP rank per GPU."
     ),
 )
 def train_planner_cmd(
@@ -222,27 +216,27 @@ def train_planner_cmd(
     cfg = resolve_cli_config(
         config, set_args, log_level=log_level, log_file=log_file
     )
-    settings = _section(cfg.planner, "planner")
+    settings, layout = cfg.planner, cfg.layout
     if dry_run_config:
-        typer.echo(cfg.to_yaml("planner"))
+        typer.echo(cfg.to_yaml())
         return
     device = settings.training.device
     if not device.strip().startswith("["):
         validate_device(device, name="planner.training.device")
     with bad_parameter_on(ValueError, FileExistsError):
-        # Before the run is recorded, so a refused run leaves the existing
-        # outputs and their manifest untouched.
-        check_planner_settings(settings, force=force)
+        check_planner_settings(settings, layout, force=force)
         with cli_run(
             cfg,
             phase="planner",
-            output_dir=settings.output_dir,
+            output_dir=layout.planner_dir,
             device=device,
             seed=settings.seed,
             log_level=log_level,
             log_file=log_file,
         ) as run:
-            result = train_planner(settings, force=force, log_level=log_level)
+            result = train_planner(
+                settings, layout, force=force, log_level=log_level
+            )
             run.result = asdict(result)
     if _is_rank_zero():
         echo_json(run.result)

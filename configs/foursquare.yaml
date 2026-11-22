@@ -1,0 +1,116 @@
+name: foursquare
+run_dir: outputs
+
+data:
+  root: data
+  raw_dir: foursquare_global_2015
+  cities: [los_angeles, washington_dc, atlanta, san_francisco, milwaukee]
+
+encoder:
+  text:
+    model: sentence-t5-xxl
+    batch_size: 256
+    precision: float32
+    include_address_in_template: false
+    include_name_in_template: true
+  graph:
+    hidden_dim: 512
+    out_dim: 128
+    num_layers: 2
+    aggr: mean
+    layer_norm: true
+    residual: true
+    dropout: 0.1
+    id_embedding_dim: 64
+    id_embedding_node_types: [poi, category, cbg]
+    temperature: 0.07
+    max_negatives: 2048
+    max_queries: 262144
+    variance_weight: 1.0
+    covariance_weight: 0.04
+    variance_target: 1.0
+    epochs: 600
+    batch_size: 4194304
+    lr: 0.001
+    num_workers: 8
+    num_neighbors: [10, 10]
+    hash_train_fraction: 0.70
+
+tokenizer:
+  n_codebooks: 6
+  codebook_size: 32
+  latent_dim: 256
+  hidden_dim: 512
+  n_encoder_layers: 4
+  input_embedding_source: pca_concat
+  pca_text_dim: 32
+  pca_graph_dim: 32
+  geo_relative_dim: 6
+  geo_scale: 5
+  text_graph_scale: 2.5
+  beta: 3.0
+  sk_epsilons: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
+  epochs: 50
+  batch_size: 1024
+  lr: 0.001
+  num_workers: 4
+
+planner:
+  data:
+    min_active_days: 2
+    max_occurrences: 128
+    city_conditioning: true
+  architecture:
+    model_dim: 256
+    n_heads: 8
+    n_layers: 6
+    dropout: 0.2
+    mobility_gate_prior: log_distinct
+    use_distance_prior: true
+  training:
+    epochs: 60
+    batch_size: 512
+    learning_rate: 0.0003
+    weight_decay: 0.0001
+    lr_scheduler: cosine
+    warmup_steps: 100
+    min_lr: 0.00003
+    early_stopping_patience: 5
+    num_workers: 8
+    compile_model: true
+
+realizer:
+  max_events: 128
+  prefix_depth: 3
+  city_vocab: 12
+  model_dim: 256
+  condition_depth: 4
+  depth: 6
+  num_heads: 8
+  dropout: 0.1
+  catalog_loss_weight: 0.1
+  endpoint_loss_weight: 0.1
+  population_loss_weight: 0.05
+  epochs: 300
+  batch_size: 512
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  lr_scheduler: cosine
+  min_lr: 0.00001
+  tail_whitening_chunk_size: 16384
+  compile: true
+  mixed_precision: bf16
+  tf32: true
+  fused_optimizer: true
+
+evaluation:
+  reference_split: test
+  sampling:
+    batch_size: 512
+    route_temperature: 1.7
+  composition:
+    batch_size: 128
+    solver: euler
+    num_steps: 20
+    catalog_temperature: 0.4
+    candidate_selection: train_prior_sample

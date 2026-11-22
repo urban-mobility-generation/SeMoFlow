@@ -7,8 +7,6 @@ import numpy as np
 
 N_PART_OF_DAY_BINS = 6
 N_TIME_TOKENS = 42
-# Start minute of each unequal circadian part-of-day bin:
-# [0,6), [6,10), [10,14), [14,18), [18,22), [22,24) hours.
 PART_OF_DAY_START_MINUTES: tuple[int, ...] = (0, 360, 600, 840, 1080, 1320)
 
 

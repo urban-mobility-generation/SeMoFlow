@@ -143,8 +143,6 @@ class OccurrenceARPlanner(nn.Module):
             gate_prior=config.mobility_gate_prior,
         )
 
-    # Released checkpoints carry an ``_extra_state`` entry; it holds no
-    # information the model needs.
     def get_extra_state(self) -> dict[str, Any]:
         return {}
 
@@ -554,8 +552,6 @@ class OccurrenceARPlanner(nn.Module):
             hidden, batch.target_gap_tokens, arrival_time_minutes
         )
 
-        # Padded steps decode the first prefix legal in the row's city, so
-        # every decoder level has a legal target.
         catalog_rows = self.catalog_rows(batch.city_ids)
         safe_token_ids = (
             self.city_legal_prefix_mask[catalog_rows]

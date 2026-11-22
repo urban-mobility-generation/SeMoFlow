@@ -60,7 +60,6 @@ def collate_occurrence_tensors(
         valid_mask[..., None], sub_prefix, default_prefix
     )
     target_gaps = torch.where(valid_mask, sub_gaps, 0)
-    # The model's clock: event times reconstructed from the gap codec.
     event_times = reconstruct_event_time_minutes(
         target_gaps,
         representative_minutes=config.gap_duration_minutes,

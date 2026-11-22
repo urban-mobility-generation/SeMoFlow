@@ -11,7 +11,6 @@ from semoflow.realizer.flow_matching import (
     compute_target_velocity,
     linear_interpolate,
     sample_logit_normal_timesteps,
-    sample_uniform_timesteps,
     velocity_from_x0,
 )
 from semoflow.realizer.model import (
@@ -184,8 +183,6 @@ class CatalogCandidateBank:
             prefix_groups.setdefault(tuple(row[:prefix_depth]), []).append(
                 row_index
             )
-        # Keys are most-significant-first, so sorted prefixes are already in
-        # key order.
         sorted_prefixes = sorted(prefix_groups)
         prefix_keys = _sid_keys(
             torch.tensor(sorted_prefixes, dtype=torch.long),
@@ -444,7 +441,6 @@ def _catalog_losses(
     prefix_indices = candidates._prefix_indices(
         active_codes[:, : candidates.prefix_depth]
     )
-    # Candidate features are computed once per distinct prefix.
     unique_indices, inverse = torch.unique(
         prefix_indices, sorted=True, return_inverse=True
     )
@@ -485,7 +481,6 @@ def _catalog_losses(
         .eq(active_codes[:, None, :])
         .all(dim=-1)
     )
-    # Column 0 is the always-valid target.
     valid_candidates = torch.cat(
         (
             torch.ones_like(duplicate[:, :1]),
@@ -523,7 +518,6 @@ def prefix_time_suffix_latent_flow_loss(
     tail_whitener: torch.Tensor,
     candidate_bank: CatalogCandidateBank,
     *,
-    lognormal_t: bool = True,
     p_mean: float = -0.5,
     p_std: float = 1.2,
     catalog_loss_weight: float,
@@ -548,17 +542,9 @@ def prefix_time_suffix_latent_flow_loss(
     padding = ~valid_mask[..., None]
     clean_tail = clean_tail.masked_fill(padding, 0.0)
     noise = torch.randn_like(clean_tail).masked_fill(padding, 0.0)
-    if lognormal_t:
-        timesteps = sample_logit_normal_timesteps(
-            clean_codes.size(0),
-            clean_codes.device,
-            p_mean=p_mean,
-            p_std=p_std,
-        )
-    else:
-        timesteps = sample_uniform_timesteps(
-            clean_codes.size(0), clean_codes.device
-        )
+    timesteps = sample_logit_normal_timesteps(
+        clean_codes.size(0), clean_codes.device, p_mean=p_mean, p_std=p_std
+    )
     noisy_tail = linear_interpolate(clean_tail, noise, timesteps).masked_fill(
         padding, 0.0
     )

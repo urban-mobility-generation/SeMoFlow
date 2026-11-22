@@ -31,9 +31,8 @@ logger = logging.getLogger(__name__)
 @app.command(
     "evaluate",
     help=(
-        "For each city in the config's evaluation section, sample plans, "
-        "compose them into POI trajectories, and score them against the "
-        "city's held-out weeks."
+        "For each evaluation city, sample plans, compose them into POI "
+        "trajectories, and score them against the city's held-out weeks."
     ),
 )
 def evaluate_cmd(
@@ -48,16 +47,16 @@ def evaluate_cmd(
     cfg = resolve_cli_config(
         config, set_args, log_level=log_level, log_file=log_file
     )
-    settings = cfg.evaluation
-    if settings is None:
-        raise typer.BadParameter("--config must define an evaluation section")
+    settings, layout, cities = (
+        cfg.evaluation,
+        cfg.layout,
+        cfg.evaluation_cities,
+    )
     validate_device(settings.device, name="evaluation.device")
-    # Before the run is recorded, so a refused run leaves the existing
-    # outputs and their manifest untouched.
     existing = [
         path
-        for name in settings.cities
-        if (path := settings.output_dir / name).exists()
+        for name in cities
+        if (path := layout.evaluation_dir / name).exists()
     ]
     if existing and not force:
         raise typer.BadParameter(
@@ -69,14 +68,14 @@ def evaluate_cmd(
         cli_run(
             cfg,
             phase="evaluation",
-            output_dir=settings.output_dir,
+            output_dir=layout.evaluation_dir,
             device=settings.device,
             seed=settings.seed,
             log_level=log_level,
             log_file=log_file,
         ) as run,
     ):
-        run.result = evaluate_cities(settings, force=force)
+        run.result = evaluate_cities(settings, layout, cities, force=force)
     echo_json(run.result)
 
 
@@ -111,15 +110,6 @@ def sample_plans_cmd(
         ),
     ] = 1024,
     temperature: Annotated[float, typer.Option("--temperature")] = 1.0,
-    length_temperature: Annotated[
-        float | None, typer.Option("--length-temperature")
-    ] = None,
-    gap_temperature: Annotated[
-        float | None, typer.Option("--gap-temperature")
-    ] = None,
-    prefix_temperature: Annotated[
-        float | None, typer.Option("--prefix-temperature")
-    ] = None,
     route_temperature: Annotated[
         float | None,
         typer.Option(
@@ -136,9 +126,6 @@ def sample_plans_cmd(
     validate_device(device)
     for name, value in (
         ("--temperature", temperature),
-        ("--length-temperature", length_temperature),
-        ("--gap-temperature", gap_temperature),
-        ("--prefix-temperature", prefix_temperature),
         ("--route-temperature", route_temperature),
     ):
         if value is not None and value <= 0:
@@ -156,9 +143,6 @@ def sample_plans_cmd(
             device=device,
             seed=seed,
             temperature=temperature,
-            length_temperature=length_temperature,
-            gap_temperature=gap_temperature,
-            prefix_temperature=prefix_temperature,
             route_temperature=route_temperature,
             force=force,
         )

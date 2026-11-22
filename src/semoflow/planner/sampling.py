@@ -13,31 +13,27 @@ def sample_occurrence_sequences(
     *,
     city_ids: torch.Tensor,
     temperature: float = 1.0,
-    length_temperature: float | None = None,
-    gap_temperature: float | None = None,
-    prefix_temperature: float | None = None,
     route_temperature: float | None = None,
     seed: int = 0,
 ) -> dict[str, torch.Tensor]:
     """Autoregressively sample one occurrence plan per city id.
 
     Returns zero-padded ``prefix_codes`` [B, L, P], ``gap_tokens`` and
-    ``event_time_minutes`` [B, L], ``lengths`` and ``city_ids`` [B]. Unset
-    per-head temperatures fall back to ``temperature``.
+    ``event_time_minutes`` [B, L], ``lengths`` and ``city_ids`` [B]. The Explore/Retrieve gate uses
+    ``route_temperature`` when set, else ``temperature``.
     """
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
 
-    def resolve(value: float | None) -> float:
-        return temperature if value is None else value
-
+    if route_temperature is None:
+        route_temperature = temperature
     generator = torch.Generator(device=device).manual_seed(seed)
     city = city_ids.to(device)
     batch_size = int(city.shape[0])
     lengths = (
         sample_categorical_logits(
             model.predict_length(city),
-            temperature=resolve(length_temperature),
+            temperature=temperature,
             generator=generator,
         )
         + 1
@@ -81,9 +77,9 @@ def sample_occurrence_sequences(
                 step=step,
                 active=active,
                 cache=cache,
-                gap_temperature=resolve(gap_temperature),
-                prefix_temperature=resolve(prefix_temperature),
-                route_temperature=resolve(route_temperature),
+                gap_temperature=temperature,
+                prefix_temperature=temperature,
+                route_temperature=route_temperature,
                 generator=generator,
             )
             gaps[active, step] = occurrence.gap_tokens

@@ -1,18 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-
-
-@dataclass(frozen=True, slots=True)
-class RealizerDataOptions:
-    """How ``semoflow-artifacts build`` derives the realizer bank.
-
-    The bank's SID lookup is the realizer's ``catalog_path``.
-    """
-
-    segments_path: Path
-    max_events: int = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,15 +8,8 @@ class PrefixTimeSuffixLatentFlowRealizerConfig:
     """Hard-prefix latent-flow realizer over whitened suffix tails, decoded
     by the calibrated legal-catalog posterior."""
 
-    bank_path: Path
-    codebooks_path: Path
-    # SID lookup whose rows are the legal catalog candidates.
-    catalog_path: Path
-    output_dir: Path
-    data: RealizerDataOptions | None = None
-    initialize_from: Path | None = None
+    max_events: int = 32
     prefix_depth: int = 3
-    # None reads the codebook size from codebooks_path.
     codebook_size: int | None = None
     time_vocab: int = 42
     latent_dim: int | None = None
@@ -48,19 +29,15 @@ class PrefixTimeSuffixLatentFlowRealizerConfig:
     early_stopping_min_delta: float = 0.0
     weight_decay: float = 1e-2
     max_grad_norm: float = 1.0
-    train_max_samples: int | None = None
-    val_max_samples: int | None = None
     num_workers: int = 0
     prefetch_factor: int = 2
     cpu_threads: int = 4
-    device: str = "cuda"
+    device: str = "cuda:0"
     seed: int = 0
     compile: bool = False
     mixed_precision: str = "none"
     tf32: bool = False
     fused_optimizer: bool = False
-    val_every: int = 1
-    lognormal_t: bool = True
     city_vocab: int = 0
     tail_whitening_shrinkage: float = 0.05
     tail_whitening_chunk_size: int = 262144
@@ -72,19 +49,8 @@ class PrefixTimeSuffixLatentFlowRealizerConfig:
     catalog_prior_weight: float = 0.25
 
     def __post_init__(self) -> None:
-        if (
-            self.initialize_from is not None
-            and self.output_dir.resolve()
-            == self.initialize_from.resolve().parent
-        ):
-            raise ValueError(
-                "output_dir must differ from the warm-start checkpoint "
-                "directory; adaptation would overwrite the parent artifacts"
-            )
-        if self.epochs <= 0 or self.batch_size <= 0 or self.val_every <= 0:
-            raise ValueError(
-                "epochs, batch_size and val_every must be positive"
-            )
+        if self.epochs <= 0 or self.batch_size <= 0:
+            raise ValueError("epochs and batch_size must be positive")
         if self.mixed_precision not in {"none", "bf16", "fp16"}:
             raise ValueError(
                 "mixed_precision must be 'none', 'bf16', or 'fp16'"
@@ -104,4 +70,4 @@ class PrefixTimeSuffixLatentFlowRealizerConfig:
             raise ValueError("tail_whitening_shrinkage must be in [0, 1]")
 
 
-__all__ = ["PrefixTimeSuffixLatentFlowRealizerConfig", "RealizerDataOptions"]
+__all__ = ["PrefixTimeSuffixLatentFlowRealizerConfig"]

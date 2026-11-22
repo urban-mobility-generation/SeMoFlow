@@ -31,7 +31,7 @@ def resolve_experiment_config(
         logger,
         config_path=Path(config_path) if config_path is not None else None,
         overrides=overrides,
-        experiment_name=cfg.experiment.name,
+        experiment_name=cfg.name,
     )
     return cfg
 

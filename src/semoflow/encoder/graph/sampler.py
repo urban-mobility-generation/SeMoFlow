@@ -68,36 +68,6 @@ def _take_random(
     return keys[choice]
 
 
-def balance_positive_edges_by_city(
-    positive_edges: torch.Tensor,
-    city_ids: torch.Tensor,
-    *,
-    seed: int = 0,
-) -> torch.Tensor:
-    if positive_edges.numel() == 0:
-        return positive_edges
-
-    edge_cities = city_ids[positive_edges[0]]
-    cities = torch.unique(edge_cities, sorted=True)
-    if cities.numel() < 2:
-        return positive_edges
-    counts = torch.stack([(edge_cities == city).sum() for city in cities])
-    per_city = int(counts.min().item())
-    if per_city <= 0:
-        return positive_edges[:, :0]
-
-    generator = torch.Generator(device="cpu").manual_seed(int(seed))
-    selected: list[torch.Tensor] = []
-    for city in cities.tolist():
-        rows = torch.nonzero(edge_cities == int(city), as_tuple=False).view(-1)
-        if rows.numel() > per_city:
-            rows = rows[
-                torch.randperm(rows.numel(), generator=generator)[:per_city]
-            ]
-        selected.append(rows)
-    return positive_edges[:, torch.cat(selected)]
-
-
 def build_graph_supervision(
     data: HeteroData,
     positive_edges: torch.Tensor,
@@ -228,7 +198,6 @@ def get_train_loader(
     seed: int = 0,
     rank: int = 0,
     world_size: int = 1,
-    city_balanced: bool = False,
 ) -> LinkNeighborLoader:
     fanout = resolve_num_neighbors(
         data, [10, 10] if num_neighbors is None else num_neighbors
@@ -253,21 +222,6 @@ def get_train_loader(
     else:
         pos_edge_index = torch.cat(
             [data[et].edge_index for et in target_edges], dim=1
-        )
-    if city_balanced:
-        city_ids = getattr(data["poi"], "city_id", None)
-        if city_ids is None:
-            raise ValueError(
-                "city_balanced supervision requires data['poi'].city_id"
-            )
-        pos_edge_index = balance_positive_edges_by_city(
-            pos_edge_index,
-            city_ids,
-            seed=seed,
-        )
-        logger.info(
-            "city-balanced temporal supervision positives=%d",
-            int(pos_edge_index.size(1)),
         )
     started = time.perf_counter()
     supervision = build_graph_supervision(

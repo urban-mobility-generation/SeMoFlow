@@ -1,14 +1,10 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from semoflow.utils.serialization import write_json_atomic
-
-if TYPE_CHECKING:
-    from semoflow.config.schemas.experiment_config import ExperimentConfig
 
 
 @dataclass(frozen=True)
@@ -64,13 +60,11 @@ class TokenizerArtifacts:
         self,
         *,
         status: str,
-        required: tuple[str, ...] = (),
-        skipped: tuple[str, ...] = (),
+        required: tuple[str, ...],
     ) -> None:
         payload = {
             "schema_version": 1,
             "status": status,
-            "skipped": list(skipped),
             "required": {
                 name: str(self.export_paths()[name]) for name in required
             },
@@ -103,18 +97,56 @@ class PreprocessingArtifacts:
             quality_scores=run_dir / "quality_scores.parquet",
         )
 
-    @classmethod
-    def from_config(cls, cfg: ExperimentConfig) -> PreprocessingArtifacts:
-        artifacts = cls.from_run_dir(
-            Path(cfg.output.output_dir).expanduser().resolve()
-        )
-        places_index = cfg.preprocessing.places_index.path
-        if places_index in (None, "", "null", "None"):
-            return artifacts
-        return replace(
-            artifacts,
-            places_index=Path(str(places_index)).expanduser().resolve(),
-        )
+
+@dataclass(frozen=True)
+class RunLayout:
+    """Where each stage of one experiment reads and writes, under ``root``."""
+
+    root: Path
+
+    @property
+    def preprocessing(self) -> PreprocessingArtifacts:
+        return PreprocessingArtifacts.from_run_dir(self.root / "preprocessing")
+
+    @property
+    def encoder_dir(self) -> Path:
+        return self.root / "encoder"
+
+    @property
+    def text_embeddings(self) -> Path:
+        return self.encoder_dir / "text" / "text_embeddings.npy"
+
+    @property
+    def graph_dir(self) -> Path:
+        return self.encoder_dir / "graph"
+
+    @property
+    def tokenizer(self) -> TokenizerArtifacts:
+        return TokenizerArtifacts.from_run_dir(self.root / "tokenization")
+
+    @property
+    def segments(self) -> Path:
+        return self.root / "segments.parquet"
+
+    @property
+    def planner_dataset(self) -> Path:
+        return self.root / "planner_dataset.pt"
+
+    @property
+    def planner_dir(self) -> Path:
+        return self.root / "planner"
+
+    @property
+    def bank(self) -> Path:
+        return self.root / "bank.pt"
+
+    @property
+    def realizer_dir(self) -> Path:
+        return self.root / "realizer"
+
+    @property
+    def evaluation_dir(self) -> Path:
+        return self.root / "evaluation"
 
 
-__all__ = ["PreprocessingArtifacts", "TokenizerArtifacts"]
+__all__ = ["PreprocessingArtifacts", "RunLayout", "TokenizerArtifacts"]

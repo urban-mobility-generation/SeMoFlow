@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Annotated
-
 import typer
 
 from semoflow.cli.common import (
@@ -32,29 +29,18 @@ app = typer.Typer(
 def preprocess_cmd(
     config: ConfigOpt = None,
     set_args: SetArgsOpt = None,
-    out_dir: Annotated[
-        Path | None,
-        typer.Option(
-            "--out-dir",
-            help="Output directory. Shortcut for --set output.output_dir=<path>.",
-        ),
-    ] = None,
     log_level: LogLevelOpt = "INFO",
     log_file: LogFileOpt = None,
 ) -> None:
-    from semoflow.config.artifacts import PreprocessingArtifacts
     from semoflow.preprocess.foursquare import run_foursquare_pipeline
 
-    overrides = list(set_args or [])
-    if out_dir is not None:
-        overrides.append(f"output.output_dir={out_dir}")
     cfg = resolve_cli_config(
-        config, overrides, log_level=log_level, log_file=log_file
+        config, set_args, log_level=log_level, log_file=log_file
     )
     with cli_run(
         cfg,
         phase="preprocessing",
-        output_dir=PreprocessingArtifacts.from_config(cfg).run_dir,
+        output_dir=cfg.layout.preprocessing.run_dir,
         log_level=log_level,
         log_file=log_file,
     ):

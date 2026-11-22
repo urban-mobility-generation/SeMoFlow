@@ -4,8 +4,6 @@ import math
 
 from torch import optim
 
-LR_SCHEDULES = ("constant", "cosine")
-
 
 def build_lr_scheduler(
     optimizer: optim.Optimizer,
@@ -38,4 +36,4 @@ def build_lr_scheduler(
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-__all__ = ["LR_SCHEDULES", "build_lr_scheduler"]
+__all__ = ["build_lr_scheduler"]

@@ -3,13 +3,6 @@ from __future__ import annotations
 import torch
 
 
-def sample_uniform_timesteps(
-    batch_size: int,
-    device: torch.device | str,
-) -> torch.Tensor:
-    return torch.rand(batch_size, device=device)
-
-
 def sample_logit_normal_timesteps(
     batch_size: int,
     device: torch.device | str,
@@ -71,6 +64,5 @@ __all__ = [
     "heun_step",
     "linear_interpolate",
     "sample_logit_normal_timesteps",
-    "sample_uniform_timesteps",
     "velocity_from_x0",
 ]

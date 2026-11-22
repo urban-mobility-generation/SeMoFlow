@@ -12,8 +12,6 @@ import yaml
 
 
 def normalize_value(value: object) -> object:
-    # Sparse evaluation panels can have undefined metrics (e.g. no returns).
-    # JSON has no NaN/Infinity literals; preserve missingness with null.
     if isinstance(value, float) and not math.isfinite(value):
         return None
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
@@ -46,7 +44,7 @@ def to_yaml_string(obj: object) -> str:
         normalize_value(obj),
         default_flow_style=False,
         allow_unicode=True,
-        sort_keys=True,
+        sort_keys=False,
     )
 
 

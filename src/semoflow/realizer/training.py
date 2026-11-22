@@ -14,6 +14,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, Sampler
 
+from semoflow.config.artifacts import RunLayout
 from semoflow.config.schemas.realizer_config import (
     PrefixTimeSuffixLatentFlowRealizerConfig,
 )
@@ -61,10 +62,8 @@ def _split_tensors(
     payload: dict[str, Any],
     path: Path,
     split: str,
-    max_samples: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    offset, cap = resolve_bank_split_window(payload, split, path=path)
-    count = cap if max_samples is None else min(cap, max_samples)
+    offset, count = resolve_bank_split_window(payload, split, path=path)
     if count <= 0:
         raise ValueError(f"realizer bank split {split!r} is empty")
     end = offset + count
@@ -178,10 +177,6 @@ class _DistributedLengthBucketBatchSampler(Sampler[list[int]]):
         if self.drop_uneven_batches:
             return batches // self.world_size
         return (batches + self.world_size - self.rank - 1) // self.world_size
-
-
-def _should_validate(epoch: int, *, epochs: int, val_every: int) -> bool:
-    return epoch % val_every == 0 or epoch == epochs
 
 
 def _distributed_context() -> tuple[bool, int, int]:
@@ -301,45 +296,25 @@ class BankSplit:
 
 def load_bank_splits(
     config: PrefixTimeSuffixLatentFlowRealizerConfig,
+    bank_path: Path,
     *,
     codebook_size: int,
 ) -> tuple[BankSplit, BankSplit]:
-    payload = load_bank_payload(config.bank_path)
-    limits = {"train": config.train_max_samples, "val": config.val_max_samples}
+    payload = load_bank_payload(bank_path)
     raw = {
-        split: _split_tensors(payload, config.bank_path, split, limit)
-        for split, limit in limits.items()
+        split: _split_tensors(payload, bank_path, split)
+        for split in ("train", "val")
     }
 
     splits = []
     for split, (codes, times, valid) in raw.items():
         city = (
-            _bank_city_ids(
-                payload, config.bank_path, split, valid, config.city_vocab
-            )
+            _bank_city_ids(payload, bank_path, split, valid, config.city_vocab)
             if config.city_vocab > 0
             else None
         )
         splits.append(BankSplit(codes, times, valid, city))
     return splits[0], splits[1]
-
-
-def _load_initialization(
-    config: PrefixTimeSuffixLatentFlowRealizerConfig, codebooks: torch.Tensor
-) -> dict[str, Any] | None:
-    if config.initialize_from is None:
-        return None
-    initialization = torch.load(
-        config.initialize_from, map_location="cpu", weights_only=False
-    )
-    source_codebooks = initialization.get("codebooks")
-    if not isinstance(source_codebooks, torch.Tensor) or not torch.equal(
-        source_codebooks.float(), codebooks
-    ):
-        raise ValueError(
-            "warm-start realizer checkpoint uses different codebooks"
-        )
-    return initialization
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,19 +340,12 @@ class _TailStats:
 
 def _tail_stats(
     config: PrefixTimeSuffixLatentFlowRealizerConfig,
-    initialization: dict[str, Any] | None,
     train: BankSplit,
     codebooks: torch.Tensor,
     *,
     device: torch.device,
 ) -> _TailStats:
-    """Train-split whitening statistics, or the warm-start parent's."""
-    if initialization is not None:
-        return _TailStats(
-            initialization["tail_mean"].float(),
-            initialization["tail_whitener"].float(),
-            initialization["tail_dewhitener"].float(),
-        )
+    """Train-split whitening statistics."""
     mean, whitener, dewhitener = compute_tail_whitening_stats(
         train.codes,
         train.valid.bool(),
@@ -444,13 +412,14 @@ def _build_loaders(
 
 def _candidate_bank(
     config: PrefixTimeSuffixLatentFlowRealizerConfig,
+    catalog_path: Path,
     train: BankSplit,
     codebooks: torch.Tensor,
     *,
     device: torch.device,
 ) -> CatalogCandidateBank:
     catalog_codes = _load_catalog_codes(
-        config.catalog_path, n_codebooks=int(codebooks.shape[0])
+        catalog_path, n_codebooks=int(codebooks.shape[0])
     )
     return CatalogCandidateBank.from_codes(
         catalog_codes,
@@ -464,10 +433,10 @@ def _candidate_bank(
 
 
 def _load_codebooks(
-    config: PrefixTimeSuffixLatentFlowRealizerConfig,
+    config: PrefixTimeSuffixLatentFlowRealizerConfig, path: Path
 ) -> SIDCodebookBundle:
     bundle = extract_codebook_bundle(
-        config.codebooks_path,
+        path,
         max_artifact_bytes=MAX_STANDALONE_CODEBOOK_ARTIFACT_BYTES,
     )
     if (
@@ -523,7 +492,7 @@ def _log_runtime(
     logger.info(
         "runtime world_size=%d per_rank_batch=%d global_batch=%d "
         "mixed_precision=%s grad_scaler=%s tf32=%s fused_optimizer=%s "
-        "val_every=%d workers=%d prefetch_factor=%d cpu_threads=%d",
+        "workers=%d prefetch_factor=%d cpu_threads=%d",
         world_size,
         config.batch_size,
         config.batch_size * world_size,
@@ -531,7 +500,6 @@ def _log_runtime(
         gradient_scaler,
         config.tf32,
         fused_optimizer,
-        config.val_every,
         config.num_workers,
         config.prefetch_factor,
         config.cpu_threads,
@@ -550,17 +518,12 @@ def _log_runtime(
     )
 
 
-def _optional_str(value: Path | None) -> str | None:
-    return None if value is None else str(value)
-
-
 def _tail_stats_record(
     config: PrefixTimeSuffixLatentFlowRealizerConfig,
     tail: dict[str, torch.Tensor],
     codebook_record: dict[str, Any],
     *,
     latent_dim: int,
-    warm_started: bool,
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -569,14 +532,7 @@ def _tail_stats_record(
         **tail,
         "normalization": "whitened",
         **codebook_record,
-        "source": (
-            str(config.initialize_from) if warm_started else "train_split_only"
-        ),
-        "statistics_source": (
-            "initialization_checkpoint"
-            if warm_started
-            else "adaptation_train_split"
-        ),
+        "source": "train_split_only",
     }
 
 
@@ -605,8 +561,6 @@ def _checkpoint_extra(
         "population_loss_weight": config.population_loss_weight,
         "catalog_prior_weight": config.catalog_prior_weight,
         "config": _jsonable(asdict(config)),
-        "initialize_from": _optional_str(config.initialize_from),
-        "optimizer_state_reused": False,
     }
 
 
@@ -614,31 +568,21 @@ def _log_epoch(
     epoch: int,
     *,
     train_loss: float,
-    val_loss: float | None,
+    val_loss: float,
     learning_rate: float,
     stale_validations: int,
 ) -> None:
-    if val_loss is None:
-        logger.info(
-            "latent suffix-flow epoch=%d train_loss=%.6f "
-            "val_loss=skipped lr=%.6g",
-            epoch,
-            train_loss,
-            learning_rate,
-        )
-    else:
-        logger.info(
-            "latent suffix-flow epoch=%d train_loss=%.6f "
-            "val_loss=%.6f lr=%.6g stale_validations=%d",
-            epoch,
-            train_loss,
-            val_loss,
-            learning_rate,
-            stale_validations,
-        )
+    logger.info(
+        "latent suffix-flow epoch=%d train_loss=%.6f "
+        "val_loss=%.6f lr=%.6g stale_validations=%d",
+        epoch,
+        train_loss,
+        val_loss,
+        learning_rate,
+        stale_validations,
+    )
 
 
-# Config settings copied verbatim into the training report.
 _REPORTED_SETTINGS = (
     "codebook_size",
     "prefix_depth",
@@ -656,14 +600,13 @@ _REPORTED_SETTINGS = (
     "min_lr",
     "early_stopping_patience",
     "early_stopping_min_delta",
-    "val_every",
     "num_workers",
     "prefetch_factor",
 )
 
 
 def train_prefix_time_suffix_latent_flow_realizer(
-    config: PrefixTimeSuffixLatentFlowRealizerConfig,
+    config: PrefixTimeSuffixLatentFlowRealizerConfig, layout: RunLayout
 ) -> dict[str, Any]:
     set_seed_all(config.seed)
     torch.set_num_threads(config.cpu_threads)
@@ -674,16 +617,18 @@ def train_prefix_time_suffix_latent_flow_realizer(
         raise ValueError("distributed latent realizer training requires CUDA")
     _configure_cuda_math(device=device, tf32=config.tf32)
 
-    bundle = _load_codebooks(config)
+    tokenizer, output_dir = layout.tokenizer, layout.realizer_dir
+    bundle = _load_codebooks(config, tokenizer.tokenizer_codebooks)
     config = replace(config, codebook_size=bundle.codebook_size)
-    train, val = load_bank_splits(config, codebook_size=bundle.codebook_size)
+    train, val = load_bank_splits(
+        config, layout.bank, codebook_size=bundle.codebook_size
+    )
     num_codebooks = int(train.codes.shape[-1])
     if bundle.n_codebooks != num_codebooks:
         raise ValueError("codebooks and bank have different SID widths")
     codebooks = bundle.codebooks.float()
     latent_dim = int(codebooks.shape[-1])
     codebook_metadata = codebook_bundle_metadata(bundle)
-    initialization = _load_initialization(config, codebooks)
     train_loader, val_loader = _build_loaders(
         config,
         train,
@@ -694,19 +639,13 @@ def train_prefix_time_suffix_latent_flow_realizer(
         world_size=world_size,
     )
 
-    tail = _tail_stats(
-        config, initialization, train, codebooks, device=device
-    ).to(device)
-    candidate_bank = _candidate_bank(config, train, codebooks, device=device)
+    tail = _tail_stats(config, train, codebooks, device=device).to(device)
+    candidate_bank = _candidate_bank(
+        config, tokenizer.placekey_lookup, train, codebooks, device=device
+    )
     model: torch.nn.Module = _build_model(
         config, codebooks, max_seq_len=int(train.codes.shape[1])
     ).to(device)
-    if initialization is not None:
-        model.load_state_dict(initialization["model_state_dict"], strict=True)
-        if is_main:
-            logger.info(
-                "warm-started realizer from %s", config.initialize_from
-            )
     if config.compile and device.type == "cuda":
         if is_main:
             logger.info("torch.compile enabled backend=inductor dynamic=True")
@@ -752,8 +691,8 @@ def train_prefix_time_suffix_latent_flow_realizer(
         "codebook_fields": list(bundle.code_fields),
         "codebook_metadata": codebook_metadata,
     }
-    tail_stats_path = config.output_dir / "tail_stats.pt"
-    config.output_dir.mkdir(parents=True, exist_ok=True)
+    tail_stats_path = output_dir / "tail_stats.pt"
+    output_dir.mkdir(parents=True, exist_ok=True)
     if is_main:
         torch.save(
             _tail_stats_record(
@@ -761,7 +700,6 @@ def train_prefix_time_suffix_latent_flow_realizer(
                 tail_payload,
                 codebook_record,
                 latent_dim=latent_dim,
-                warm_started=initialization is not None,
             ),
             tail_stats_path,
         )
@@ -779,7 +717,6 @@ def train_prefix_time_suffix_latent_flow_realizer(
         tail_mean=tail.mean,
         tail_whitener=tail.whitener,
         candidate_bank=candidate_bank,
-        lognormal_t=config.lognormal_t,
         catalog_loss_weight=config.catalog_loss_weight,
         catalog_temperature=config.catalog_temperature,
         endpoint_loss_weight=config.endpoint_loss_weight,
@@ -794,10 +731,10 @@ def train_prefix_time_suffix_latent_flow_realizer(
         autocast=autocast,
         reduce_across_ranks=distributed,
     )
-    best_path = config.output_dir / "best.pt"
-    last_path = config.output_dir / "last.pt"
+    best_path = output_dir / "best.pt"
+    last_path = output_dir / "last.pt"
     best_val = float("inf")
-    history: list[dict[str, float | None]] = []
+    history: list[dict[str, float]] = []
     early_stopper = EarlyStopper(
         patience=config.early_stopping_patience,
         min_delta=config.early_stopping_min_delta,
@@ -811,14 +748,8 @@ def train_prefix_time_suffix_latent_flow_realizer(
             scheduler=scheduler,
             scaler=scaler,
         )
-        val_loss: float | None = None
-        if _should_validate(
-            epoch, epochs=config.epochs, val_every=config.val_every
-        ):
-            validation_model = (
-                model.module if isinstance(model, DDP) else model
-            )
-            val_loss = run_epoch(validation_model, val_loader, scaler=None)
+        validation_model = model.module if isinstance(model, DDP) else model
+        val_loss = run_epoch(validation_model, val_loader, scaler=None)
         learning_rate = float(optimizer.param_groups[0]["lr"])
         history.append(
             {
@@ -828,11 +759,9 @@ def train_prefix_time_suffix_latent_flow_realizer(
                 "learning_rate": learning_rate,
             }
         )
-        improved = stop_training = False
-        if val_loss is not None:
-            decision = early_stopper.step(val_loss, epoch=epoch)
-            improved, stop_training = decision.improved, decision.should_stop
-            best_val = early_stopper.best_value
+        decision = early_stopper.step(val_loss, epoch=epoch)
+        improved, stop_training = decision.improved, decision.should_stop
+        best_val = early_stopper.best_value
         if is_main:
             _log_epoch(
                 epoch,
@@ -848,10 +777,8 @@ def train_prefix_time_suffix_latent_flow_realizer(
                 epoch=epoch,
                 extra=checkpoint_extra,
             )
-            save(
-                last_path, val_loss=best_val if val_loss is None else val_loss
-            )
-            if val_loss is not None and improved:
+            save(last_path, val_loss=val_loss)
+            if improved:
                 save(best_path, val_loss=val_loss)
         if distributed:
             best_tensor = torch.tensor(best_val, device=device)
@@ -883,7 +810,7 @@ def train_prefix_time_suffix_latent_flow_realizer(
         "num_codebooks": num_codebooks,
         "codebook_metadata": codebook_metadata,
         "latent_dim": latent_dim,
-        "catalog_path": str(config.catalog_path),
+        "catalog_path": str(tokenizer.placekey_lookup),
         "parameter_count": unwrap_ddp(model).count_parameters(),
         "world_size": world_size,
         "per_rank_batch_size": config.batch_size,
@@ -894,13 +821,12 @@ def train_prefix_time_suffix_latent_flow_realizer(
         "epochs_completed": len(history),
         "best_val_loss": best_val,
         "history": history,
-        "bank_path": str(config.bank_path),
-        "codebooks_path": str(config.codebooks_path),
+        "bank_path": str(layout.bank),
+        "codebooks_path": str(tokenizer.tokenizer_codebooks),
         "tail_stats_path": str(tail_stats_path),
-        "initialize_from": _optional_str(config.initialize_from),
     }
     if is_main:
-        write_json(config.output_dir / "metrics.json", result)
+        write_json(output_dir / "metrics.json", result)
     return result
 
 

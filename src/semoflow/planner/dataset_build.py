@@ -6,7 +6,7 @@ from pathlib import Path
 import polars as pl
 import torch
 
-from semoflow.config.artifacts import TokenizerArtifacts
+from semoflow.config.artifacts import RunLayout
 from semoflow.config.schemas.planner_config import (
     OccurrencePlannerDataOptions,
 )
@@ -25,7 +25,6 @@ from semoflow.tokenization.decoding.codebooks import extract_codebook_bundle
 from semoflow.tokenization.token_space import sid_code_columns
 
 OBSERVATION_WINDOW_MINUTES = 7.0 * 24.0 * 60.0
-# SID levels the planner generates; the realizer completes the rest.
 PREFIX_DEPTH = 3
 
 
@@ -132,7 +131,6 @@ def _materialize_split(
         lookup_rows = [lookup[int(value)] for value in row["placekey_id"]]
         length = len(lookup_rows)
         lengths[row_index] = length
-        # A week's visits all fall in one city.
         city_ids[row_index] = lookup_rows[0][1]
         prefixes[row_index, :length] = torch.stack(
             [prefix for prefix, _ in lookup_rows]
@@ -151,18 +149,19 @@ def _materialize_split(
 
 def build_planner_data(
     data: OccurrencePlannerDataOptions,
+    layout: RunLayout,
     *,
-    dataset_path: Path,
     force: bool = False,
 ) -> dict[str, object]:
     """Build the weekly segments, then the planner dataset from them.
 
     Weeks longer than ``max_occurrences`` keep their first visits.
     """
-    tokenizer = TokenizerArtifacts.from_run_dir(data.tokenization_dir)
+    tokenizer = layout.tokenizer
+    dataset_path = layout.planner_dataset
     segments = build_weekly_segment_cache(
         stays_path=tokenizer.augmented_processed_visits,
-        output=data.segments_path,
+        output=layout.segments,
         min_active_days=data.min_active_days,
         force=force,
     )
@@ -173,20 +172,16 @@ def build_planner_data(
     lookup, legal_prefixes, catalog_city_ids, city_legal_prefix_mask = (
         _load_prefix_lookup(lookup_path, prefix_depth=PREFIX_DEPTH)
     )
-    centroids = (
-        (None, None)
-        if data.places_path is None
-        else _load_prefix_centroids(
-            lookup_path,
-            data.places_path,
-            legal_prefixes=legal_prefixes,
-            prefix_depth=PREFIX_DEPTH,
-        )
+    centroids = _load_prefix_centroids(
+        lookup_path,
+        layout.preprocessing.places_index,
+        legal_prefixes=legal_prefixes,
+        prefix_depth=PREFIX_DEPTH,
     )
 
     length = pl.col("placekey_id").list.len()
     frame = (
-        pl.scan_parquet(data.segments_path)
+        pl.scan_parquet(layout.segments)
         .filter(pl.col("_split").is_in(["train", "val"]))
         .select("_split", "placekey_id", "_timestamps")
         .collect()
@@ -238,11 +233,7 @@ def build_planner_data(
             "legal_prefixes": int(legal_prefixes.shape[0]),
             "truncated_rows": truncated_rows,
             "mean_length": float(frame.select(length.mean()).item()),
-            "centroid_coverage": (
-                None
-                if centroids[1] is None
-                else float(centroids[1].float().mean())
-            ),
+            "centroid_coverage": float(centroids[1].float().mean()),
         },
     }
 

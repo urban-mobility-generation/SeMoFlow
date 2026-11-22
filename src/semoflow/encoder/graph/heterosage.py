@@ -46,7 +46,6 @@ class HeteroSAGE(nn.Module):
             self.convs.append(
                 HeteroConv(
                     {
-                        # SAGEConv does not use the optional edge_update hook.
                         edge_type: SAGEConv(  # ty: ignore[call-non-callable]
                             (hidden_dim, hidden_dim), out_channels
                         )

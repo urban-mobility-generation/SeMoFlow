@@ -1,7 +1,6 @@
 """Joint temporal-spatial JSDs over weekly visit sequences.
 
-Two joint histograms compare generated and real visits on one shared grid,
-so SeMoFlow and every baseline are scored by the same definition:
+Two joint histograms compare generated and real visits on one shared grid:
 
 * **Time-location:** each active visit's weekly time token (Monday-Sunday x
   the six unequal circadian intervals of ``training/circadian.py``, 42 tokens)
@@ -16,7 +15,7 @@ so SeMoFlow and every baseline are scored by the same definition:
 
 JSDs use natural logarithms with no pseudocounts and weight visits or pairs
 equally. The marginals of the same histograms are reported alongside each
-joint value. Definitions: docs/research/design/rebuttal_diagnostics_2026-11-09.md.
+joint value.
 """
 
 from __future__ import annotations
@@ -41,8 +40,6 @@ DISTANCE_EDGES_KM = np.array(
     [0, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, np.inf]
 )
 EARTH_RADIUS_KM = 6371.0088
-# Bins 0..len(edges)-2 are the finite intervals; the last index is the
-# negative-gap (resp. missing-distance) category.
 N_GAP_BINS = len(GAP_EDGES_HOURS)
 N_DISTANCE_BINS = len(DISTANCE_EDGES_KM)
 
@@ -178,8 +175,6 @@ def temporal_spatial_jsd(
     generated_cells = np.asarray(generated.geohash, dtype=object)[
         generated_valid
     ]
-    # Cell 0 is the explicit missing-location cell; the remaining cells are the
-    # union observed on either side, so one-sided cells count in the JSD.
     vocabulary = {
         cell: index + 1
         for index, cell in enumerate(
@@ -232,7 +227,6 @@ def temporal_spatial_jsd(
             "time_tokens": "weekday x six circadian intervals (42)",
             "location": "geohash_5 plus a missing cell",
             "gap": "token-midpoint hours (quantized proxy)",
-            # Finite left-closed edges; the last interval is open-ended.
             "gap_edges_hours": GAP_EDGES_HOURS[:-1].tolist(),
             "distance_edges_km": DISTANCE_EDGES_KM[:-1].tolist(),
             "units": "natural-log JSD in nats",

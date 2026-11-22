@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 import polars as pl
@@ -81,7 +81,6 @@ def encode_texts(
     device: str,
     batch_size: int,
     precision: str = "float32",
-    backend: str = "torch",
 ) -> np.ndarray:
     dtypes = {
         "float32": torch.float32,
@@ -92,18 +91,10 @@ def encode_texts(
         raise ValueError(
             "text precision must be float32, float16, or bfloat16"
         )
-    if backend not in {"torch", "onnx"}:
-        raise ValueError("text backend must be 'torch' or 'onnx'")
-    if backend == "onnx" and precision != "float32":
-        raise ValueError("ONNX text encoding requires float32 precision")
     devices = _parse_devices(device)
     multi_gpu = len(devices) > 1
 
     if multi_gpu:
-        if backend != "torch":
-            raise ValueError(
-                "multi-device text encoding requires the torch backend"
-            )
         logger.info(
             "multi-GPU text encoding  devices=%s  texts=%d",
             devices,
@@ -125,24 +116,9 @@ def encode_texts(
             encoder.stop_multi_process_pool(pool)
         return np.asarray(emb, dtype=np.float32)
 
-    single_device = devices[0]
-    if backend == "onnx":
-        m_kwargs: dict[str, Any] = {
-            "provider": "CUDAExecutionProvider"
-            if single_device.startswith("cuda")
-            else "CPUExecutionProvider"
-        }
-        if ":" in single_device:
-            m_kwargs["provider_options"] = {
-                "device_id": single_device.split(":")[1]
-            }
-        encoder = SentenceTransformer(
-            model_name, backend="onnx", model_kwargs=m_kwargs
-        )
-    else:
-        encoder = SentenceTransformer(model_name, device=single_device).to(
-            dtype=dtypes[precision]
-        )
+    encoder = SentenceTransformer(model_name, device=devices[0]).to(
+        dtype=dtypes[precision]
+    )
     return np.asarray(
         encoder.encode(
             texts,
@@ -155,9 +131,8 @@ def encode_texts(
 
 
 def build_text_embeddings(
-    places: pl.DataFrame, config: TextEncoderConfig
+    places: pl.DataFrame, config: TextEncoderConfig, *, path: Path
 ) -> np.ndarray:
-    path = Path(config.out_path)
     if path.exists():
         try:
             cached = load_poi_embedding_artifact(path, kind="text").align_to(
@@ -181,7 +156,6 @@ def build_text_embeddings(
         device=config.device,
         batch_size=int(config.batch_size),
         precision=config.precision,
-        backend=config.backend,
     )
     write_poi_embedding_artifact(
         path,

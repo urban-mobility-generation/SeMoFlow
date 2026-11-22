@@ -51,9 +51,6 @@ def sample_occurrence_planner(
     device: str = "cpu",
     seed: int = 0,
     temperature: float = 1.0,
-    length_temperature: float | None = None,
-    gap_temperature: float | None = None,
-    prefix_temperature: float | None = None,
     route_temperature: float | None = None,
     force: bool = False,
 ) -> OccurrencePlannerSampleResult:
@@ -101,30 +98,20 @@ def sample_occurrence_planner(
                 model,
                 city_ids=torch.full((stop - start,), city_id),
                 temperature=temperature,
-                length_temperature=length_temperature,
-                gap_temperature=gap_temperature,
-                prefix_temperature=prefix_temperature,
                 route_temperature=route_temperature,
                 seed=seed + start,
             )
         )
         logger.info("sampling progress samples=%d/%d", stop, num_samples)
 
-    temperatures = {
-        "length_temperature": length_temperature,
-        "gap_temperature": gap_temperature,
-        "prefix_temperature": prefix_temperature,
-        "route_temperature": route_temperature,
-    }
     save_occurrence_planner_samples(
         output_path,
         **_concat_padded(chunks),
         seed=seed,
         temperature=temperature,
-        **{
-            name: temperature if value is None else value
-            for name, value in temperatures.items()
-        },
+        route_temperature=(
+            temperature if route_temperature is None else route_temperature
+        ),
         force=force,
     )
     logger.info(

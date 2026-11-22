@@ -6,7 +6,8 @@ import logging
 from pathlib import Path
 from typing import Any, cast
 
-from semoflow.config.artifacts import TokenizerArtifacts
+from semoflow.config.artifacts import RunLayout
+from semoflow.config.constants import CITY_ID
 from semoflow.config.schemas.evaluation_config import EvaluationConfig
 from semoflow.metrics.city_inputs import (
     GROUNDING_NAME,
@@ -27,41 +28,45 @@ logger = logging.getLogger(__name__)
 
 
 def evaluate_cities(
-    settings: EvaluationConfig, *, force: bool = False
+    settings: EvaluationConfig,
+    layout: RunLayout,
+    cities: list[str],
+    *,
+    force: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Sample, compose, and score trajectories for each configured city.
 
     The city banks keep weeks up to the realizer's sequence length, as its
     training bank did.
     """
-    tokenizer = TokenizerArtifacts.from_run_dir(settings.tokenization_dir)
-    max_events = realizer_max_events(settings.realizer_checkpoint)
+    max_events = realizer_max_events(layout.realizer_dir / "best.pt")
     return {
         name: _evaluate_city(
             settings,
-            city_id,
-            tokenizer=tokenizer,
+            layout,
+            CITY_ID[name],
             max_events=max_events,
-            output_dir=settings.output_dir / name,
+            output_dir=layout.evaluation_dir / name,
             force=force,
         )
-        for name, city_id in settings.cities.items()
+        for name in cities
     }
 
 
 def _evaluate_city(
     settings: EvaluationConfig,
+    layout: RunLayout,
     city_id: int,
     *,
-    tokenizer: TokenizerArtifacts,
     max_events: int,
     output_dir: Path,
     force: bool,
 ) -> dict[str, Any]:
     logger.info("evaluating city_id=%d output_dir=%s", city_id, output_dir)
+    tokenizer = layout.tokenizer
     extract_city_inputs(
         city_id,
-        segments=settings.segments_path,
+        segments=layout.segments,
         lookup=tokenizer.placekey_lookup,
         grounding_index=tokenizer.grounding_index,
         output_dir=output_dir,
@@ -83,12 +88,11 @@ def _evaluate_city(
         prior = output_dir / "candidate_prior.json"
         write_json(prior, build_prior(bank))
 
-    # One plan per reference week.
     num_samples = row_counts[settings.reference_split]
     plans = output_dir / "plans.pt"
     sampling = settings.sampling
     sample_occurrence_planner(
-        checkpoint_path=settings.planner_checkpoint,
+        checkpoint_path=layout.planner_dir / "best.pt",
         output_path=plans,
         num_samples=num_samples,
         city_id=city_id,
@@ -101,13 +105,13 @@ def _evaluate_city(
     )
     output = output_dir / "composition.json"
     report = evaluate_planner_realizer(
-        realizer_checkpoint=settings.realizer_checkpoint,
+        realizer_checkpoint=layout.realizer_dir / "best.pt",
         planner_samples=plans,
         bank=bank,
         codebooks=tokenizer.tokenizer_codebooks,
         lookup=output_dir / LOOKUP_NAME,
         grounding_index=output_dir / GROUNDING_NAME,
-        places=settings.places_path,
+        places=layout.preprocessing.places_index,
         output=output,
         max_samples=num_samples,
         batch_size=composition.batch_size,

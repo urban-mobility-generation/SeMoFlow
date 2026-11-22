@@ -7,6 +7,7 @@ import numpy as np
 import polars as pl
 import torch
 
+from semoflow.config.artifacts import RunLayout
 from semoflow.config.schemas.realizer_config import (
     PrefixTimeSuffixLatentFlowRealizerConfig,
 )
@@ -259,20 +260,14 @@ def bank_split_city_ids(
 
 
 def build_realizer_data(
-    settings: PrefixTimeSuffixLatentFlowRealizerConfig,
+    settings: PrefixTimeSuffixLatentFlowRealizerConfig, layout: RunLayout
 ) -> dict[str, object]:
-    """Build the bank ``settings`` trains on, keyed by its catalog lookup."""
-    data, lookup = settings.data, settings.catalog_path
-    if data is None or lookup is None:
-        raise ValueError(
-            "building the realizer bank needs realizer.data and "
-            "realizer.catalog_path"
-        )
+    """Build the bank the realizer trains on, keyed by the tokenizer lookup."""
     return build_bank(
-        lookup_path=lookup,
-        segments_path=data.segments_path,
-        output_path=settings.bank_path,
-        max_events=data.max_events,
+        lookup_path=layout.tokenizer.placekey_lookup,
+        segments_path=layout.segments,
+        output_path=layout.bank,
+        max_events=settings.max_events,
     )
 
 

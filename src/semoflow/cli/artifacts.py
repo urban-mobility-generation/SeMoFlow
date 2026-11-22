@@ -13,49 +13,45 @@ from semoflow.cli.common import (
 )
 
 app = typer.Typer(
-    help="Derive and assemble identity-keyed SeMoFlow artifacts.",
+    help="Build a stage's training data from the tokenizer outputs.",
     no_args_is_help=True,
     add_completion=False,
 )
 
 
-@app.callback()
-def _group() -> None:
-    """Keep `build` a named subcommand even though it is the only one."""
-
-
 @app.command(
-    "build",
-    help=(
-        "Build a stage's training data from its config: the weekly segments "
-        "and planner dataset for a planner config, or the bank for a "
-        "realizer config."
-    ),
+    "planner",
+    help="Build the weekly segments and the planner dataset.",
 )
-def build_cmd(
+def planner_data_cmd(
     config: ConfigOpt = None,
     set_args: SetArgsOpt = None,
     force: ForceOpt = False,
     log_level: LogLevelOpt = "INFO",
 ) -> None:
     from semoflow.planner.dataset_build import build_planner_data
+
+    cfg = resolve_cli_config(config, set_args, log_level=log_level)
+    with bad_parameter_on(FileExistsError, OSError, TypeError, ValueError):
+        echo_json(
+            build_planner_data(cfg.planner.data, cfg.layout, force=force)
+        )
+
+
+@app.command(
+    "realizer",
+    help="Build the realizer bank from the weekly segments.",
+)
+def realizer_data_cmd(
+    config: ConfigOpt = None,
+    set_args: SetArgsOpt = None,
+    log_level: LogLevelOpt = "INFO",
+) -> None:
     from semoflow.realizer.bank import build_realizer_data
 
     cfg = resolve_cli_config(config, set_args, log_level=log_level)
     with bad_parameter_on(FileExistsError, OSError, TypeError, ValueError):
-        if cfg.planner is not None and cfg.planner.data is not None:
-            result = build_planner_data(
-                cfg.planner.data,
-                dataset_path=cfg.planner.dataset_path,
-                force=force,
-            )
-        elif cfg.realizer is not None and cfg.realizer.data is not None:
-            result = build_realizer_data(cfg.realizer)
-        else:
-            raise ValueError(
-                "--config must define planner.data or realizer.data"
-            )
-    echo_json(result)
+        echo_json(build_realizer_data(cfg.realizer, cfg.layout))
 
 
 def main() -> None:

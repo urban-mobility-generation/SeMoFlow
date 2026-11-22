@@ -18,7 +18,6 @@ Rows are cut at the horizon: events up to and including the first one at
 ``horizon_hours`` are kept and the rest dropped, so clamped arrival times do
 not create artificial zero-hour returns. Missing, non-finite, decreasing or
 beyond-horizon clocks raise; callers report such panels as unavailable.
-Definition: docs/research/design/elapsed_time_recurrence_2026-11-11.md.
 """
 
 from __future__ import annotations

@@ -19,6 +19,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
+from semoflow.config.artifacts import RunLayout
 from semoflow.config.schemas.planner_config import (
     OccurrencePlannerArchitecture,
     OccurrencePlannerTrainingOptions,
@@ -47,10 +48,6 @@ from semoflow.planner.data import (
 from semoflow.planner.legality import LegalPrefixIndex
 from semoflow.planner.loss import occurrence_planner_loss
 from semoflow.planner.model import OccurrenceARPlanner
-from semoflow.planner.warm_start import (
-    PlannerWarmStart,
-    apply_planner_warm_start,
-)
 from semoflow.training.utils.distributed import find_free_port
 from semoflow.training.utils.early_stopping import EarlyStopper
 from semoflow.training.utils.lr_schedule import build_lr_scheduler
@@ -435,7 +432,7 @@ def _primary_split_nll(
     return _broadcast_metrics(metrics, distributed)
 
 
-_OUTPUT_NAMES = ("best.pt", "last.pt", "metrics.json", "warm_start.json")
+_OUTPUT_NAMES = ("best.pt", "last.pt", "metrics.json")
 
 
 def _check_gpu_list(device_ids: list[int]) -> None:
@@ -454,21 +451,13 @@ def _check_gpu_list(device_ids: list[int]) -> None:
 
 
 def check_planner_settings(
-    settings: PlannerTrainingConfig, *, force: bool = False
+    settings: PlannerTrainingConfig, layout: RunLayout, *, force: bool = False
 ) -> None:
     """Fail fast on unusable GPUs or outputs that would be overwritten."""
     _, device_ids = parse_device_spec(settings.training.device)
     if device_ids:
         _check_gpu_list(device_ids)
-    output_dir = Path(settings.output_dir)
-    if (
-        settings.initialize_from is not None
-        and Path(settings.initialize_from).resolve().parent
-        == output_dir.resolve()
-    ):
-        raise ValueError(
-            "the warm-start checkpoint must not live in the output directory"
-        )
+    output_dir = layout.planner_dir
     existing = [
         output_dir / name
         for name in _OUTPUT_NAMES
@@ -483,6 +472,7 @@ def check_planner_settings(
 
 def train_planner(
     settings: PlannerTrainingConfig,
+    layout: RunLayout,
     *,
     force: bool = False,
     log_level: str = "INFO",
@@ -491,9 +481,9 @@ def train_planner(
     _, device_ids = parse_device_spec(settings.training.device)
     if len(device_ids) > 1 and not settings.training.distributed:
         return train_occurrence_planner_on_devices(
-            settings, device_ids, force=force, log_level=log_level
+            settings, layout, device_ids, force=force, log_level=log_level
         )
-    return train_occurrence_planner(settings, force=force)
+    return train_occurrence_planner(settings, layout, force=force)
 
 
 def _catalog_tensors(
@@ -504,7 +494,7 @@ def _catalog_tensors(
     if config.use_distance_prior and dataset.legal_prefix_centroids is None:
         raise ValueError(
             "architecture.use_distance_prior requires a planner dataset "
-            "built with planner.data.places_path"
+            "whose places carry coordinates"
         )
     return {
         "legal_prefixes": dataset.legal_prefixes,
@@ -649,29 +639,24 @@ def _log_epoch(
 
 
 def train_occurrence_planner(
-    settings: PlannerTrainingConfig, *, force: bool = False
+    settings: PlannerTrainingConfig, layout: RunLayout, *, force: bool = False
 ) -> OccurrencePlannerTrainResult:
     options, seed = settings.training, settings.seed
-    warm_start = (
-        None
-        if settings.initialize_from is None
-        else PlannerWarmStart(checkpoint=settings.initialize_from)
-    )
-    dataset = load_occurrence_planner_dataset(settings.dataset_path)
+    dataset = load_occurrence_planner_dataset(layout.planner_dataset)
     if int(os.environ.get("RANK", "0")) == 0:
         logger.info(
             "loaded planner dataset  path=%s  train=%d  validation=%d  "
             "codebook_size=%d  gap_vocab=%d",
-            settings.dataset_path,
+            layout.planner_dataset,
             dataset.train.size,
             dataset.validation.size,
             dataset.config.codebook_size,
             dataset.config.gap_vocab,
         )
     config = _planner_config(dataset.config, settings.architecture)
-    check_planner_settings(settings, force=force)
-    output_dir = Path(settings.output_dir)
-    best_path, last_path, metrics_path, warm_start_path = (
+    check_planner_settings(settings, layout, force=force)
+    output_dir = layout.planner_dir
+    best_path, last_path, metrics_path = (
         output_dir / name for name in _OUTPUT_NAMES
     )
 
@@ -682,27 +667,6 @@ def train_occurrence_planner(
     set_seed_all(seed)
     catalog = _catalog_tensors(config, dataset)
     model = OccurrenceARPlanner(config, **catalog).to(device)
-    warm_start_report = (
-        None
-        if warm_start is None
-        else apply_planner_warm_start(model, warm_start)
-    )
-    if warm_start_report is not None and distributed.is_primary:
-        logger.info(
-            "warm started from %s  source_cities=%s  inherited_cities=%s  "
-            "zero_initialized_cities=%s  source_prefixes=%d  "
-            "target_prefixes=%d  catalog_changed=%s",
-            warm_start_report.checkpoint,
-            list(warm_start_report.source_city_ids),
-            list(warm_start_report.inherited_city_ids),
-            list(warm_start_report.zero_initialized_city_ids),
-            warm_start_report.source_legal_prefix_count,
-            warm_start_report.target_legal_prefix_count,
-            warm_start_report.catalog_changed,
-        )
-        write_json_atomic(
-            warm_start_path, warm_start_report.to_dict(), force=force
-        )
     if options.compile_model:
         model.compile(
             backend=options.compile_backend,
@@ -854,11 +818,6 @@ def train_occurrence_planner(
             final_train_metrics=final_train_metrics,
             final_validation_metrics=validation_metrics,
             history=history,
-            warm_start=(
-                None
-                if warm_start_report is None
-                else warm_start_report.to_dict()
-            ),
             force=force,
         )
         logger.info(
@@ -893,6 +852,7 @@ def _train_occurrence_planner_spawn_worker(
     device_ids: list[int],
     port: int,
     settings: PlannerTrainingConfig,
+    layout: RunLayout,
     log_level: str,
     log_file: Path | None,
     force: bool,
@@ -918,11 +878,14 @@ def _train_occurrence_planner_spawn_worker(
     os.environ["LOCAL_RANK"] = str(rank)
     device_spec = f"[{','.join(str(device_id) for device_id in device_ids)}]"
     training = replace(settings.training, device=device_spec, distributed=True)
-    train_occurrence_planner(replace(settings, training=training), force=force)
+    train_occurrence_planner(
+        replace(settings, training=training), layout, force=force
+    )
 
 
 def train_occurrence_planner_on_devices(
     settings: PlannerTrainingConfig,
+    layout: RunLayout,
     device_ids: list[int],
     *,
     force: bool = False,
@@ -941,6 +904,7 @@ def train_occurrence_planner_on_devices(
             device_ids,
             port,
             settings,
+            layout,
             log_level,
             get_configured_log_file(),
             force,
@@ -949,7 +913,7 @@ def train_occurrence_planner_on_devices(
         join=True,
     )
 
-    output_dir = Path(settings.output_dir)
+    output_dir = layout.planner_dir
     metrics_path = output_dir / "metrics.json"
     metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
     return OccurrencePlannerTrainResult(
@@ -972,7 +936,6 @@ def _write_metrics_json(
     final_train_metrics: _NLLMetrics,
     final_validation_metrics: _NLLMetrics,
     history: list[dict[str, float]],
-    warm_start: dict[str, object] | None,
     force: bool,
 ) -> None:
     payload: dict[str, object] = {
@@ -982,8 +945,6 @@ def _write_metrics_json(
         **_prefixed_metrics("final_validation", final_validation_metrics),
         "epochs": history,
     }
-    if warm_start is not None:
-        payload["warm_start"] = warm_start
     write_json_atomic(path, payload, force=force)
 
 

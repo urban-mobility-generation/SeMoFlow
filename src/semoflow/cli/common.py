@@ -36,14 +36,17 @@ ConfigOpt = Annotated[
         "--config",
         exists=True,
         dir_okay=False,
-        help="Path to experiment YAML (under configs/).",
+        help="Experiment YAML, for example configs/foursquare.yaml.",
     ),
 ]
 SetArgsOpt = Annotated[
     list[str] | None,
     typer.Option(
         "--set",
-        help="Override a config field: section.field=value. May be repeated.",
+        help=(
+            "Override a config field, for example run_dir=/data/run or "
+            "planner.training.epochs=20. May be repeated."
+        ),
     ),
 ]
 LogLevelOpt = Annotated[
@@ -128,7 +131,6 @@ def cli_run(
     *,
     phase: str,
     output_dir: Path,
-    config_phase: str | None = None,
     device: str | None = None,
     seed: int | None = None,
     log_level: str = "INFO",
@@ -150,18 +152,18 @@ def cli_run(
         )
     log_run_start(
         logger,
-        name=cfg.experiment.name,
+        name=cfg.name,
         phase=phase,
         output_dir=output_dir,
         device=device,
         seed=seed,
     )
     config_path = output_dir / RESOLVED_CONFIG_NAME
-    cfg.save_yaml(config_path, phase=config_phase or phase)
+    cfg.save_yaml(config_path)
     logger.info("Resolved config written: %s", config_path)
     manifest = write_run_manifest(
         output_dir,
-        experiment=cfg.experiment.name,
+        experiment=cfg.name,
         phase=phase,
         config_path=config_path,
         device=device,

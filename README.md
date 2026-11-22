@@ -67,7 +67,7 @@ data/foursquare_global_2015/
 ```
 
 ```bash
-uv run semoflow-preprocess --config configs/foursquare/preprocess.yaml
+uv run semoflow-preprocess --config configs/foursquare.yaml
 ```
 
 This prepares **Los Angeles, Washington DC, Atlanta, San Francisco, and
@@ -75,48 +75,48 @@ Milwaukee** in `outputs/preprocessing/`: visits, the POI catalog, and quality sc
 
 ## Training
 
-Run the stages in order from the repository root. All recipes are in
-[`configs/foursquare/`](configs/foursquare/).
-
-| Stage | Output |
-| --- | --- |
-| 1. Encoders + tokenizer | `outputs/tokenization/` |
-| 2. Planner | `outputs/planner/best.pt` |
-| 3. Realizer | `outputs/realizer/best.pt` |
-
-Configs use `cuda:0`. Select a physical GPU before running the commands:
+One file, [`configs/foursquare.yaml`](configs/foursquare.yaml), holds the
+whole experiment: a section per stage, and `run_dir`, under which every stage
+reads and writes its artifacts. Run the stages in order from the repository
+root, passing the same file to each:
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0
+C=configs/foursquare.yaml
+
+uv run semoflow-train encoder --config $C
+uv run semoflow-train tokenizer --config $C
+
+uv run semoflow-artifacts planner --config $C
+uv run semoflow-train planner --config $C
+
+uv run semoflow-artifacts realizer --config $C
+uv run semoflow-train realizer --config $C
 ```
 
-### 1. Encoders and tokenizer
+| Stage | Output under `run_dir` (default `outputs/`) |
+| --- | --- |
+| Preprocessing | `preprocessing/` |
+| Encoders | `encoder/text/text_embeddings.npy`, `encoder/graph/` |
+| Tokenizer | `tokenization/` |
+| Planner data and model | `segments.parquet`, `planner_dataset.pt`, `planner/best.pt` |
+| Realizer data and model | `bank.pt`, `realizer/best.pt` |
+| Evaluation | `evaluation/<city>/` |
+
+Override any setting with `--set`, for example `--set run_dir=/data/run1` to
+place a whole experiment elsewhere or `--set planner.training.epochs=20`.
+Each stage writes its resolved config to `config_resolved.yaml` in its output
+directory. Every stage defaults to `cuda:0`; select the physical GPU with
+`CUDA_VISIBLE_DEVICES`. The text encoder reuses
+`encoder/text/text_embeddings.npy` when it already covers the POI catalog.
+
+For multi-GPU training, give the planner a device list, which starts one DDP
+rank per GPU, and launch the realizer under `torchrun`:
 
 ```bash
-uv run semoflow-train encoder --config configs/foursquare/encoder.yaml
-uv run semoflow-train tokenizer --config configs/foursquare/tokenizer.yaml
+uv run semoflow-train planner --config $C --set 'planner.training.device=[0,1]'
+uv run torchrun --nproc_per_node=2 -m semoflow.cli.train realizer --config $C
 ```
-
-### 2. Planner
-
-Build weekly trajectories and train the prefix planner:
-
-```bash
-uv run semoflow-artifacts build --config configs/foursquare/planner.yaml
-uv run semoflow-train planner --config configs/foursquare/planner.yaml
-```
-
-### 3. Realizer
-
-Build the trajectory bank and train the suffix realizer:
-
-```bash
-uv run semoflow-artifacts build --config configs/foursquare/realizer.yaml
-uv run semoflow-train realizer --config configs/foursquare/realizer.yaml
-```
-
-Override settings with `--set`, for example `--set planner.training.epochs=20`.
-Use `--help` for command options.
 
 ## Sampling
 
@@ -124,7 +124,7 @@ Use `--help` for command options.
 are sampled; the test set supplies the number of trajectories to generate.
 
 ```bash
-uv run semoflow-eval evaluate --config configs/foursquare/evaluation.yaml
+uv run semoflow-eval evaluate --config configs/foursquare.yaml
 ```
 
 Results are saved under `outputs/evaluation/<city>/`:
@@ -162,9 +162,8 @@ prefix. Each visit keeps its own probabilities, but repeated visits to an area
 tend to return to the same place. It applies only to the calibrated catalog
 decoder.
 
-To run one city, append `--set "evaluation.cities={atlanta: 9}"`.
-See [city IDs](src/semoflow/config/constants.py) and
-[evaluation settings](configs/foursquare/evaluation.yaml).
+Evaluation covers every city in `data.cities`; to run one city, append
+`--set "evaluation.cities=[atlanta]"`.
 
 ### Sample a released planner
 

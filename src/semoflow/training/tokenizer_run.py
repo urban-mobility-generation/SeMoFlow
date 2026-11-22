@@ -12,7 +12,6 @@ import torch
 from torch.utils.data import DataLoader
 
 from semoflow.config import ExperimentConfig
-from semoflow.config.artifacts import TokenizerArtifacts
 from semoflow.preprocess.places_index import load_places_index
 from semoflow.tokenization.features import (
     GRAPH_PREFIX,
@@ -49,18 +48,15 @@ class PreparedFeatures:
 
 
 def prepare_features(cfg: ExperimentConfig) -> PreparedFeatures:
-    tcfg = cfg.tokenizer_config
-    places_index = load_places_index(tcfg.places_index_output_path())
-    stays = pl.read_parquet(tcfg.processed_visits_output_path())
-    graph_dir = (
-        Path(tcfg.graphsage_artifact_dir)
-        if tcfg.graphsage_artifact_dir
-        else None
-    )
+    tcfg = cfg.tokenizer
+    layout = cfg.layout
+    places_index = load_places_index(layout.preprocessing.places_index)
+    stays = pl.read_parquet(layout.preprocessing.processed_visits)
+    graph_dir = layout.graph_dir
     poi_features, pca_state = build_features(
         places_index=places_index,
         source=tcfg.input_embedding_source,
-        text_embeddings_path=Path(tcfg.text_embeddings_path),
+        text_embeddings_path=layout.text_embeddings,
         graphsage_artifact_dir=graph_dir,
         pca_text_dim=tcfg.pca_text_dim,
         pca_graph_dim=tcfg.pca_graph_dim,
@@ -82,11 +78,6 @@ def prepare_features(cfg: ExperimentConfig) -> PreparedFeatures:
 
     graph_dim = None
     if tcfg.lambda_graph > 0 or tcfg.lambda_prefix_graph > 0:
-        if graph_dir is None:
-            raise ValueError(
-                "graph alignment requires tokenizer_config."
-                "graphsage_artifact_dir"
-            )
         graph_targets = _graph_targets(poi_features, places_index, graph_dir)
         tensors["graph_target"] = torch.from_numpy(graph_targets)
         graph_dim = int(graph_targets.shape[1])
@@ -126,7 +117,7 @@ def fit_tokenizer(
     *,
     checkpoints_dir: Path,
 ) -> tuple[RQVAE, list[dict[str, float]]]:
-    tcfg = cfg.tokenizer_config
+    tcfg = cfg.tokenizer
     model = build_tokenizer_model(
         tcfg,
         input_dim=len(prepared.feature_cols),
@@ -161,10 +152,10 @@ def fit_tokenizer(
 
 def run_semantic_id_tokenizer(cfg: ExperimentConfig) -> Path | None:
     """Fit the RQ-VAE and publish its artifacts into the run directory."""
-    arts = TokenizerArtifacts.from_run_dir(cfg.tokenizer_config.run_dir())
+    arts = cfg.layout.tokenizer
     if arts.augmented_processed_visits.exists():
         logger.info("replacing existing tokenizer outputs: %s", arts.run_dir)
-    cfg.save_yaml(arts.config_yaml, phase="tokenizer")
+    cfg.save_yaml(arts.config_yaml)
     logger.info("building semantic IDs  run_dir=%s", arts.run_dir)
     prepared = prepare_features(cfg)
     model, history = fit_tokenizer(
