@@ -71,7 +71,7 @@ uv run semoflow-preprocess --config configs/foursquare.yaml
 ```
 
 This prepares **Los Angeles, Washington DC, Atlanta, San Francisco, and
-Milwaukee** in `outputs/preprocessing/`: visits, the POI catalog, and quality scores.
+Milwaukee** in `outputs/preprocessing/`: check-in visits and the POI catalog.
 
 ## Training
 

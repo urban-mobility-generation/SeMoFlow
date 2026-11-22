@@ -12,7 +12,6 @@ import torch
 from torch.utils.data import DataLoader
 
 from semoflow.config import ExperimentConfig
-from semoflow.preprocess.places_index import load_places_index
 from semoflow.tokenization.features import (
     GRAPH_PREFIX,
     build_features,
@@ -50,7 +49,7 @@ class PreparedFeatures:
 def prepare_features(cfg: ExperimentConfig) -> PreparedFeatures:
     tcfg = cfg.tokenizer
     layout = cfg.layout
-    places_index = load_places_index(layout.preprocessing.places_index)
+    places_index = pl.read_parquet(layout.preprocessing.places_index)
     stays = pl.read_parquet(layout.preprocessing.processed_visits)
     graph_dir = layout.graph_dir
     poi_features, pca_state = build_features(

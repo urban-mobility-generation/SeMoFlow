@@ -25,7 +25,6 @@ from semoflow.encoder.graph.losses import (
     variance_covariance_penalty,
 )
 from semoflow.encoder.graph.sampler import get_train_loader
-from semoflow.preprocess.places_index import load_places_index
 from semoflow.training.encoder.cache import (
     graph_data_cache_dir as _graph_data_cache_dir,
 )
@@ -307,7 +306,7 @@ def _build_graph_data(
             f"{stays_df.height:,}",
             f"{n_all:,}",
         )
-    places_index_df = load_places_index(places_index_path)
+    places_index_df = pl.read_parquet(places_index_path)
 
     data, val_edges = build_hetero_data(
         stays_df=stays_df,
@@ -433,7 +432,7 @@ def _export_poi_embeddings(
     emb_path = out_dir / "poi_graph_emb.pt"
     torch.save(poi_graph_emb, emb_path)
 
-    places_index_df = load_places_index(cfg.layout.preprocessing.places_index)
+    places_index_df = pl.read_parquet(cfg.layout.preprocessing.places_index)
     identity_cols = [
         c for c in ("placekey_id", "placekey") if c in places_index_df.columns
     ]

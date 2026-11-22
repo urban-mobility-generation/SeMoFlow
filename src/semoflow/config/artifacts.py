@@ -86,7 +86,6 @@ class PreprocessingArtifacts:
     run_dir: Path
     processed_visits: Path
     places_index: Path
-    quality_scores: Path
 
     @classmethod
     def from_run_dir(cls, run_dir: Path) -> PreprocessingArtifacts:
@@ -94,7 +93,6 @@ class PreprocessingArtifacts:
             run_dir=run_dir,
             processed_visits=run_dir / "processed_visits.parquet",
             places_index=run_dir / "places_index.parquet",
-            quality_scores=run_dir / "quality_scores.parquet",
         )
 
 
