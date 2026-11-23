@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import functools
 import logging
-from dataclasses import asdict
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -211,22 +213,43 @@ def _run_epoch(
     return float((totals[0] / totals[1].clamp_min(1.0)).item())
 
 
-def train_prefix_time_suffix_latent_flow_realizer(
-    config: RealizerConfig, layout: RunLayout
-) -> dict[str, Any]:
+@dataclass
+class _Run:
+    config: RealizerConfig
+    rank: int
+    world_size: int
+    train: _BankSplit
+    val: _BankSplit
+    train_loader: DataLoader
+    val_loader: DataLoader
+    model: torch.nn.Module
+    optimizer: torch.optim.Optimizer
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None
+    run_epoch: Callable[..., float]
+    checkpoint_extra: dict[str, Any]
+
+    @property
+    def is_main(self) -> bool:
+        return self.rank == 0
+
+    @property
+    def raw_model(self) -> torch.nn.Module:
+        return unwrap_ddp(self.model)
+
+
+def _setup(config: RealizerConfig, layout: RunLayout) -> _Run:
     set_seed_all(config.seed)
     torch.set_num_threads(_CPU_THREADS)
     device = torch.device(config.device)
     distributed = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if distributed else 0
     world_size = dist.get_world_size() if distributed else 1
-    is_main = rank == 0
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
 
-    tokenizer, output_dir = layout.tokenizer, layout.realizer_dir
+    tokenizer = layout.tokenizer
     codebooks = load_codebooks(tokenizer.tokenizer_codebooks)
     payload = load_bank_payload(layout.bank)
     train, val = (
@@ -240,7 +263,6 @@ def train_prefix_time_suffix_latent_flow_realizer(
     )
     train_loader = loader(train, shuffle=True)
     val_loader = loader(val, shuffle=False)
-
     tail_mean, tail_whitener = (
         stat.to(device)
         for stat in compute_tail_whitening_stats(
@@ -299,7 +321,7 @@ def train_prefix_time_suffix_latent_flow_realizer(
         base_lr=config.learning_rate,
         min_lr=config.min_lr,
     )
-    if is_main:
+    if rank == 0:
         logger.info(
             "runtime world_size=%d per_rank_batch=%d global_batch=%d "
             "bf16=%s compile=%s workers=%d total_updates=%d",
@@ -311,52 +333,87 @@ def train_prefix_time_suffix_latent_flow_realizer(
             config.num_workers,
             total_updates,
         )
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_extra = {
-        "model_type": MODEL_TYPE,
-        "prefix_depth": config.prefix_depth,
-        "num_codebooks": num_codebooks,
-        "codebook_size": int(codebooks.shape[1]),
-        "time_vocab": N_TIME_TOKENS,
-        "latent_dim": latent_dim,
-        "tail_mean": tail_mean.cpu(),
-        "tail_whitener": tail_whitener.cpu(),
-        "codebooks": codebooks,
-        "config": asdict(config),
-    }
-
-    run_epoch = functools.partial(
-        _run_epoch,
-        objective=functools.partial(
-            prefix_time_suffix_latent_flow_loss,
-            codebooks=codebooks.to(device),
-            tail_mean=tail_mean,
-            tail_whitener=tail_whitener,
-            candidates=candidates,
-            catalog_loss_weight=config.catalog_loss_weight,
-            catalog_temperature=config.catalog_temperature,
-            endpoint_loss_weight=config.endpoint_loss_weight,
-            population_loss_weight=config.population_loss_weight,
-            catalog_prior_weight=config.catalog_prior_weight,
+    return _Run(
+        config=config,
+        rank=rank,
+        world_size=world_size,
+        train=train,
+        val=val,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        run_epoch=functools.partial(
+            _run_epoch,
+            objective=functools.partial(
+                prefix_time_suffix_latent_flow_loss,
+                codebooks=codebooks.to(device),
+                tail_mean=tail_mean,
+                tail_whitener=tail_whitener,
+                candidates=candidates,
+                catalog_loss_weight=config.catalog_loss_weight,
+                catalog_temperature=config.catalog_temperature,
+                endpoint_loss_weight=config.endpoint_loss_weight,
+                population_loss_weight=config.population_loss_weight,
+                catalog_prior_weight=config.catalog_prior_weight,
+            ),
+            device=device,
+            bf16=config.bf16,
+            distributed=distributed,
+            max_grad_norm=config.max_grad_norm,
         ),
-        device=device,
-        bf16=config.bf16,
-        distributed=distributed,
-        max_grad_norm=config.max_grad_norm,
+        checkpoint_extra={
+            "model_type": MODEL_TYPE,
+            "prefix_depth": config.prefix_depth,
+            "num_codebooks": num_codebooks,
+            "codebook_size": int(codebooks.shape[1]),
+            "time_vocab": N_TIME_TOKENS,
+            "latent_dim": latent_dim,
+            "tail_mean": tail_mean.cpu(),
+            "tail_whitener": tail_whitener.cpu(),
+            "codebooks": codebooks,
+            "config": asdict(config),
+        },
     )
-    raw_model = unwrap_ddp(model)
+
+
+def _save_checkpoint(
+    run: _Run, output_dir: Path, epoch: int, val_loss: float, improved: bool
+) -> None:
+    checkpoint = {
+        "epoch": epoch,
+        "model_state_dict": run.raw_model.state_dict(),
+        "optimizer_state_dict": run.optimizer.state_dict(),
+        "val_loss": val_loss,
+        **run.checkpoint_extra,
+    }
+    torch.save(checkpoint, output_dir / "last.pt")
+    if improved:
+        torch.save(checkpoint, output_dir / "best.pt")
+
+
+def train_prefix_time_suffix_latent_flow_realizer(
+    config: RealizerConfig, layout: RunLayout
+) -> dict[str, Any]:
+    run = _setup(config, layout)
+    output_dir = layout.realizer_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model = run.model
     stopper = EarlyStopper(patience=config.early_stopping_patience)
     history: list[dict[str, float]] = []
     stopped_early = False
     for epoch in range(1, config.epochs + 1):
-        train_loss = run_epoch(
-            model, train_loader, optimizer=optimizer, scheduler=scheduler
+        train_loss = run.run_epoch(
+            model,
+            run.train_loader,
+            optimizer=run.optimizer,
+            scheduler=run.scheduler,
         )
-        val_loss = run_epoch(
-            model.module if isinstance(model, DDP) else model, val_loader
+        val_loss = run.run_epoch(
+            model.module if isinstance(model, DDP) else model, run.val_loader
         )
-        learning_rate = float(optimizer.param_groups[0]["lr"])
+        learning_rate = float(run.optimizer.param_groups[0]["lr"])
         history.append(
             {
                 "epoch": float(epoch),
@@ -366,7 +423,7 @@ def train_prefix_time_suffix_latent_flow_realizer(
             }
         )
         improved = stopper.step(val_loss, epoch=epoch)
-        if is_main:
+        if run.is_main:
             logger.info(
                 "latent suffix-flow epoch=%d train_loss=%.6f val_loss=%.6f "
                 "lr=%.6g stale_validations=%d",
@@ -376,19 +433,10 @@ def train_prefix_time_suffix_latent_flow_realizer(
                 learning_rate,
                 stopper.epochs_without_improvement,
             )
-            checkpoint = {
-                "epoch": epoch,
-                "model_state_dict": raw_model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "val_loss": val_loss,
-                **checkpoint_extra,
-            }
-            torch.save(checkpoint, output_dir / "last.pt")
-            if improved:
-                torch.save(checkpoint, output_dir / "best.pt")
+            _save_checkpoint(run, output_dir, epoch, val_loss, improved)
         if stopper.should_stop:
             stopped_early = True
-            if is_main:
+            if run.is_main:
                 logger.info(
                     "latent suffix-flow early_stop epoch=%d best_epoch=%d "
                     "best_val_loss=%.6f",
@@ -398,28 +446,29 @@ def train_prefix_time_suffix_latent_flow_realizer(
                 )
             break
 
-    if distributed:
+    if dist.is_available() and dist.is_initialized():
         dist.barrier()
+    extra = run.checkpoint_extra
     result: dict[str, Any] = {
         "model_type": MODEL_TYPE,
         "config": asdict(config),
-        "train_rows": len(train),
-        "val_rows": len(val),
-        "num_codebooks": num_codebooks,
-        "latent_dim": latent_dim,
-        "parameter_count": sum(p.numel() for p in raw_model.parameters()),
-        "world_size": world_size,
-        "global_batch_size": config.batch_size * world_size,
+        "train_rows": len(run.train),
+        "val_rows": len(run.val),
+        "num_codebooks": extra["num_codebooks"],
+        "latent_dim": extra["latent_dim"],
+        "parameter_count": sum(p.numel() for p in run.raw_model.parameters()),
+        "world_size": run.world_size,
+        "global_batch_size": config.batch_size * run.world_size,
         "stopped_early": stopped_early,
         "epochs_completed": len(history),
         "best_epoch": stopper.best_epoch,
         "best_val_loss": stopper.best_value,
         "history": history,
         "bank_path": str(layout.bank),
-        "codebooks_path": str(tokenizer.tokenizer_codebooks),
-        "catalog_path": str(tokenizer.placekey_lookup),
+        "codebooks_path": str(layout.tokenizer.tokenizer_codebooks),
+        "catalog_path": str(layout.tokenizer.placekey_lookup),
     }
-    if is_main:
+    if run.is_main:
         write_json(output_dir / "metrics.json", result)
     return result
 

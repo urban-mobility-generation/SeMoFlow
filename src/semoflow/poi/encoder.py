@@ -4,6 +4,7 @@ import logging
 import os
 import tempfile
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -150,6 +151,71 @@ def _export_poi_embeddings(
     return embeddings
 
 
+def _build_model(
+    graph_cfg: GraphEncoderConfig, data: Any, device: torch.device
+) -> HeteroSAGE:
+    return HeteroSAGE(
+        data.metadata(),
+        {ntype: data[ntype].x.size(1) for ntype in data.node_types},
+        hidden_dim=graph_cfg.hidden_dim,
+        out_dim=graph_cfg.out_dim,
+        num_layers=graph_cfg.num_layers,
+        dropout=graph_cfg.dropout,
+        aggr=graph_cfg.aggr,
+        layer_norm=graph_cfg.layer_norm,
+        residual=graph_cfg.residual,
+        id_embedding_dim=graph_cfg.id_embedding_dim,
+        id_embedding_counts=_id_embedding_counts(graph_cfg, data),
+    ).to(device)
+
+
+def _resume(
+    best_path: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    is_main: bool,
+) -> tuple[int, float]:
+    if not best_path.exists():
+        return 0, float("inf")
+    checkpoint = torch.load(best_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    start_epoch = checkpoint["epoch"] + 1
+    best_val_loss = checkpoint["best_val_loss"]
+    if is_main:
+        logger.info(
+            "Resumed from %s — starting at epoch %d, best_val=%.4f",
+            best_path,
+            start_epoch + 1,
+            best_val_loss,
+        )
+    return start_epoch, best_val_loss
+
+
+def _epoch_loss(
+    model: torch.nn.Module,
+    batches: Any,
+    graph_cfg: GraphEncoderConfig,
+    device: torch.device,
+    world_size: int,
+    optimizer: torch.optim.Optimizer | None = None,
+) -> float:
+    training = optimizer is not None
+    model.train(training)
+    total, count = torch.zeros((), device=device), 0
+    with torch.set_grad_enabled(training):
+        for batch in batches:
+            loss = _batch_loss(model, batch, graph_cfg, device)
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+            total += loss.detach()
+            count += 1
+    return _mean_over_ranks(total, count, world_size)
+
+
 def _train(
     cfg: ExperimentConfig,
     data: Any,
@@ -180,20 +246,7 @@ def _train(
         )
         for edges in (None, val_edges)
     )
-
-    raw_model = HeteroSAGE(
-        data.metadata(),
-        {ntype: data[ntype].x.size(1) for ntype in data.node_types},
-        hidden_dim=graph_cfg.hidden_dim,
-        out_dim=graph_cfg.out_dim,
-        num_layers=graph_cfg.num_layers,
-        dropout=graph_cfg.dropout,
-        aggr=graph_cfg.aggr,
-        layer_norm=graph_cfg.layer_norm,
-        residual=graph_cfg.residual,
-        id_embedding_dim=graph_cfg.id_embedding_dim,
-        id_embedding_counts=_id_embedding_counts(graph_cfg, data),
-    ).to(device)
+    raw_model = _build_model(graph_cfg, data, device)
     model: torch.nn.Module = (
         DistributedDataParallel(
             raw_model, device_ids=[device.index], find_unused_parameters=True
@@ -203,21 +256,12 @@ def _train(
     )
     n_parameters = sum(p.numel() for p in raw_model.parameters())
     optimizer = torch.optim.Adam(raw_model.parameters(), lr=graph_cfg.lr)
-
-    start_epoch, best_val_loss = 0, float("inf")
-    if best_path.exists():
-        checkpoint = torch.load(best_path, map_location=device)
-        raw_model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        start_epoch = checkpoint["epoch"] + 1
-        best_val_loss = checkpoint["best_val_loss"]
-        if is_main:
-            logger.info(
-                "Resumed from %s — starting at epoch %d, best_val=%.4f",
-                best_path,
-                start_epoch + 1,
-                best_val_loss,
-            )
+    start_epoch, best_val_loss = _resume(
+        best_path, raw_model, optimizer, device, is_main
+    )
+    epoch_loss = partial(
+        _epoch_loss, graph_cfg=graph_cfg, device=device, world_size=world_size
+    )
 
     epochs = graph_cfg.epochs
     history: list[dict[str, float]] = []
@@ -233,26 +277,13 @@ def _train(
         )
     for epoch in range(start_epoch, epochs):
         started = time.perf_counter()
-        model.train()
-        total, batches = torch.zeros((), device=device), 0
         desc = f"Epoch {epoch + 1}/{epochs}"
-        for batch in tqdm(loader, desc=desc) if is_main else loader:
-            optimizer.zero_grad(set_to_none=True)
-            loss = _batch_loss(model, batch, graph_cfg, device)
-            loss.backward()
-            optimizer.step()
-            total += loss.detach()
-            batches += 1
-        train_loss = _mean_over_ranks(total, batches, world_size)
-
-        model.eval()
-        total, batches = torch.zeros((), device=device), 0
-        with torch.no_grad():
-            for batch in val_loader:
-                total += _batch_loss(model, batch, graph_cfg, device)
-                batches += 1
-        val_loss = _mean_over_ranks(total, batches, world_size)
-
+        train_loss = epoch_loss(
+            model,
+            tqdm(loader, desc=desc) if is_main else loader,
+            optimizer=optimizer,
+        )
+        val_loss = epoch_loss(model, val_loader)
         elapsed = time.perf_counter() - started
         history.append(
             {

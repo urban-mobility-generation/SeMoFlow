@@ -12,13 +12,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from semoflow.config import PlannerTrainingConfig
-from semoflow.planner.layers import (
+from semoflow.planner.prefix_decoder import (
     HierarchicalPrefixDecoder,
     LegalPrefixIndex,
     PrefixDistanceContext,
     PrefixDistancePrior,
-    SpatioTemporalRelationBias,
-    SpatioTemporalTransformer,
     sample_categorical_logits,
 )
 from semoflow.planner.router import (
@@ -26,6 +24,10 @@ from semoflow.planner.router import (
     explore_retrieve_target_log_probability,
     prefix_target_log_probability,
     retrieval_target_log_probability,
+)
+from semoflow.planner.transformer import (
+    SpatioTemporalRelationBias,
+    SpatioTemporalTransformer,
 )
 from semoflow.utils import load_artifact, save_torch_atomic
 

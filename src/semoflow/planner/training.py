@@ -4,7 +4,7 @@ import json
 import logging
 import random
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
@@ -25,9 +25,8 @@ from torch.utils.data import (
 )
 from torch.utils.data.distributed import DistributedSampler
 
-from semoflow.config import PlannerConfig, RunLayout
+from semoflow.config import PlannerConfig, PlannerTrainingConfig, RunLayout
 from semoflow.data import DATASET_ARTIFACT_TYPE, reconstruct_event_time_minutes
-from semoflow.planner.layers import LegalPrefixIndex
 from semoflow.planner.model import (
     OccurrenceARPlanner,
     OccurrenceBatch,
@@ -35,6 +34,7 @@ from semoflow.planner.model import (
     occurrence_planner_loss,
     save_occurrence_planner_checkpoint,
 )
+from semoflow.planner.prefix_decoder import LegalPrefixIndex
 from semoflow.utils import (
     EarlyStopper,
     build_lr_scheduler,
@@ -337,18 +337,41 @@ def _synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def train_occurrence_planner(
-    settings: PlannerConfig, layout: RunLayout
-) -> dict[str, Any]:
-    options, seed = settings.training, settings.seed
-    if dist.is_available() and dist.is_initialized():
-        rank, world_size = dist.get_rank(), dist.get_world_size()
-        device = torch.device("cuda", torch.cuda.current_device())
-    else:
-        rank, world_size = 0, 1
-        device = parse_device_spec(options.device)[0]
-    ctx = _Rank(rank, world_size, device)
+@dataclass
+class _Run:
+    ctx: _Rank
+    options: PlannerTrainingConfig
+    seed: int
+    config: OccurrencePlannerConfig
+    model: OccurrenceARPlanner
+    train_model: nn.Module
+    optimizer: optim.Optimizer
+    scheduler: optim.lr_scheduler.LRScheduler | None
+    sampler: Sampler[int]
+    train_loader: DataLoader
+    val_loader: DataLoader
+    train_eval_loader: DataLoader
+    save: Callable[..., None]
 
+    @property
+    def total_steps(self) -> int:
+        return len(self.train_loader) * self.options.epochs
+
+
+def _rank(options: PlannerTrainingConfig) -> _Rank:
+    if dist.is_available() and dist.is_initialized():
+        return _Rank(
+            dist.get_rank(),
+            dist.get_world_size(),
+            torch.device("cuda", torch.cuda.current_device()),
+        )
+    return _Rank(0, 1, parse_device_spec(options.device)[0])
+
+
+def _setup(settings: PlannerConfig, layout: RunLayout) -> _Run:
+    options, seed = settings.training, settings.seed
+    ctx = _rank(options)
+    device = ctx.device
     dataset = load_occurrence_planner_dataset(layout.planner_dataset)
     if ctx.primary:
         logger.info(
@@ -361,10 +384,6 @@ def train_occurrence_planner(
             dataset.config.gap_vocab,
         )
     config = _planner_config(dataset, settings)
-    best_path, last_path, metrics_path = (
-        layout.planner_dir / name for name in _OUTPUT_NAMES
-    )
-
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
     set_seed_all(seed)
@@ -380,7 +399,7 @@ def train_occurrence_planner(
             output_device=device.index,
             broadcast_buffers=False,
         )
-    set_seed_all(seed + rank)
+    set_seed_all(seed + ctx.rank)
     optimizer = optim.AdamW(
         model.parameters(),
         lr=options.learning_rate,
@@ -393,7 +412,7 @@ def train_occurrence_planner(
             "n_layers=%d  lr_scheduler=%s  warmup_steps=%d  min_lr=%g  "
             "compile=%s",
             device,
-            world_size,
+            ctx.world_size,
             seed,
             options.epochs,
             options.batch_size,
@@ -405,7 +424,6 @@ def train_occurrence_planner(
             options.min_lr,
             options.compile_model,
         )
-
     build = partial(
         build_occurrence_tensor_dataloader,
         config=config,
@@ -417,8 +435,8 @@ def train_occurrence_planner(
     sampler = (
         DistributedSampler(
             range(dataset.train.size),
-            num_replicas=world_size,
-            rank=rank,
+            num_replicas=ctx.world_size,
+            rank=ctx.rank,
             shuffle=True,
             seed=seed,
             drop_last=False,
@@ -427,87 +445,149 @@ def train_occurrence_planner(
         else SeededShuffleSampler(dataset.train.size, seed=seed)
     )
     train_loader = build(dataset.train, sampler=sampler)
-    val_loader = build(dataset.validation)
-    train_eval_loader = build(dataset.train)
-
-    steps_per_epoch = len(train_loader)
-    total_steps = steps_per_epoch * options.epochs
-    scheduler = build_lr_scheduler(
-        optimizer,
-        schedule=options.lr_scheduler,
-        warmup_steps=options.warmup_steps,
-        total_updates=total_steps,
-        base_lr=options.learning_rate,
-        min_lr=options.min_lr,
-    )
-    save = partial(
-        save_occurrence_planner_checkpoint,
-        config=config,
-        seed=seed,
+    return _Run(
+        ctx=ctx,
         options=options,
-        **catalog,
+        seed=seed,
+        config=config,
+        model=model,
+        train_model=train_model,
+        optimizer=optimizer,
+        scheduler=build_lr_scheduler(
+            optimizer,
+            schedule=options.lr_scheduler,
+            warmup_steps=options.warmup_steps,
+            total_updates=len(train_loader) * options.epochs,
+            base_lr=options.learning_rate,
+            min_lr=options.min_lr,
+        ),
+        sampler=sampler,
+        train_loader=train_loader,
+        val_loader=build(dataset.validation),
+        train_eval_loader=build(dataset.train),
+        save=partial(
+            save_occurrence_planner_checkpoint,
+            config=config,
+            seed=seed,
+            options=options,
+            **catalog,
+        ),
     )
 
-    stopper = EarlyStopper(patience=options.early_stopping_patience)
+
+def _train_epoch(run: _Run, epoch: int, step: int) -> tuple[_NLL, int]:
+    device, optimizer = run.ctx.device, run.optimizer
+    steps_per_epoch = len(run.train_loader)
+    if isinstance(run.sampler, DistributedSampler):
+        run.sampler.set_epoch(epoch)
+    run.train_model.train()
+    nll = _NLL()
+    window_start, window_samples = time.perf_counter(), 0
+    for batch in run.train_loader:
+        batch = batch.to(device, non_blocking=True)
+        loss = occurrence_planner_loss(run.train_model(batch), batch)
+        nll.add(loss, batch)
+        optimizer.zero_grad(set_to_none=True)
+        loss.total.backward()
+        optimizer.step()
+        if run.scheduler is not None:
+            run.scheduler.step()
+        step += 1
+        window_samples += int(batch.lengths.shape[0])
+        if run.ctx.primary and _should_log(
+            step, steps_per_epoch, run.total_steps
+        ):
+            _synchronize(device)
+            now = time.perf_counter()
+            log_training_step(
+                logger,
+                step=step,
+                total_steps=run.total_steps,
+                epoch=epoch,
+                total_epochs=run.options.epochs,
+                metrics={
+                    "loss": float(loss.total.detach()),
+                    "prefix_loss": float(loss.prefix.detach()),
+                    "gap_loss": float(loss.gap.detach()),
+                    "length_loss": float(loss.length.detach()),
+                },
+                lr=float(optimizer.param_groups[0]["lr"]),
+                samples_per_sec=window_samples / max(now - window_start, 1e-6),
+            )
+            window_start, window_samples = now, 0
+    nll.all_reduce(run.ctx)
+    _synchronize(device)
+    return nll, step
+
+
+def _log_epoch(
+    run: _Run,
+    epoch: int,
+    row: dict[str, float],
+    train: dict[str, float],
+    validation: dict[str, float],
+    improved: bool,
+) -> None:
+    device = run.ctx.device
+    cuda = device.type == "cuda"
+    log_epoch_summary(
+        logger,
+        epoch=epoch,
+        total_epochs=run.options.epochs,
+        epoch_elapsed_s=row["train_elapsed_s"],
+        samples_per_sec=row["train_samples_per_sec"],
+        gpu_allocated_gb=torch.cuda.memory_allocated(device) / 1e9
+        if cuda
+        else 0.0,
+        gpu_peak_gb=torch.cuda.max_memory_allocated(device) / 1e9
+        if cuda
+        else 0.0,
+    )
+    logger.info(
+        "epoch %d/%d  lr=%.6g  train_nll=%.4f  validation_nll=%.4f  "
+        "val[length=%.4f gap=%.4f prefix=%.4f]%s",
+        epoch,
+        run.options.epochs,
+        row["learning_rate"],
+        train["nll"],
+        validation["nll"],
+        validation["length_nll"],
+        validation["gap_nll"],
+        validation["prefix_nll"],
+        "  (best)" if improved else "",
+    )
+
+
+def train_occurrence_planner(
+    settings: PlannerConfig, layout: RunLayout
+) -> dict[str, Any]:
+    run = _setup(settings, layout)
+    ctx, device = run.ctx, run.ctx.device
+    best_path, last_path, metrics_path = (
+        layout.planner_dir / name for name in _OUTPUT_NAMES
+    )
+    stopper = EarlyStopper(patience=run.options.early_stopping_patience)
     history: list[dict[str, float]] = []
     validation: dict[str, float] = {}
     step = 0
     epoch = 0
-    for epoch in range(1, options.epochs + 1):
+    for epoch in range(1, run.options.epochs + 1):
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             torch.cuda.reset_peak_memory_stats(device)
         started = time.perf_counter()
-        if isinstance(sampler, DistributedSampler):
-            sampler.set_epoch(epoch)
-        train_model.train()
-        nll = _NLL()
-        window_start, window_samples = time.perf_counter(), 0
-        for batch in train_loader:
-            batch = batch.to(device, non_blocking=True)
-            loss = occurrence_planner_loss(train_model(batch), batch)
-            nll.add(loss, batch)
-            optimizer.zero_grad(set_to_none=True)
-            loss.total.backward()
-            optimizer.step()
-            if scheduler is not None:
-                scheduler.step()
-            step += 1
-            window_samples += int(batch.lengths.shape[0])
-            if ctx.primary and _should_log(step, steps_per_epoch, total_steps):
-                _synchronize(device)
-                now = time.perf_counter()
-                log_training_step(
-                    logger,
-                    step=step,
-                    total_steps=total_steps,
-                    epoch=epoch,
-                    total_epochs=options.epochs,
-                    metrics={
-                        "loss": float(loss.total.detach()),
-                        "prefix_loss": float(loss.prefix.detach()),
-                        "gap_loss": float(loss.gap.detach()),
-                        "length_loss": float(loss.length.detach()),
-                    },
-                    lr=float(optimizer.param_groups[0]["lr"]),
-                    samples_per_sec=window_samples
-                    / max(now - window_start, 1e-6),
-                )
-                window_start, window_samples = now, 0
-        nll.all_reduce(ctx)
-        _synchronize(device)
+        nll, step = _train_epoch(run, epoch, step)
         train_elapsed = time.perf_counter() - started
-
         validation_started = time.perf_counter()
-        validation = _evaluate(model, val_loader, ctx)
+        validation = _evaluate(run.model, run.val_loader, ctx)
         _synchronize(device)
         validation_elapsed = time.perf_counter() - validation_started
         improved = stopper.step(validation["nll"], epoch=epoch)
         if ctx.primary:
             if improved:
-                save(
+                run.save(
                     best_path,
-                    model_state=model.state_dict(),
+                    model_state=run.model.state_dict(),
                     epoch=epoch,
                     validation_metric=stopper.best_value,
                     force=True,
@@ -515,7 +595,7 @@ def train_occurrence_planner(
             train = nll.metrics()
             row = {
                 "epoch": epoch,
-                "learning_rate": float(optimizer.param_groups[0]["lr"]),
+                "learning_rate": float(run.optimizer.param_groups[0]["lr"]),
                 "train_elapsed_s": train_elapsed,
                 "validation_elapsed_s": validation_elapsed,
                 "train_samples_per_sec": nll.sums[0]
@@ -524,33 +604,7 @@ def train_occurrence_planner(
                 **_prefixed("validation", validation),
             }
             history.append(row)
-            cuda = device.type == "cuda"
-            log_epoch_summary(
-                logger,
-                epoch=epoch,
-                total_epochs=options.epochs,
-                epoch_elapsed_s=train_elapsed,
-                samples_per_sec=row["train_samples_per_sec"],
-                gpu_allocated_gb=torch.cuda.memory_allocated(device) / 1e9
-                if cuda
-                else 0.0,
-                gpu_peak_gb=torch.cuda.max_memory_allocated(device) / 1e9
-                if cuda
-                else 0.0,
-            )
-            logger.info(
-                "epoch %d/%d  lr=%.6g  train_nll=%.4f  validation_nll=%.4f  "
-                "val[length=%.4f gap=%.4f prefix=%.4f]%s",
-                epoch,
-                options.epochs,
-                row["learning_rate"],
-                train["nll"],
-                validation["nll"],
-                validation["length_nll"],
-                validation["gap_nll"],
-                validation["prefix_nll"],
-                "  (best)" if improved else "",
-            )
+            _log_epoch(run, epoch, row, train, validation, improved)
         if stopper.should_stop:
             if ctx.primary:
                 logger.info(
@@ -562,7 +616,7 @@ def train_occurrence_planner(
                 )
             break
 
-    final_train = _evaluate(model, train_eval_loader, ctx)
+    final_train = _evaluate(run.model, run.train_eval_loader, ctx)
     summary: dict[str, Any] = {
         "best_epoch": stopper.best_epoch,
         "best_validation_nll": stopper.best_value,
@@ -570,9 +624,9 @@ def train_occurrence_planner(
         **_prefixed("final_validation", validation),
     }
     if ctx.primary:
-        save(
+        run.save(
             last_path,
-            model_state=model.state_dict(),
+            model_state=run.model.state_dict(),
             epoch=epoch,
             validation_metric=validation["nll"],
             force=True,

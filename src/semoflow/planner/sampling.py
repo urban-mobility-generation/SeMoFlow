@@ -7,11 +7,11 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from semoflow.planner.layers import sample_categorical_logits
 from semoflow.planner.model import (
     OccurrenceARPlanner,
     load_occurrence_planner_checkpoint,
 )
+from semoflow.planner.prefix_decoder import sample_categorical_logits
 from semoflow.utils import save_torch_atomic
 
 SAMPLES_ARTIFACT_TYPE = "occurrence_planner_samples"

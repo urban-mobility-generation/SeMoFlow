@@ -21,6 +21,7 @@ from semoflow.data import (
     load_bank_payload,
 )
 from semoflow.evaluation.scoring import (
+    SampledPlan,
     aligned_reference_event_hours,
     load_candidate_prior,
     load_places,
@@ -302,6 +303,133 @@ def _sample_arm(
     }
 
 
+@dataclass(frozen=True)
+class _Reference:
+    codes: torch.Tensor
+    times: torch.Tensor
+    valid: torch.Tensor
+    placekey_ids: torch.Tensor
+    hours: torch.Tensor
+
+    @property
+    def rows(self) -> int:
+        return int(self.codes.size(0))
+
+
+def _load_reference_and_plan(
+    payload: dict[str, Any],
+    planner_samples: Path,
+    *,
+    split: str,
+    width: int,
+    max_samples: int,
+) -> tuple[_Reference, SampledPlan]:
+    codes, times, valid, placekey_ids = load_reference(
+        payload, split=split, max_samples=max_samples
+    )
+    plan = plan_from_planner_samples(
+        torch.load(planner_samples, map_location="cpu", weights_only=False),
+        width=width,
+        max_rows=max_samples,
+    )
+    n_rows = min(codes.size(0), plan.prefix.size(0))
+    codes, times, valid, placekey_ids = (
+        tensor[:n_rows] for tensor in (codes, times, valid, placekey_ids)
+    )
+    hours = aligned_reference_event_hours(
+        payload, split=split, valid_mask=valid
+    )
+    return _Reference(codes, times, valid, placekey_ids, hours), plan
+
+
+def _arms(
+    model: PrefixTimeSuffixLatentFlowRealizer,
+    catalog: SuffixCatalog,
+    reference: _Reference,
+    plan: SampledPlan,
+    payload: dict[str, Any],
+    split: str,
+) -> tuple[_Arm, _Arm]:
+    n_rows = reference.rows
+    gold_city = sampled_city = None
+    if model.city_vocab > 0:
+        gold_city = bank_split_city_ids(payload, split, rows=n_rows)
+        sampled_city = plan.city_id[:n_rows]
+    gold_prefix = reference.codes[..., : model.prefix_depth]
+    sampled_prefix = plan.prefix[:n_rows]
+    sampled_valid = plan.valid[:n_rows]
+    return (
+        _Arm(
+            name="gold_prefix",
+            prefix=gold_prefix,
+            times=reference.times,
+            input_valid=reference.valid,
+            supported=reference.valid & catalog.supports(gold_prefix).cpu(),
+            hours=reference.hours,
+            seed=7000,
+            city_id=gold_city,
+        ),
+        _Arm(
+            name="sampled_plan",
+            prefix=sampled_prefix,
+            times=plan.time_tokens[:n_rows],
+            input_valid=sampled_valid,
+            supported=sampled_valid & catalog.supports(sampled_prefix).cpu(),
+            hours=plan.event_hours[:n_rows],
+            seed=17000,
+            city_id=sampled_city,
+        ),
+    )
+
+
+def _score_arms(
+    reference: _Reference,
+    arms: tuple[_Arm, _Arm],
+    generated: dict[str, torch.Tensor],
+    *,
+    grounding_index: Path,
+    places: Path,
+    candidate_selection: str,
+    candidate_prior: Path | None,
+    device: torch.device,
+) -> dict[str, dict[str, Any]]:
+    grounding = SemanticIDGroundingIndex.load(grounding_index)
+    coordinates, geohashes, placekey_vocab_size = load_places(places)
+    weights = (
+        None
+        if candidate_prior is None
+        else load_candidate_prior(candidate_prior)
+    )
+    evaluations: dict[str, dict[str, Any]] = {}
+    for arm in arms:
+        arm_started = time.perf_counter()
+        evaluations[arm.name] = metric_block(
+            reference.codes,
+            reference.valid,
+            generated[arm.name],
+            arm.supported,
+            grounding=grounding,
+            coordinates=coordinates,
+            geohashes=geohashes,
+            placekey_vocab_size=placekey_vocab_size,
+            reference_placekey_ids=reference.placekey_ids,
+            real_time_tokens=reference.times,
+            generated_time_tokens=arm.times,
+            real_event_hours=reference.hours,
+            generated_event_hours=arm.hours,
+            candidate_selection=candidate_selection,
+            candidate_weights=weights,
+            compute_device=device,
+        )
+        logger.info(
+            "%s metrics on %d rows in %.1fs",
+            arm.name,
+            reference.rows,
+            time.perf_counter() - arm_started,
+        )
+    return evaluations
+
+
 def evaluate_planner_realizer(
     *,
     realizer_checkpoint: Path,
@@ -334,23 +462,13 @@ def evaluate_planner_realizer(
         if catalog_temperature is None
         else catalog_temperature
     )
-
     payload = load_bank_payload(bank)
-    real_codes, real_times, real_valid, real_placekey_ids = load_reference(
-        payload, split=reference_split, max_samples=max_samples
-    )
-    plan = plan_from_planner_samples(
-        torch.load(planner_samples, map_location="cpu", weights_only=False),
+    reference, plan = _load_reference_and_plan(
+        payload,
+        planner_samples,
+        split=reference_split,
         width=model.max_seq_len,
-        max_rows=max_samples,
-    )
-    n_rows = min(real_codes.size(0), plan.prefix.size(0))
-    real_codes, real_times, real_valid, real_placekey_ids = (
-        tensor[:n_rows]
-        for tensor in (real_codes, real_times, real_valid, real_placekey_ids)
-    )
-    real_hours = aligned_reference_event_hours(
-        payload, split=reference_split, valid_mask=real_valid
+        max_samples=max_samples,
     )
     catalog = _catalog(
         model,
@@ -358,36 +476,7 @@ def evaluate_planner_realizer(
         payload,
         lookup_path=lookup,
     )
-
-    gold_city = sampled_city = None
-    if model.city_vocab > 0:
-        gold_city = bank_split_city_ids(payload, reference_split, rows=n_rows)
-        sampled_city = plan.city_id[:n_rows]
-    gold_prefix = real_codes[..., : model.prefix_depth]
-    sampled_prefix = plan.prefix[:n_rows]
-    sampled_valid = plan.valid[:n_rows]
-    arms = (
-        _Arm(
-            name="gold_prefix",
-            prefix=gold_prefix,
-            times=real_times,
-            input_valid=real_valid,
-            supported=real_valid & catalog.supports(gold_prefix).cpu(),
-            hours=real_hours,
-            seed=7000,
-            city_id=gold_city,
-        ),
-        _Arm(
-            name="sampled_plan",
-            prefix=sampled_prefix,
-            times=plan.time_tokens[:n_rows],
-            input_valid=sampled_valid,
-            supported=sampled_valid & catalog.supports(sampled_prefix).cpu(),
-            hours=plan.event_hours[:n_rows],
-            seed=17000,
-            city_id=sampled_city,
-        ),
-    )
+    arms = _arms(model, catalog, reference, plan, payload, reference_split)
     sampled = {
         arm.name: _sample_arm(
             model,
@@ -413,48 +502,22 @@ def evaluate_planner_realizer(
         },
         output.with_name("generated_full_sids.pt"),
     )
-
-    grounding = SemanticIDGroundingIndex.load(grounding_index)
-    coordinates, geohashes, placekey_vocab_size = load_places(places)
-    weights = (
-        None
-        if candidate_prior is None
-        else load_candidate_prior(candidate_prior)
+    evaluations = _score_arms(
+        reference,
+        arms,
+        {name: full_sids for name, (full_sids, _) in sampled.items()},
+        grounding_index=grounding_index,
+        places=places,
+        candidate_selection=candidate_selection,
+        candidate_prior=candidate_prior,
+        device=resolved_device,
     )
-    evaluations: dict[str, dict[str, Any]] = {}
-    for arm in arms:
-        arm_started = time.perf_counter()
-        evaluations[arm.name] = metric_block(
-            real_codes,
-            real_valid,
-            sampled[arm.name][0],
-            arm.supported,
-            grounding=grounding,
-            coordinates=coordinates,
-            geohashes=geohashes,
-            placekey_vocab_size=placekey_vocab_size,
-            reference_placekey_ids=real_placekey_ids,
-            real_time_tokens=real_times,
-            generated_time_tokens=arm.times,
-            real_event_hours=real_hours,
-            generated_event_hours=arm.hours,
-            candidate_selection=candidate_selection,
-            candidate_weights=weights,
-            compute_device=resolved_device,
-        )
-        logger.info(
-            "%s metrics on %d rows in %.1fs",
-            arm.name,
-            n_rows,
-            time.perf_counter() - arm_started,
-        )
-
     result: dict[str, Any] = {
         "checkpoint": str(realizer_checkpoint),
         "planner_samples": str(planner_samples),
         "reference_bank": str(bank),
         "reference_split": reference_split,
-        "rows": n_rows,
+        "rows": reference.rows,
         "sampling": {"solver": solver, "num_steps": num_steps},
         "decoding": {
             "catalog_temperature": temperature,
@@ -486,4 +549,5 @@ def evaluate_planner_realizer(
 __all__ = [
     "evaluate_cities",
     "evaluate_planner_realizer",
+    "summary",
 ]
