@@ -1,9 +1,3 @@
-"""Compose planner samples with the realizer and score both arms.
-
-The gold-prefix arm completes the reference split's own prefixes; the
-sampled-plan arm completes the planner's samples.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -38,11 +32,9 @@ from semoflow.tokenization.sids import (
     SemanticIDGroundingIndex,
     sid_code_columns,
 )
-from semoflow.utils.serialization import normalize_value, write_json
+from semoflow.utils import normalize_value, write_json
 
 LOGGER = logging.getLogger(__name__)
-
-# Joint JSDs nested in an arm's metrics, lifted into its summary.
 _NESTED_SUMMARY_KEYS = {
     "time_location_joint_jsd": (
         "temporal_spatial",
@@ -94,17 +86,12 @@ def load_realizer_checkpoint(
 
 
 def realizer_max_events(checkpoint: Path) -> int:
-    """The number of events per trajectory a realizer checkpoint models."""
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     position = payload["model_state_dict"]["event_position_embedding.weight"]
     return int(position.shape[0])
 
 
 def summary(metrics: Mapping[str, Any]) -> dict[str, object]:
-    """An arm's scalar metrics, with the nested joint JSDs lifted out.
-
-    A metric the arm could not score is ``None``.
-    """
     out: dict[str, object] = {
         key: value
         for key, value in metrics.items()
@@ -125,8 +112,6 @@ def _catalog(
     *,
     lookup_path: Path,
 ) -> PrefixTailCatalog:
-    """The legal SID catalog generation decodes into, with the train-split
-    log-count prior and, for a city-conditioned realizer, each SID's city."""
     lookup = pl.read_parquet(lookup_path)
     columns = list(sid_code_columns(lookup.columns))
     catalog_codes = torch.from_numpy(
@@ -151,8 +136,6 @@ def _catalog(
 
 @dataclass(frozen=True)
 class _Arm:
-    """One conditioning source for the realizer: gold or sampled prefixes."""
-
     name: str
     prefix: torch.Tensor
     times: torch.Tensor
@@ -184,11 +167,6 @@ def _sample_arm(
     solver: str,
     catalog_noise_coupling: str,
 ) -> tuple[torch.Tensor, dict[str, int]]:
-    """The arm's full SIDs, and how the city constraint applied.
-
-    Rows without a supported event are sampled from a placeholder first
-    event and returned all zero.
-    """
     prefix, times, valid = arm.prefix, arm.times, arm.supported.clone()
     empty = ~valid.any(dim=1)
     if empty.any():
@@ -245,8 +223,6 @@ def evaluate_planner_realizer(
     reference_split: str = "val",
     catalog_noise_coupling: str = "independent",
 ) -> dict[str, Any]:
-    """Complete planner samples with the realizer, score both arms against
-    the reference split, and write the report to ``output``."""
     if candidate_selection != "first" and candidate_prior is None:
         raise ValueError("--candidate-selection requires --candidate-prior")
     started = time.perf_counter()

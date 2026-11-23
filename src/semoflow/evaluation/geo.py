@@ -11,14 +11,11 @@ from semoflow.evaluation.distribution import jsd
 
 _EARTH_RADIUS_KM = 6371.0
 _DISTANCE_BINS = 50
-
-
 _CACHE_CAPACITY = 16
 _table_caches: dict[Callable[..., Any], list[tuple[Any, Any]]] = {}
 
 
 def _cached_table[K, V](build: Callable[[K], V], lookup: K) -> V:
-    """``build(lookup)``, memoized on the lookup's identity (LRU of 16)."""
     cache = _table_caches.setdefault(build, [])
     for index, (stored, table) in enumerate(cache):
         if stored is lookup:
@@ -72,7 +69,6 @@ def _table_rows(
     max_id: int,
     pad_id: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Clamped lookup-table row per token and whether the token has one."""
     values = tokens.long()
     rows = values.clamp(0, max_id)
     keep = (
@@ -89,7 +85,6 @@ def _lookup_coordinates(
     placekey_latlon: dict[int, tuple[float, float]],
     pad_id: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """(lat, lon) per token and whether it is a located POI."""
     coords, lookup_valid, max_id = _cached_table(
         _latlon_table, placekey_latlon
     )
@@ -151,7 +146,6 @@ def per_sequence_travel_distance(
 def _distance_bins(
     real: torch.Tensor, generated: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Equal-width bin index of every value over the pooled [0, max] range."""
     max_value = float(torch.maximum(real.max(), generated.max()).item())
 
     def _bins(values: torch.Tensor) -> torch.Tensor:
@@ -167,7 +161,6 @@ def _distance_bins(
 
 
 def _binned_jsd(real: torch.Tensor, generated: torch.Tensor) -> float:
-    """JSD of two non-negative samples over shared distance bins."""
 
     def _hist(bins: torch.Tensor) -> torch.Tensor:
         counts = torch.bincount(bins, minlength=_DISTANCE_BINS).float()

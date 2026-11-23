@@ -1,6 +1,5 @@
 import warnings
 
-# torch_geometric still calls the deprecated torch.jit.script on import.
 warnings.filterwarnings(
     "ignore",
     message=(

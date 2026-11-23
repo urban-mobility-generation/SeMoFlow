@@ -1,5 +1,3 @@
-"""The HeteroSAGE POI graph encoder and its contrastive training losses."""
-
 from __future__ import annotations
 
 import torch
@@ -9,10 +7,6 @@ from torch_geometric.nn import HeteroConv, SAGEConv
 
 
 class HeteroSAGE(nn.Module):
-    """Per-node-type input projections, optionally concatenated with learned
-    node-ID embeddings, followed by ``num_layers`` heterogeneous SAGE
-    convolutions with optional LayerNorm and residual connections."""
-
     def __init__(
         self,
         metadata: tuple[list[str], list[tuple[str, str, str]]],
@@ -119,8 +113,6 @@ def variance_covariance_penalty(
     variance_target: float = 1.0,
     eps: float = 1e-4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """VICReg-style penalties: per-dimension std below ``variance_target``
-    and squared off-diagonal covariance."""
     n_rows, n_dims = poi_emb.shape
     if n_rows < 2:
         zero = poi_emb.sum() * 0.0
@@ -145,9 +137,6 @@ def contrastive_link_loss(
     max_negatives: int = 2048,
     max_queries: int = 65536,
 ) -> torch.Tensor:
-    """InfoNCE over positive POI transitions against shared in-batch
-    negatives, with each source's explicit hard negative in the first slot
-    and target collisions masked out."""
     source, target = pos_edges
     if source.numel() == 0:
         return poi_emb.sum() * 0.0

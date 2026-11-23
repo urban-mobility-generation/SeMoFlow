@@ -46,7 +46,6 @@ def _causal_history_mask(prefix_codes: torch.Tensor) -> torch.Tensor:
 def _same_prefix(
     prefix_codes: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Which memory steps hold an event, and which pairs share a prefix."""
     valid = (prefix_codes >= 0).all(dim=-1)
     same = (prefix_codes[:, :, None, :] == prefix_codes[:, None, :, :]).all(
         dim=-1
@@ -251,8 +250,6 @@ class ExploreRetrieveRouter(nn.Module):
         history_mask: torch.Tensor,
         distinct_prefix_count: torch.Tensor,
     ) -> ExploreRetrieveRoutingOutput:
-        """Mix the retrieval experts and gate retrieval against exploration;
-        rows without history always explore."""
         mechanism_log_weights = F.log_softmax(
             self.mechanism_router(query_states).float(), dim=-1
         )
@@ -377,10 +374,17 @@ def prefix_target_log_probability(
     prefix_logits: torch.Tensor,
     prefix_targets: torch.Tensor,
 ) -> torch.Tensor:
-    """Hierarchical log-probability of ``prefix_targets`` ([..., P])."""
     selected = (
         F.log_softmax(prefix_logits.float(), dim=-1)
         .gather(-1, prefix_targets[..., None])
         .squeeze(-1)
     )
     return selected.sum(dim=-1)
+
+
+__all__ = [
+    "ExploreRetrieveRouter",
+    "explore_retrieve_target_log_probability",
+    "prefix_target_log_probability",
+    "retrieval_target_log_probability",
+]

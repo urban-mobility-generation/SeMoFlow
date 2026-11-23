@@ -17,11 +17,9 @@ from typing import Annotated, Any, Literal
 import typer
 
 from semoflow.config import ExperimentConfig, load_config
-from semoflow.utils.log import configure_logging
-from semoflow.utils.serialization import dump_json, write_json
+from semoflow.utils import configure_logging, dump_json, write_json
 
 logger = logging.getLogger(__name__)
-
 app = typer.Typer(
     help=(
         "Run a SeMoFlow stage. Every stage reads one experiment config and "
@@ -31,7 +29,6 @@ app = typer.Typer(
     add_completion=False,
     pretty_exceptions_show_locals=False,
 )
-
 Config = Annotated[
     Path,
     typer.Option(
@@ -93,7 +90,6 @@ def _git(*args: str) -> str:
 
 
 def _write_manifest(directory: Path, **fields: Any) -> None:
-    """Record the command, code revision and environment of a stage run."""
     packages = {
         name: metadata.version(name)
         for name in ("torch", "polars", "numpy", "pyyaml")
@@ -195,7 +191,7 @@ def planner_data(
     force: Force = False,
     log_level: LogLevel = "INFO",
 ) -> None:
-    from semoflow.planner.dataset_build import build_planner_data
+    from semoflow.planner.data import build_planner_data
 
     cfg = _load(config, sets, log_level)
     _echo(build_planner_data(cfg.planner.data, cfg.layout, force=force))

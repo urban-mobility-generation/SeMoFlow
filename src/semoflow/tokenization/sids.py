@@ -1,6 +1,3 @@
-"""Semantic IDs: the ``sem_code_*`` columns, integer keys for code rows,
-the tokenizer codebooks, and the grounding index from SIDs to POIs."""
-
 from __future__ import annotations
 
 import functools
@@ -29,8 +26,6 @@ def sid_code_columns(columns: Iterable[str]) -> tuple[str, ...]:
 def packed_code_keys(
     codes: torch.Tensor, *, codebook_size: int
 ) -> torch.LongTensor:
-    """Each ``[..., width]`` code row as one base-``codebook_size`` integer,
-    first level most significant, so key order is lexicographic code order."""
     width = codes.shape[-1]
     powers = torch.tensor(
         [codebook_size**power for power in range(width - 1, -1, -1)],
@@ -43,10 +38,6 @@ def packed_code_keys(
 def find_sorted(
     sorted_keys: torch.Tensor, keys: torch.Tensor
 ) -> tuple[torch.LongTensor, torch.BoolTensor]:
-    """Each key's position in ``sorted_keys`` and whether it is there.
-
-    Positions of absent keys are clamped into range, so they index safely.
-    """
     positions = torch.searchsorted(sorted_keys, keys)
     safe = positions.clamp_max(max(sorted_keys.numel() - 1, 0))
     found = (positions < sorted_keys.numel()) & (sorted_keys[safe] == keys)
@@ -54,7 +45,6 @@ def find_sorted(
 
 
 def load_codebooks(path: str | Path) -> torch.Tensor:
-    """The ``[levels, codebook_size, dim]`` codebooks a tokenizer published."""
     payload = torch.load(Path(path), map_location="cpu", weights_only=False)
     return payload["codebooks"].detach().float().contiguous()
 
@@ -62,7 +52,6 @@ def load_codebooks(path: str | Path) -> torch.Tensor:
 def codes_to_embeddings(
     codes: torch.Tensor, codebooks: torch.Tensor
 ) -> torch.Tensor:
-    """Sum of each level's codebook row: ``[..., levels]`` to ``[..., dim]``."""
     codes = codes.long()
     codebooks = codebooks.to(codes.device)
     if codes.numel() and (
@@ -76,7 +65,6 @@ def codes_to_embeddings(
 
 
 def pack_code_rows(rows: np.ndarray) -> np.ndarray:
-    """Pack each row of byte-sized codes into one uint64 key."""
     packed = np.zeros(rows.shape[0], dtype=np.uint64)
     for column in range(rows.shape[1]):
         packed |= rows[:, column].astype(np.uint64) << (8 * column)
@@ -84,9 +72,6 @@ def pack_code_rows(rows: np.ndarray) -> np.ndarray:
 
 
 class SemanticIDGroundingIndex:
-    """Each full SID's candidate POIs, as payload dicts keyed by
-    ``placekey_id``, in catalog order."""
-
     def __init__(
         self,
         *,
@@ -105,8 +90,6 @@ class SemanticIDGroundingIndex:
     def from_frame(
         cls, frame: pl.DataFrame, *, payload_columns: Sequence[str]
     ) -> SemanticIDGroundingIndex:
-        """Group ``frame`` rows by their ``sem_code_*`` columns, keeping
-        each ``placekey_id`` once per SID."""
         keys = list(sid_code_columns(frame.columns))
         if not keys:
             raise ValueError("no semantic code columns found")
@@ -127,7 +110,6 @@ class SemanticIDGroundingIndex:
     def _packed_lookup(
         self,
     ) -> tuple[np.ndarray, list[list[dict[str, Any]]]]:
-        """Sorted packed keys and each key's candidate payloads."""
         key_rows = np.asarray(list(self.groups), dtype=np.int64)
         if np.any((key_rows < 0) | (key_rows > 255)):
             raise ValueError(
@@ -139,7 +121,6 @@ class SemanticIDGroundingIndex:
         return packed[order], [payload_rows[int(index)] for index in order]
 
     def packed_lookup_table(self) -> tuple[np.ndarray, list[dict[str, Any]]]:
-        """Sorted packed keys and each key's first candidate payload."""
         keys, groups = self._packed_lookup
         return keys, [group[0] for group in groups]
 

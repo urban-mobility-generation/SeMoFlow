@@ -18,35 +18,32 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from semoflow.config import PlannerConfig, RunLayout
-from semoflow.planner.artifacts import (
-    OccurrencePlannerDataset,
-    load_occurrence_planner_dataset,
-    save_occurrence_planner_checkpoint,
-)
-from semoflow.planner.config import OccurrencePlannerConfig
+from semoflow.planner.artifacts import save_occurrence_planner_checkpoint
 from semoflow.planner.data import (
-    OccurrencePlannerTensorDataset,
+    OccurrencePlannerDataset,
+    SeededShuffleSampler,
     build_occurrence_tensor_dataloader,
+    load_occurrence_planner_dataset,
 )
-from semoflow.planner.loss import occurrence_planner_loss
-from semoflow.planner.model import OccurrenceARPlanner
-from semoflow.utils.log import (
-    get_configured_log_file,
-    log_epoch_summary,
-    log_training_step,
+from semoflow.planner.model import (
+    OccurrenceARPlanner,
+    OccurrencePlannerConfig,
+    occurrence_planner_loss,
 )
-from semoflow.utils.serialization import write_json
-from semoflow.utils.training import (
+from semoflow.utils import (
     EarlyStopper,
     build_lr_scheduler,
     ddp_worker,
     find_free_port,
+    get_configured_log_file,
+    log_epoch_summary,
+    log_training_step,
     parse_device_spec,
     set_seed_all,
+    write_json,
 )
 
 logger = logging.getLogger(__name__)
-
 _OUTPUT_NAMES = ("best.pt", "last.pt", "metrics.json")
 _METRIC_NAMES = (
     "nll",
@@ -75,8 +72,6 @@ class _Rank:
 
 
 class _NLL:
-    """Sequence and event totals of the planner's NLL terms."""
-
     def __init__(self) -> None:
         self.sums = [0.0] * 6
 
@@ -118,7 +113,6 @@ def _prefixed(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
 def _evaluate(
     model: OccurrenceARPlanner, loader: DataLoader, rank: _Rank
 ) -> dict[str, float]:
-    """NLL on ``loader``, computed on the primary rank and shared."""
     values = torch.zeros(
         len(_METRIC_NAMES), dtype=torch.float64, device=rank.device
     )
@@ -181,7 +175,6 @@ def _synchronize(device: torch.device) -> None:
 def train_occurrence_planner(
     settings: PlannerConfig, layout: RunLayout
 ) -> dict[str, Any]:
-    """Train on one device, or as one rank of an initialized process group."""
     options, seed = settings.training, settings.seed
     if dist.is_available() and dist.is_initialized():
         rank, world_size = dist.get_rank(), dist.get_world_size()
@@ -256,10 +249,9 @@ def train_occurrence_planner(
         num_workers=options.num_workers,
         pin_memory=device.type == "cuda",
     )
-    train_set = OccurrencePlannerTensorDataset(dataset.train)
     sampler = (
         DistributedSampler(
-            train_set,
+            range(dataset.train.size),
             num_replicas=world_size,
             rank=rank,
             shuffle=True,
@@ -267,15 +259,11 @@ def train_occurrence_planner(
             drop_last=False,
         )
         if ctx.distributed
-        else None
+        else SeededShuffleSampler(dataset.train.size, seed=seed)
     )
-    train_loader = build(
-        train_set, shuffle=sampler is None, seed=seed, sampler=sampler
-    )
-    val_loader = build(
-        OccurrencePlannerTensorDataset(dataset.validation), shuffle=False
-    )
-    train_eval_loader = build(train_set, shuffle=False)
+    train_loader = build(dataset.train, sampler=sampler)
+    val_loader = build(dataset.validation)
+    train_eval_loader = build(dataset.train)
 
     steps_per_epoch = len(train_loader)
     total_steps = steps_per_epoch * options.epochs
@@ -302,10 +290,10 @@ def train_occurrence_planner(
     epoch = 0
     for epoch in range(1, options.epochs + 1):
         if device.type == "cuda":
-            _synchronize(device)
+            torch.cuda.synchronize(device)
             torch.cuda.reset_peak_memory_stats(device)
         started = time.perf_counter()
-        if sampler is not None:
+        if isinstance(sampler, DistributedSampler):
             sampler.set_epoch(epoch)
         train_model.train()
         nll = _NLL()
@@ -454,7 +442,6 @@ def _spawn_worker(
 def train_planner(
     settings: PlannerConfig, layout: RunLayout, *, log_level: str = "INFO"
 ) -> dict[str, Any]:
-    """Train in this process, or spawn one DDP rank per listed GPU."""
     _, device_ids = parse_device_spec(settings.training.device)
     if len(device_ids) < 2:
         return train_occurrence_planner(settings, layout)

@@ -1,51 +1,138 @@
 from __future__ import annotations
 
+import dataclasses
+import math
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-from semoflow.planner.config import OccurrencePlannerConfig
-from semoflow.planner.decoders import (
+from semoflow.planner.layers import (
     HierarchicalPrefixDecoder,
+    LegalPrefixIndex,
     PrefixDistanceContext,
+    PrefixDistancePrior,
+    SpatioTemporalRelationBias,
+    SpatioTemporalTransformer,
     sample_categorical_logits,
 )
-from semoflow.planner.geography import PrefixDistancePrior
-from semoflow.planner.legality import LegalPrefixIndex
-from semoflow.planner.mobility_router import (
+from semoflow.planner.router import (
     ExploreRetrieveRouter,
     explore_retrieve_target_log_probability,
     prefix_target_log_probability,
     retrieval_target_log_probability,
 )
-from semoflow.planner.spatiotemporal_transformer import (
-    SpatioTemporalRelationBias,
-    SpatioTemporalTransformer,
-)
-from semoflow.planner.time_features import (
-    TIME_FEATURE_DIM,
-    time_features,
-)
-from semoflow.planner.types import (
-    OccurrenceBatch,
-    OccurrenceGenerationCache,
-    OccurrencePlannerOutput,
-    OccurrenceStepSample,
-)
+
+
+@dataclass(frozen=True, slots=True)
+class OccurrencePlannerConfig:
+    codebook_size: int
+    gap_vocab: int
+    gap_codec_version: str
+    gap_bucket_edges_minutes: tuple[float, ...]
+    gap_duration_minutes: tuple[float, ...]
+    observation_window_minutes: float
+    prefix_depth: int = 3
+    max_occurrences: int = 128
+    model_dim: int = 128
+    n_heads: int = 4
+    n_layers: int = 4
+    dropout: float = 0.1
+    city_conditioning: bool = False
+    mobility_gate_prior: str = "log_distinct"
+    use_distance_prior: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class OccurrenceBatch:
+    previous_prefix_codes: torch.Tensor
+    previous_gap_tokens: torch.Tensor
+    previous_event_time_minutes: torch.Tensor
+    target_prefix_codes: torch.Tensor
+    target_gap_tokens: torch.Tensor
+    valid_mask: torch.Tensor
+    lengths: torch.Tensor
+    city_ids: torch.Tensor
+
+    def _map_tensors(
+        self, transform: Callable[[torch.Tensor], torch.Tensor]
+    ) -> OccurrenceBatch:
+        return OccurrenceBatch(
+            **{
+                field.name: transform(getattr(self, field.name))
+                for field in dataclasses.fields(self)
+            }
+        )
+
+    def to(
+        self, device: torch.device | str, *, non_blocking: bool = False
+    ) -> OccurrenceBatch:
+        return self._map_tensors(
+            lambda tensor: tensor.to(device, non_blocking=non_blocking)
+        )
+
+    def pin_memory(self) -> OccurrenceBatch:
+        return self._map_tensors(torch.Tensor.pin_memory)
+
+
+@dataclass(frozen=True, slots=True)
+class OccurrencePlannerOutput:
+    length_logits: torch.Tensor
+    gap_logits: torch.Tensor
+    prefix_log_probability: torch.Tensor
+
+
+@dataclass(frozen=True, slots=True)
+class OccurrencePlannerLoss:
+    total: torch.Tensor
+    length: torch.Tensor
+    gap: torch.Tensor
+    prefix: torch.Tensor
+
+
+_DAY_MINUTES = 1440.0
+_WEEK_MINUTES = 10080.0
+_DAILY_HARMONICS = 4
+_WEEKLY_HARMONICS = 2
+TIME_FEATURE_DIM = 2 * (_DAILY_HARMONICS + _WEEKLY_HARMONICS) + 2
+
+
+def time_features(
+    event_time_minutes: torch.Tensor,
+    *,
+    observation_window_minutes: float,
+) -> torch.Tensor:
+    minutes = event_time_minutes.float()
+    day_phase = (
+        2.0 * math.pi * torch.remainder(minutes, _DAY_MINUTES) / _DAY_MINUTES
+    )
+    week_phase = (
+        2.0 * math.pi * torch.remainder(minutes, _WEEK_MINUTES) / _WEEK_MINUTES
+    )
+    features: list[torch.Tensor] = []
+    for harmonic in range(1, _DAILY_HARMONICS + 1):
+        features.append(torch.sin(harmonic * day_phase))
+        features.append(torch.cos(harmonic * day_phase))
+    for harmonic in range(1, _WEEKLY_HARMONICS + 1):
+        features.append(torch.sin(harmonic * week_phase))
+        features.append(torch.cos(harmonic * week_phase))
+    elapsed_fraction = torch.clamp(
+        minutes / observation_window_minutes, 0.0, 1.0
+    )
+    features.append(elapsed_fraction)
+    features.append(1.0 - elapsed_fraction)
+    return torch.stack(features, dim=-1)
 
 
 def _gap_duration_buffers(
     config: OccurrencePlannerConfig,
 ) -> dict[str, torch.Tensor]:
-    """Per-gap-token duration bounds and representatives, in minutes."""
     edges = torch.tensor(config.gap_bucket_edges_minutes, dtype=torch.float32)
-    window = torch.tensor(
-        [config.observation_window_minutes], dtype=torch.float32
-    )
     return {
         "gap_duration_lower_minutes": torch.cat((torch.zeros(1), edges)),
-        "gap_duration_upper_minutes": torch.cat((edges, window)),
         "gap_representative_minutes": torch.tensor(
             config.gap_duration_minutes, dtype=torch.float32
         ),
@@ -143,7 +230,6 @@ class OccurrenceARPlanner(nn.Module):
             gate_prior=config.mobility_gate_prior,
         )
 
-    # Released checkpoints carry an empty ``_extra_state`` entry.
     def get_extra_state(self) -> dict[str, Any]:
         return {}
 
@@ -151,7 +237,6 @@ class OccurrenceARPlanner(nn.Module):
         pass
 
     def catalog_rows(self, city_ids: torch.Tensor) -> torch.Tensor:
-        """Row of each city in the catalog's city-legality mask."""
         return torch.searchsorted(self.catalog_city_ids, city_ids.contiguous())
 
     def _add_city_state(
@@ -204,13 +289,15 @@ class OccurrenceARPlanner(nn.Module):
         representatives = self.gap_representative_minutes[gap_tokens].float()
         return (previous_time_minutes + representatives).clamp(max=window)
 
-    def condition_on_gap_and_time(
+    def _condition(
         self,
         hidden: torch.Tensor,
         gap_tokens: torch.Tensor,
         arrival_time_minutes: torch.Tensor,
     ) -> torch.Tensor:
-        conditioned = self.condition_on_gap(hidden, gap_tokens)
+        conditioned = hidden + self.gap_condition(
+            self.gap_embedding(gap_tokens)
+        )
         return conditioned + self._time_state_embedding(arrival_time_minutes)
 
     def predict_length(self, city_ids: torch.Tensor) -> torch.Tensor:
@@ -220,8 +307,6 @@ class OccurrenceARPlanner(nn.Module):
     def _embed_events(
         self, prefix_codes: torch.Tensor, gap_tokens: torch.Tensor
     ) -> torch.Tensor:
-        """Summed prefix-level and gap embeddings; ``-1`` (no event) maps
-        to each table's padding row."""
         prefix_ids = torch.where(
             prefix_codes >= 0,
             prefix_codes,
@@ -247,7 +332,6 @@ class OccurrenceARPlanner(nn.Module):
         lengths: torch.Tensor,
         city_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """The causal input state of each step from its previous event."""
         hidden = self._embed_events(previous_prefix_codes, previous_gap_tokens)
         bos = (previous_prefix_codes < 0).all(dim=-1)
         hidden = hidden + bos[..., None] * self.bos_embedding
@@ -276,86 +360,6 @@ class OccurrenceARPlanner(nn.Module):
         memory = self._embed_events(previous_prefix_codes, previous_gap_tokens)
         return memory + self._time_state_embedding(previous_event_time_minutes)
 
-    def initialize_generation_cache(
-        self,
-        *,
-        batch_size: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> OccurrenceGenerationCache:
-        head_dim = self.config.model_dim // self.config.n_heads
-        shape = (batch_size, self.config.n_heads, 0, head_dim)
-        return OccurrenceGenerationCache(
-            keys=tuple(
-                torch.empty(shape, device=device, dtype=dtype)
-                for _ in range(self.config.n_layers)
-            ),
-            values=tuple(
-                torch.empty(shape, device=device, dtype=dtype)
-                for _ in range(self.config.n_layers)
-            ),
-        )
-
-    def _embed_history_step(
-        self,
-        batch: OccurrenceBatch,
-        *,
-        step: int,
-        active: torch.Tensor,
-    ) -> torch.Tensor:
-        window = slice(step, step + 1)
-        return self._embed_history(
-            batch.previous_prefix_codes[active, window],
-            batch.previous_gap_tokens[active, window],
-            batch.previous_event_time_minutes[active, window],
-            batch.lengths[active],
-            batch.city_ids[active],
-        )
-
-    @torch.no_grad()
-    def _encode_history_step(
-        self,
-        batch: OccurrenceBatch,
-        *,
-        step: int,
-        active: torch.Tensor,
-        cache: OccurrenceGenerationCache,
-    ) -> tuple[torch.Tensor, OccurrenceGenerationCache]:
-        batch_size = batch.previous_prefix_codes.shape[0]
-        hidden = self._embed_history_step(batch, step=step, active=active)
-        new_keys: list[torch.Tensor] = []
-        new_values: list[torch.Tensor] = []
-        head_dim = self.config.model_dim // self.config.n_heads
-        relation_bias = self.relation_bias.step(
-            batch.previous_prefix_codes[active],
-            batch.previous_event_time_minutes[active],
-            step=step,
-        )
-        for layer_index, layer in enumerate(self.transformer.layers):
-            past_keys = cache.keys[layer_index]
-            past_values = cache.values[layer_index]
-            hidden, current_key, current_value = layer.forward_step(
-                hidden,
-                step=step,
-                past_key=past_keys[active],
-                past_value=past_values[active],
-                relation_bias=relation_bias,
-            )
-            key_slot = torch.zeros(
-                (batch_size, self.config.n_heads, 1, head_dim),
-                device=hidden.device,
-                dtype=hidden.dtype,
-            )
-            value_slot = torch.zeros_like(key_slot)
-            key_slot[active] = current_key
-            value_slot[active] = current_value
-            new_keys.append(torch.cat((past_keys, key_slot), dim=2))
-            new_values.append(torch.cat((past_values, value_slot), dim=2))
-        hidden = self.transformer.final_norm(hidden)
-        return hidden.squeeze(1), OccurrenceGenerationCache(
-            keys=tuple(new_keys), values=tuple(new_values)
-        )
-
     def _encode_history(self, batch: OccurrenceBatch) -> torch.Tensor:
         previous_prefixes = batch.previous_prefix_codes
         hidden = self._embed_history(
@@ -375,12 +379,29 @@ class OccurrenceARPlanner(nn.Module):
             valid_mask=batch.valid_mask,
         )
 
-    def condition_on_gap(
-        self, hidden: torch.Tensor, gap_tokens: torch.Tensor
+    def initialize_generation_cache(
+        self,
+        *,
+        batch_size: int,
+        max_length: int,
+        device: torch.device,
+        dtype: torch.dtype,
     ) -> torch.Tensor:
-        return hidden + self.gap_condition(self.gap_embedding(gap_tokens))
+        config = self.config
+        return torch.zeros(
+            (
+                config.n_layers,
+                2,
+                batch_size,
+                config.n_heads,
+                max_length,
+                config.model_dim // config.n_heads,
+            ),
+            device=device,
+            dtype=dtype,
+        )
 
-    def _sample_routed_prefix(
+    def _sample_prefix(
         self,
         conditioned: torch.Tensor,
         *,
@@ -388,146 +409,97 @@ class OccurrenceARPlanner(nn.Module):
         memory_gap_tokens: torch.Tensor,
         memory_event_time_minutes: torch.Tensor,
         catalog_rows: torch.Tensor,
-        distance: PrefixDistanceContext | None,
-        prefix_temperature: float,
+        temperature: float,
         route_temperature: float,
-        generator: torch.Generator | None,
+        generator: torch.Generator,
     ) -> torch.Tensor:
-        """Sample a prefix by exploring the decoder or retrieving memory."""
         memory_states = self._embed_retrieval_memory(
-            memory_prefix_codes,
-            memory_gap_tokens,
-            memory_event_time_minutes,
+            memory_prefix_codes, memory_gap_tokens, memory_event_time_minutes
         )
         routing = self.mobility_router.forward_step(
-            conditioned,
-            memory_states,
-            memory_prefix_codes,
+            conditioned, memory_states, memory_prefix_codes
         )
         explore_prefix = self.prefix_decoder.sample(
             conditioned,
-            temperature=prefix_temperature,
+            temperature=temperature,
             generator=generator,
             catalog_rows=catalog_rows,
-            distance=distance,
+            distance=self._distance_context(memory_prefix_codes[:, -1]),
         )
-
-        history_available = routing.history_mask.any(dim=-1)
-        safe_retrieval_logits = (
-            routing.retrieval_log_probability.float().clone()
-        )
-        if bool((~history_available).any()):
-            safe_retrieval_logits[~history_available] = float("-inf")
-            safe_retrieval_logits[~history_available, 0] = 0.0
+        no_history = ~routing.history_mask.any(dim=-1)
+        retrieval_logits = routing.retrieval_log_probability.float().clone()
+        retrieval_logits[no_history] = float("-inf")
+        retrieval_logits[no_history, 0] = 0.0
         retrieval_choice = sample_categorical_logits(
-            safe_retrieval_logits,
-            temperature=prefix_temperature,
-            generator=generator,
+            retrieval_logits, temperature=temperature, generator=generator
         )
-        row = torch.arange(
-            conditioned.shape[0], device=memory_prefix_codes.device
-        )
+        row = torch.arange(conditioned.shape[0], device=conditioned.device)
         retrieved_prefix = memory_prefix_codes[row, retrieval_choice]
-
-        route_probability_policy = torch.sigmoid(
+        retrieve_probability = torch.sigmoid(
             routing.retrieve_logit / route_temperature
-        ).masked_fill(~history_available, 0.0)
+        )
         route_draw = torch.rand(
-            route_probability_policy.shape,
+            retrieve_probability.shape,
             device=conditioned.device,
             generator=generator,
         )
-        use_retrieve = (
-            route_draw < route_probability_policy
-        ) & history_available
+        use_retrieve = route_draw < retrieve_probability
         return torch.where(
             use_retrieve[:, None], retrieved_prefix, explore_prefix
         )
 
-    def _sample_from_hidden(
-        self,
-        hidden: torch.Tensor,
-        *,
-        previous_time_minutes: torch.Tensor,
-        memory_prefix_codes: torch.Tensor,
-        memory_gap_tokens: torch.Tensor,
-        memory_event_time_minutes: torch.Tensor,
-        catalog_rows: torch.Tensor,
-        gap_temperature: float,
-        prefix_temperature: float,
-        route_temperature: float,
-        generator: torch.Generator | None,
-    ) -> OccurrenceStepSample:
-        distance = self._distance_context(memory_prefix_codes[:, -1])
-        earliest_previous_time = self._earliest_previous_event_time(
-            memory_gap_tokens
-        )[:, -1]
-        gap_logits = self._mask_gap_logits_by_horizon(
-            self.gap_head(hidden), earliest_previous_time
-        )
-        gap_tokens = sample_categorical_logits(
-            gap_logits,
-            temperature=gap_temperature,
-            generator=generator,
-        )
-        arrival_time_minutes = self._reconstruct_arrival_time(
-            previous_time_minutes, gap_tokens
-        )
-        conditioned = self.condition_on_gap_and_time(
-            hidden, gap_tokens, arrival_time_minutes
-        )
-        prefix = self._sample_routed_prefix(
-            conditioned,
-            memory_prefix_codes=memory_prefix_codes,
-            memory_gap_tokens=memory_gap_tokens,
-            memory_event_time_minutes=memory_event_time_minutes,
-            catalog_rows=catalog_rows,
-            distance=distance,
-            prefix_temperature=prefix_temperature,
-            route_temperature=route_temperature,
-            generator=generator,
-        )
-        return OccurrenceStepSample(
-            gap_tokens=gap_tokens,
-            prefix_codes=prefix,
-            arrival_time_minutes=arrival_time_minutes,
-        )
-
     @torch.no_grad()
-    def sample_next_occurrence(
+    def sample_step(
         self,
-        batch: OccurrenceBatch,
+        history_prefix_codes: torch.Tensor,
+        history_gap_tokens: torch.Tensor,
+        history_event_time_minutes: torch.Tensor,
         *,
+        lengths: torch.Tensor,
+        city_ids: torch.Tensor,
         step: int,
         active: torch.Tensor,
-        cache: OccurrenceGenerationCache,
-        gap_temperature: float,
-        prefix_temperature: float,
+        cache: torch.Tensor,
+        temperature: float,
         route_temperature: float,
-        generator: torch.Generator | None,
-    ) -> tuple[OccurrenceStepSample, OccurrenceGenerationCache]:
-        hidden, cache = self._encode_history_step(
-            batch, step=step, active=active, cache=cache
+        generator: torch.Generator,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        prefixes = history_prefix_codes[active, : step + 1]
+        gaps = history_gap_tokens[active, : step + 1]
+        times = history_event_time_minutes[active, : step + 1]
+        cities = city_ids[active]
+        hidden = self._embed_history(
+            prefixes[:, -1:],
+            gaps[:, -1:],
+            times[:, -1:],
+            lengths[active],
+            cities,
         )
-        sample = self._sample_from_hidden(
+        hidden = self.transformer.forward_step(
             hidden,
-            previous_time_minutes=batch.previous_event_time_minutes[
-                active, step
-            ],
-            memory_prefix_codes=batch.previous_prefix_codes[
-                active, : step + 1
-            ],
-            memory_gap_tokens=batch.previous_gap_tokens[active, : step + 1],
-            memory_event_time_minutes=batch.previous_event_time_minutes[
-                active, : step + 1
-            ],
-            catalog_rows=self.catalog_rows(batch.city_ids[active]),
-            gap_temperature=gap_temperature,
-            prefix_temperature=prefix_temperature,
+            active=active,
+            cache=cache,
+            relation_bias=self.relation_bias.step(prefixes, times),
+        ).squeeze(1)
+        gap_logits = self._mask_gap_logits_by_horizon(
+            self.gap_head(hidden),
+            self._earliest_previous_event_time(gaps)[:, -1],
+        )
+        gap_tokens = sample_categorical_logits(
+            gap_logits, temperature=temperature, generator=generator
+        )
+        arrival = self._reconstruct_arrival_time(times[:, -1], gap_tokens)
+        prefix = self._sample_prefix(
+            self._condition(hidden, gap_tokens, arrival),
+            memory_prefix_codes=prefixes,
+            memory_gap_tokens=gaps,
+            memory_event_time_minutes=times,
+            catalog_rows=self.catalog_rows(cities),
+            temperature=temperature,
             route_temperature=route_temperature,
             generator=generator,
         )
-        return sample, cache
+        return gap_tokens, prefix, arrival
 
     def forward(self, batch: OccurrenceBatch) -> OccurrencePlannerOutput:
         hidden = self._encode_history(batch)
@@ -538,7 +510,7 @@ class OccurrenceARPlanner(nn.Module):
         arrival_time_minutes = self._reconstruct_arrival_time(
             batch.previous_event_time_minutes, batch.target_gap_tokens
         )
-        conditioned = self.condition_on_gap_and_time(
+        conditioned = self._condition(
             hidden, batch.target_gap_tokens, arrival_time_minutes
         )
 
@@ -553,7 +525,7 @@ class OccurrenceARPlanner(nn.Module):
             batch.target_prefix_codes,
             self.legality.codes[safe_token_ids][:, None, :],
         )
-        prefix_logits, prefix_targets = self.prefix_decoder(
+        prefix_logits = self.prefix_decoder(
             conditioned,
             decoder_target_prefix_codes,
             catalog_rows=catalog_rows,
@@ -569,7 +541,7 @@ class OccurrenceARPlanner(nn.Module):
         )
         prefix_log_probability = explore_retrieve_target_log_probability(
             explore_target_log_probability=prefix_target_log_probability(
-                prefix_logits, prefix_targets
+                prefix_logits, decoder_target_prefix_codes
             ),
             routing=routing,
             retrieval_target_log_probability=retrieval_target_log_probability(
@@ -583,3 +555,34 @@ class OccurrenceARPlanner(nn.Module):
             gap_logits=gap_logits,
             prefix_log_probability=prefix_log_probability,
         )
+
+
+def occurrence_planner_loss(
+    output: OccurrencePlannerOutput, batch: OccurrenceBatch
+) -> OccurrencePlannerLoss:
+    valid = batch.valid_mask
+    batch_size = batch.lengths.shape[0]
+    length_loss = F.cross_entropy(output.length_logits, batch.lengths - 1)
+    gap_loss = (
+        F.cross_entropy(
+            output.gap_logits[valid],
+            batch.target_gap_tokens[valid],
+            reduction="sum",
+        )
+        / batch_size
+    )
+    prefix_loss = -output.prefix_log_probability[valid].sum() / batch_size
+    return OccurrencePlannerLoss(
+        total=length_loss + gap_loss + prefix_loss,
+        length=length_loss,
+        gap=gap_loss,
+        prefix=prefix_loss,
+    )
+
+
+__all__ = [
+    "OccurrenceARPlanner",
+    "OccurrenceBatch",
+    "OccurrencePlannerConfig",
+    "occurrence_planner_loss",
+]

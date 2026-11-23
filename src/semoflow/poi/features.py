@@ -11,7 +11,6 @@ import torch
 from semoflow.poi.embeddings import load_poi_embeddings
 
 logger = logging.getLogger(__name__)
-
 TEXT_PREFIX = "text_emb_"
 GRAPH_PREFIX = "graph_emb_"
 PCA_TEXT_PREFIX = "pca_text_"

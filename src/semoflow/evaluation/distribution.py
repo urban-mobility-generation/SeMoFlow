@@ -1,5 +1,3 @@
-"""Jensen-Shannon divergences (natural log) over histograms."""
-
 from __future__ import annotations
 
 import math
@@ -13,7 +11,6 @@ JSD_MAX_NATS = math.log(2.0)
 
 
 def jensen_shannon_divergence(left: np.ndarray, right: np.ndarray) -> float:
-    """JSD of two unnormalized histograms in float64; NaN if one is empty."""
     left_array = np.asarray(left, dtype=np.float64)
     right_array = np.asarray(right, dtype=np.float64)
 
@@ -34,9 +31,6 @@ def jensen_shannon_divergence(left: np.ndarray, right: np.ndarray) -> float:
 
 
 def jsd(p: torch.Tensor, q: torch.Tensor) -> float:
-    """JSD of two unnormalized histogram tensors at their own precision;
-    NaN if one is empty. Travel, radius, spatial and POI-frequency scores
-    use it."""
     p_sum = p.sum()
     q_sum = q.sum()
     if p_sum <= 0 or q_sum <= 0:
@@ -59,7 +53,6 @@ def token_marginal_jsd(
     *,
     pad_id: int = PAD_ID,
 ) -> float:
-    """JSD of the token frequencies of two sequences, ignoring padding."""
     real = tokens_real[tokens_real != pad_id]
     gen = tokens_gen[tokens_gen != pad_id]
     p = torch.bincount(real, minlength=vocab_size).float()[:vocab_size]

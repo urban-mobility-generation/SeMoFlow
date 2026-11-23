@@ -1,5 +1,3 @@
-"""The RQ-VAE semantic-ID tokenizer: a residual MLP encoder, residual vector quantization with Sinkhorn-balanced assignment, and an MLP decoder."""
-
 from __future__ import annotations
 
 import logging
@@ -259,7 +257,6 @@ class RQVAE(nn.Module):
         self.commit_weight = commit_weight
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Reconstruction, quantization and total losses for a batch."""
         x = x.float()
         z_q, _, vq_loss = self.quantizer(self.encoder(x))
         recon_loss = F.mse_loss(self.decoder(z_q), x)
@@ -268,7 +265,6 @@ class RQVAE(nn.Module):
 
     @torch.no_grad()
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """The [N, n_codebooks] semantic codes of each row."""
         was_training = self.training
         self.eval()
         codes = self.quantizer(self.encoder(x.float()))[1].long()

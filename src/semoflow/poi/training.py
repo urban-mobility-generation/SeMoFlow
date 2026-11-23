@@ -1,10 +1,3 @@
-"""The two POI representation stages.
-
-The encoder embeds POI text and trains the HeteroSAGE graph encoder on it;
-the tokenizer fits the RQ-VAE on both embeddings and publishes each POI's
-semantic ID.
-"""
-
 from __future__ import annotations
 
 import contextlib
@@ -40,18 +33,18 @@ from semoflow.poi.graph_model import (
 from semoflow.poi.rqvae import RQVAE, build_tokenizer_model
 from semoflow.poi.text import build_text_embeddings
 from semoflow.tokenization.sids import SemanticIDGroundingIndex, sid_code_names
-from semoflow.utils.log import get_configured_log_file, log_ddp_summary
-from semoflow.utils.serialization import write_json
-from semoflow.utils.training import (
+from semoflow.utils import (
     ddp_worker,
     find_free_port,
+    get_configured_log_file,
+    log_ddp_summary,
     parse_device_spec,
     set_seed_all,
     unwrap_ddp,
+    write_json,
 )
 
 logger = logging.getLogger(__name__)
-
 _LOOKUP_COLUMNS = ("placekey_id", "placekey", "city_id")
 _GROUNDING_COLUMNS = (
     "placekey_id",
@@ -76,8 +69,6 @@ def _batch_loss(
     graph_cfg: GraphEncoderConfig,
     device: torch.device,
 ) -> torch.Tensor:
-    """Contrastive link loss over the batch's labelled POI-POI edges, plus
-    the optional variance/covariance penalty on the POI embeddings."""
     batch = batch.to(device, non_blocking=device.type == "cuda")
     ids = (
         {ntype: batch[ntype].n_id for ntype in batch.node_types}
@@ -126,7 +117,6 @@ def _mean_over_ranks(
 def _build_graph_data(
     cfg: ExperimentConfig,
 ) -> tuple[Any, torch.Tensor | None]:
-    """The train-split heterogeneous POI graph and its held-out edges."""
     graph_cfg = cfg.encoder.graph
     logger.info("Loading processed visits and POI index...")
     stays = pl.read_parquet(cfg.layout.preprocessing.processed_visits)
@@ -149,7 +139,6 @@ def _build_graph_data(
 def _id_embedding_counts(
     graph_cfg: GraphEncoderConfig, data: Any
 ) -> dict[str, int] | None:
-    """Node count per node type that gets a learned ID embedding table."""
     if graph_cfg.id_embedding_dim <= 0:
         return None
     selected = graph_cfg.id_embedding_node_types
@@ -172,7 +161,6 @@ def _id_embedding_counts(
 def _export_poi_embeddings(
     cfg: ExperimentConfig, model: torch.nn.Module, data: Any
 ) -> torch.Tensor:
-    """Write the CPU POI embeddings with their placekey_id index."""
     logger.info("Extracting final POI embeddings...")
     model.eval()
     model.to("cpu")
@@ -187,7 +175,6 @@ def _export_poi_embeddings(
     )
     with torch.no_grad():
         embeddings = model(data.x_dict, data.edge_index_dict, ids)["poi"]
-    # Graph POI nodes are numbered in sorted placekey_id order.
     places = pl.read_parquet(cfg.layout.preprocessing.places_index)
     write_poi_embeddings(
         cfg.layout.graph_embeddings, embeddings, places["placekey_id"].sort()
@@ -251,7 +238,6 @@ def _train(
     n_parameters = sum(p.numel() for p in raw_model.parameters())
     optimizer = torch.optim.Adam(raw_model.parameters(), lr=graph_cfg.lr)
 
-    # An existing best checkpoint resumes training after its epoch.
     start_epoch, best_val_loss = 0, float("inf")
     if best_path.exists():
         checkpoint = torch.load(best_path, map_location=device)
@@ -374,7 +360,6 @@ def _train_worker(
 
 
 def train_heterosage(cfg: ExperimentConfig) -> None:
-    """Train on one device, or spawn one DDP rank per listed GPU."""
     graph_cfg = cfg.encoder.graph
     set_seed_all(graph_cfg.seed)
     device, device_ids = parse_device_spec(graph_cfg.device)
@@ -413,7 +398,6 @@ def train_heterosage(cfg: ExperimentConfig) -> None:
 
 
 def run_encoder_pipeline(cfg: ExperimentConfig) -> None:
-    """Embed POI text, then train the graph encoder on those features."""
     started = time.perf_counter()
     logger.info("running text encoder  model=%s", cfg.encoder.text.model)
     build_text_embeddings(
@@ -508,8 +492,6 @@ def _encode(model: RQVAE, x: torch.Tensor, device: str) -> torch.Tensor:
 
 
 def run_semantic_id_tokenizer(cfg: ExperimentConfig) -> Path:
-    """Fit the RQ-VAE on POI features and publish lookup, grounding index,
-    codebooks, model and SID-augmented visits into the run directory."""
     tcfg, layout = cfg.tokenizer, cfg.layout
     arts = layout.tokenizer
     logger.info("building semantic IDs  run_dir=%s", arts.run_dir)

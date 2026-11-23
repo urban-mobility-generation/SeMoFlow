@@ -1,25 +1,3 @@
-"""Elapsed-time recurrence JSDs over weekly visit sequences.
-
-Two panel metrics compare when generated and real rows return to a POI:
-
-* ``inter_return_time_jsd`` (IRT-JSD): hours between each return and the
-  latest earlier visit to the same POI in the row.
-* ``return_index_time_joint_jsd``: the same returns on a joint grid of exact
-  visit-index gap x elapsed hours, so a generator must match both how many
-  visits and how much time separate a return from its previous visit.
-
-Gaps are placed on centers every ``grid_hours`` by linear interpolation (soft
-binning), with no clipping or wrapping. Index gaps are exact integers. JSDs use
-natural logarithms, union support and no pseudocounts; a side with no returns
-gives ``NaN``. Repeat rates and the rate-aware composite are required
-companions because both JSDs ignore how often rows return.
-
-Rows are cut at the horizon: events up to and including the first one at
-``horizon_hours`` are kept and the rest dropped, so clamped arrival times do
-not create artificial zero-hour returns. Missing, non-finite, decreasing or
-beyond-horizon clocks raise; callers report such panels as unavailable.
-"""
-
 from __future__ import annotations
 
 import dataclasses
@@ -39,13 +17,6 @@ WEEK_HOURS = 168.0
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class ReturnEvents:
-    """Padded per-visit inputs, all shaped ``[rows, width]``.
-
-    ``place_ids`` are grounded POI identities and ``hours`` elapsed hours from
-    a row-local origin. Values at inactive positions are ignored; active
-    positions are compacted in order, as in the index recurrence metric.
-    """
-
     place_ids: np.ndarray
     hours: np.ndarray
     valid: np.ndarray
@@ -120,11 +91,6 @@ def soft_time_histogram(
     index_gaps: np.ndarray | None = None,
     n_index_bins: int = 1,
 ) -> np.ndarray:
-    """Split each gap's unit mass between its two nearest grid centers.
-
-    With ``index_gaps`` the result is ``[n_index_bins, n_bins]``: each return
-    keeps its exact index gap and is softly binned in time only.
-    """
     gaps = np.asarray(gaps_hours, dtype=np.float64)
     rows = (
         np.zeros(len(gaps), dtype=np.int64)
@@ -145,7 +111,6 @@ def _rate(side: _Side) -> float:
 
 
 def _composite(real: _Side, gen: _Side, q_real, q_gen) -> float:
-    """JSD over (FIRST_VISIT, r * q) so a never-returning side is penalized."""
     r_real, r_gen = _rate(real), _rate(gen)
     if math.isnan(r_real) or math.isnan(r_gen):
         return math.nan
@@ -192,7 +157,6 @@ def elapsed_recurrence_jsd(
     grid_hours: float = DEFAULT_GRID_HOURS,
     horizon_hours: float = WEEK_HOURS,
 ) -> dict[str, Any]:
-    """Return IRT-JSD, the index x time joint JSD and required companions."""
     real_side = _collect(real, horizon_hours)
     gen_side = _collect(generated, horizon_hours)
     n_bins = math.floor(horizon_hours / grid_hours) + 2

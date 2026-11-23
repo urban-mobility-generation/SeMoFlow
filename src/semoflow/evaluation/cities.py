@@ -1,9 +1,3 @@
-"""Per-city evaluation behind ``semoflow evaluate``.
-
-Each city's inputs are cut from the joint artifacts; its bank, train-split
-POI prior and sampled plans are then composed and scored.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -24,10 +18,9 @@ from semoflow.realizer.evaluation import (
 from semoflow.tokenization.sids import (
     SemanticIDGroundingIndex,
 )
-from semoflow.utils.serialization import write_json
+from semoflow.utils import write_json
 
 logger = logging.getLogger(__name__)
-
 SEGMENTS_NAME = "segments.parquet"
 LOOKUP_NAME = "placekey_lookup.parquet"
 GROUNDING_NAME = "grounding_index.pkl"
@@ -38,11 +31,6 @@ def evaluate_cities(
     layout: RunLayout,
     cities: list[str],
 ) -> dict[str, dict[str, Any]]:
-    """Sample, compose, and score trajectories for each configured city.
-
-    The city banks keep weeks up to the realizer's sequence length, as its
-    training bank did.
-    """
     max_events = realizer_max_events(layout.realizer_dir / "best.pt")
     return {
         name: _evaluate_city(
@@ -135,12 +123,6 @@ def _extract_city_inputs(
     grounding_index: Path,
     output_dir: Path,
 ) -> None:
-    """Write ``city_id``'s segments, SID lookup, and grounding index.
-
-    Each output keeps the joint artifact's rows, order, and identifiers, so
-    the bank, candidate prior, and composition built from them are those of
-    the joint run restricted to one city.
-    """
     city_lookup = pl.read_parquet(lookup).filter(pl.col("city_id") == city_id)
     city_segments = pl.read_parquet(segments).filter(
         pl.col(SEGMENT_CITY_COLUMN) == city_id
@@ -160,7 +142,6 @@ def _extract_city_inputs(
 
 
 def _build_prior(bank_path: Path) -> dict[str, Any]:
-    """Per-POI visit counts over the bank's train rows."""
     payload = load_bank_payload(bank_path)
     frame = bank_segments(payload, "train", ["placekey_id"])
     counter = Counter(int(value) for value in frame["placekey_id"].explode())

@@ -36,22 +36,19 @@ from semoflow.tokenization.sids import (
     load_codebooks,
     sid_code_columns,
 )
-from semoflow.utils.serialization import write_json
-from semoflow.utils.training import (
+from semoflow.utils import (
     EarlyStopper,
     build_lr_scheduler,
     set_seed_all,
     unwrap_ddp,
+    write_json,
 )
 
 logger = logging.getLogger(__name__)
-
 _CPU_THREADS = 4
 
 
 class _BankSplit(Dataset[dict[str, torch.Tensor]]):
-    """One bank split; a batch is a tensor of row indices of equal length."""
-
     def __init__(
         self, payload: dict[str, Any], split: str, city_vocab: int
     ) -> None:
@@ -85,8 +82,6 @@ class _BankSplit(Dataset[dict[str, torch.Tensor]]):
 
 
 class _LengthBuckets(Sampler[torch.Tensor]):
-    """Batches of equal-length rows, dealt round-robin across ranks."""
-
     def __init__(
         self,
         lengths: torch.Tensor,
@@ -128,7 +123,6 @@ class _LengthBuckets(Sampler[torch.Tensor]):
         if self.shuffle:
             order = torch.randperm(len(batches), generator=generator)
             batches = [batches[int(i)] for i in order.tolist()]
-            # Every rank takes the same number of training steps.
             batches = batches[
                 : len(batches) // self.world_size * self.world_size
             ]
@@ -190,7 +184,6 @@ def _run_epoch(
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
 ) -> float:
-    """Event-weighted mean loss; trains when ``optimizer`` is given."""
     training = optimizer is not None
     model.train(training)
     totals = torch.zeros(2, dtype=torch.float64, device=device)
@@ -233,7 +226,6 @@ def _run_epoch(
 def train_prefix_time_suffix_latent_flow_realizer(
     config: RealizerConfig, layout: RunLayout
 ) -> dict[str, Any]:
-    """Train on ``config.device``, or as one rank of a torchrun group."""
     set_seed_all(config.seed)
     torch.set_num_threads(_CPU_THREADS)
     device = torch.device(config.device)

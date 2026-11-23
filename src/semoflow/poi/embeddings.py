@@ -1,6 +1,3 @@
-"""POI embedding matrices with a ``<name>.index.parquet`` sidecar that maps
-each row to its ``placekey_id``."""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,7 +6,7 @@ import numpy as np
 import polars as pl
 import torch
 
-from semoflow.utils.serialization import write_json
+from semoflow.utils import write_json
 
 
 def _index_path(path: Path) -> Path:
@@ -23,8 +20,6 @@ def write_poi_embeddings(
     *,
     metadata: dict[str, object] | None = None,
 ) -> None:
-    """Save ``embeddings`` (``.npy`` or a torch file) whose rows belong to
-    ``placekey_ids``, plus its index sidecar and optional metadata."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     embeddings = embeddings.detach().cpu().float()
@@ -42,7 +37,6 @@ def write_poi_embeddings(
 def load_poi_embeddings(
     path: Path, places_index: pl.DataFrame
 ) -> torch.Tensor:
-    """The embedding rows of ``path`` in ``places_index`` row order."""
     path = Path(path)
     if path.suffix == ".npy":
         matrix = torch.from_numpy(np.load(path).astype(np.float32, copy=False))

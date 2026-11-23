@@ -1,5 +1,3 @@
-"""The heterogeneous POI graph built from train-split visits, and the link-prediction supervision and neighbor loaders that train on it."""
-
 from __future__ import annotations
 
 import logging
@@ -26,15 +24,12 @@ def build_key_index(series: pl.Series, name: str = "key") -> pl.DataFrame:
 
 
 def _join_idx(df: pl.DataFrame, col: str, lookup: pl.DataFrame) -> pl.Series:
-    """Row index of each ``df[col]`` value in a ``(key, idx)`` lookup."""
     return df.select(pl.col(col).alias("key")).join(
         lookup, on="key", how="left", maintain_order="left"
     )["idx"]
 
 
 _AGGREGATION_CHUNK = 500_000
-
-
 _TIME_OF_DAY_RELATIONS = (
     "next_weekend",
     "next_morning",
@@ -60,7 +55,6 @@ def _mean_features(
     feature_rows: np.ndarray,
     features: torch.Tensor,
 ) -> torch.Tensor:
-    """Average ``features[feature_rows]`` into ``node_index`` buckets."""
     total = torch.zeros(num_nodes, features.shape[1])
     count = torch.zeros(num_nodes, 1)
     for start in range(0, len(node_index), _AGGREGATION_CHUNK):
@@ -78,7 +72,6 @@ def _membership_edges(
     column: str,
     lookup: pl.DataFrame,
 ) -> torch.Tensor:
-    """POI -> attribute-node edges for every POI with a known attribute."""
     pairs = places_index_df.select([poi_col, column]).drop_nulls()
     poi = _join_idx(pairs, poi_col, poi_lookup).fill_null(-1).to_numpy()
     node = _join_idx(pairs, column, lookup).fill_null(-1).to_numpy()
@@ -95,11 +88,6 @@ def _transition_edges(
     train_fraction: float,
     seed: int,
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor, int]:
-    """Consecutive-visit POI edges keyed by the arrival's time of day.
-
-    A seeded ``1 - train_fraction`` share of the transitions is held out
-    and returned as validation edges instead.
-    """
     seq = (
         stays_valid.select(["device_key", poi_col, ts_col])
         .drop_nulls()
@@ -164,11 +152,6 @@ def build_hetero_data(
     train_fraction: float,
     seed: int,
 ) -> tuple[HeteroData, torch.Tensor]:
-    """POI graph with user, category and CBG nodes plus transition edges.
-
-    Returns the graph and the held-out transition edges for link-prediction
-    validation.
-    """
     t0 = time.perf_counter()
     logger.info(
         "Building HeteroData graph  stays=%d  pois=%d",
@@ -304,7 +287,6 @@ def _edge_keys(edge_index: torch.Tensor, n_nodes: int) -> torch.Tensor:
 
 
 def _category_ids(data: HeteroData) -> torch.Tensor:
-    """Each POI's category node, or ``-1`` without a category."""
     edge_index = data["poi", "has_category", "category"].edge_index
     result = torch.full((int(data["poi"].num_nodes),), -1, dtype=torch.long)
     result[edge_index[0]] = edge_index[1]
@@ -438,8 +420,6 @@ def get_train_loader(
     rank: int,
     world_size: int,
 ) -> LinkNeighborLoader:
-    """Link-prediction batches over ``train_edge_index``, or over every
-    temporal POI-POI edge when it is ``None``."""
     target_edges = supervision_edge_types(data)
     supervision_edge_type = target_edges[0]
     if len(target_edges) > 1:

@@ -17,7 +17,7 @@ from semoflow.tokenization.sids import (
     find_sorted,
     packed_code_keys,
 )
-from semoflow.utils.training import unwrap_ddp
+from semoflow.utils import unwrap_ddp
 
 
 def sample_logit_normal_timesteps(
@@ -34,7 +34,6 @@ def sample_logit_normal_timesteps(
 def velocity_from_x0(
     zt: torch.Tensor, x0_pred: torch.Tensor, t: torch.Tensor
 ) -> torch.Tensor:
-    """The flow velocity implied by a clean-data prediction at time ``t``."""
     return (zt - x0_pred) / t[:, None, None].clamp_min(1e-6)
 
 
@@ -46,8 +45,6 @@ def count_catalog_occurrences(
     count_device: torch.device | str = "cpu",
     chunk_size: int = 1_048_576,
 ) -> torch.Tensor:
-    """Count how often each catalog SID occurs among ``[N, M]`` observed
-    code rows."""
     catalog_order = torch.argsort(catalog_keys, stable=True)
     sorted_catalog_keys = catalog_keys[catalog_order].to(count_device)
     sorted_counts = torch.zeros(
@@ -74,7 +71,6 @@ def _prefix_candidate_rows(
     catalog_rows: list[list[int]],
     max_candidates: int,
 ) -> torch.Tensor:
-    """Most frequent half of the budget, then strided coverage."""
     rows = sorted(
         rows,
         key=lambda row_index: (
@@ -96,7 +92,6 @@ def _candidate_table(
     groups: list[torch.Tensor],
     max_candidates: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pad each group's catalog rows into [groups, max_candidates] tables."""
     shape = (len(groups), max_candidates)
     codes = torch.zeros((*shape, catalog.shape[1]), dtype=torch.long)
     log_prior = torch.full(shape, float("-inf"), dtype=torch.float32)
@@ -133,8 +128,6 @@ class CatalogCandidateBank:
         count_device: torch.device | str,
         max_candidates: int,
     ) -> CatalogCandidateBank:
-        """Each legal prefix's candidate table over ``catalog_codes``, with
-        log-count priors from the ``[N, M]`` observed train SIDs."""
         codebook_size = int(codebooks.shape[1])
 
         catalog = torch.unique(catalog_codes.long().cpu(), dim=0).contiguous()
@@ -234,7 +227,6 @@ def suffix_tail_embeddings(
     *,
     prefix_depth: int,
 ) -> torch.Tensor:
-    """Summed codebook embeddings of the levels after ``prefix_depth``."""
     return codes_to_embeddings(
         clean_codes[..., prefix_depth:].long(),
         codebooks.to(clean_codes.device)[prefix_depth:],
@@ -247,7 +239,6 @@ def suffix_tail_level_embeddings(
     *,
     prefix_depth: int,
 ) -> torch.Tensor:
-    """Per-level codebook embeddings ``[..., S, D]`` after ``prefix_depth``."""
     suffix_codes = clean_codes[..., prefix_depth:].long()
     levels = torch.arange(suffix_codes.shape[-1], device=clean_codes.device)
     return codebooks.to(clean_codes.device)[prefix_depth:][
@@ -272,7 +263,6 @@ def compute_tail_whitening_stats(
     chunk_size: int = 16384,
     compute_device: torch.device | str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mean and shrunk-covariance whitener of the train suffix tails."""
     flat_codes = clean_codes.reshape(-1, clean_codes.shape[-1])
     flat_valid = valid_mask.reshape(-1)
     stats_device = (
@@ -335,7 +325,6 @@ def _catalog_features(
     *,
     prefix_depth: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Normalized tails and catalog features of [N, M] or [N, K, M] SIDs."""
     rows = codes if codes.ndim == 3 else codes.unsqueeze(1)
     raw = suffix_tail_embeddings(rows, codebooks, prefix_depth=prefix_depth)
     levels = suffix_tail_level_embeddings(
@@ -355,8 +344,6 @@ def _catalog_softmax_losses(
     catalog_temperature: float,
     population_loss_weight: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Cross-entropy of the target (column 0) against its candidates, and
-    the prior-to-posterior KL when weighted (zero otherwise)."""
     logits = (logits / catalog_temperature).masked_fill(
         ~valid_candidates, float("-inf")
     )
@@ -396,7 +383,6 @@ def _catalog_losses(
     catalog_temperature: float,
     population_loss_weight: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Score each target SID against its prefix's catalog candidates."""
     active_codes = clean_codes[valid_mask].long()
     active_pred = predicted_normalized[valid_mask]
     prefix_indices = candidates._prefix_indices(
@@ -488,8 +474,6 @@ def prefix_time_suffix_latent_flow_loss(
     catalog_prior_weight: float = 0.25,
     city_id: torch.LongTensor | None = None,
 ) -> torch.Tensor:
-    """Flow-matching loss on whitened suffix tails plus the weighted
-    endpoint, calibrated-catalog and population terms."""
     core = cast(PrefixTimeSuffixLatentFlowRealizer, unwrap_ddp(model))
 
     clean_tail = normalize_tail(

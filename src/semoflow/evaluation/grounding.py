@@ -27,8 +27,6 @@ _CANDIDATE_WEIGHT_SMOOTHING = 1.0
 def _vectorized_lookup(
     code_rows: np.ndarray, grounding_index: Any
 ) -> tuple[np.ndarray, list[dict[str, Any]]]:
-    """Each SID row's index into the packed payload table; ``-1`` for a
-    SID with no catalog POI."""
     table_keys, table_payloads = grounding_index.packed_lookup_table()
     packed = pack_code_rows(code_rows)
     positions = np.searchsorted(table_keys, packed, side="left")
@@ -51,7 +49,6 @@ def _candidate_probabilities(
 
 
 def _unique_code_rows(codes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Distinct byte-sized code rows and each row's index into them."""
     packed, inverse = np.unique(pack_code_rows(codes), return_inverse=True)
     unique = np.empty((packed.shape[0], codes.shape[1]), dtype=np.int64)
     for column in range(codes.shape[1]):
@@ -68,15 +65,6 @@ def ground_sid_codes(
     candidate_selection: str = "first",
     candidate_weights: Mapping[int, float] | None = None,
 ) -> torch.Tensor:
-    """The placekey ID each valid ``[rows, events, depth]`` SID grounds to.
-
-    Invalid or ungrounded positions get ``PAD_ID``.
-
-    Each SID resolves to the grounding index's first candidate, or to a
-    train-prior choice under ``candidate_selection``;
-    ``train_prior_sample`` chooses per occurrence. ``preferred_placekey_ids``
-    pins every position to a known POI of its SID instead.
-    """
     if candidate_selection != "first" and candidate_weights is None:
         raise ValueError(
             f"candidate_selection={candidate_selection!r} requires "
@@ -88,7 +76,6 @@ def ground_sid_codes(
     active_codes = codes[active]
     encoded = np.full(len(codes), PAD_ID, dtype=np.int64)
     if preferred_placekey_ids is not None:
-        # Reference positions keep their own POI, a candidate of their SID.
         encoded[active] = (
             preferred_placekey_ids.reshape(-1).cpu().numpy()[active]
         )
@@ -139,10 +126,6 @@ def ground_sid_codes(
 
 
 def _return_histograms(tokens: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
-    """Pooled return-gap (in visits) and per-POI visit-count histograms.
-
-    Values at or beyond the trajectory width share the last bin.
-    """
     width = tokens.size(1)
     gaps = np.zeros(width + 1, dtype=np.int64)
     multiplicity = np.zeros(width + 1, dtype=np.int64)
@@ -169,7 +152,6 @@ def grounded_poi_metrics(
     day_keys_generated: Any,
     compute_device: torch.device | str | None = None,
 ) -> dict[str, float | None]:
-    """The POI-level JSDs between grounded real and generated placekeys."""
     real_gaps, real_multiplicity = _return_histograms(real)
     generated_gaps, generated_multiplicity = _return_histograms(generated)
     if compute_device is not None:

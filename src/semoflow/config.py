@@ -1,7 +1,3 @@
-"""Experiment configuration: every stage's settings, in the order of
-``configs/foursquare.yaml``, the YAML/``--set`` parsing that builds them, and
-the fixed run-directory layout."""
-
 from __future__ import annotations
 
 import dataclasses
@@ -15,12 +11,10 @@ from typing import Any, Final
 
 import yaml
 
-from semoflow.utils.serialization import to_yaml_string
+from semoflow.utils import to_yaml_string
 
 logger = logging.getLogger(__name__)
-
 PAD_ID: Final[int] = 0
-
 CITY_ID: Final[dict[str, int]] = {
     "boston": 0,
     "chicago": 1,
@@ -75,8 +69,6 @@ class TokenizerArtifacts:
 
 @dataclass(frozen=True)
 class RunLayout:
-    """Where each stage of one experiment reads and writes, under ``root``."""
-
     root: Path
 
     @property
@@ -128,15 +120,12 @@ class RunLayout:
         return self.root / "evaluation"
 
 
-# --- YAML and --set parsing ---
-
 _NULL = {"", "null", "none", "~"}
 _TRUE = {"1", "true", "yes", "y", "on"}
 _FALSE = {"0", "false", "no", "n", "off"}
 
 
 def _non_null_types(annotation: Any) -> tuple[list[Any], bool]:
-    """Union members other than ``None``, and whether ``None`` is allowed."""
     if typing.get_origin(annotation) in (typing.Union, types.UnionType):
         members = typing.get_args(annotation)
         kinds = [kind for kind in members if kind is not type(None)]
@@ -152,11 +141,6 @@ def _dataclass_type(annotation: Any) -> type | None:
 
 
 def _coerce(text: str, annotation: Any) -> object:
-    """Parse ``text`` as a value of the field type ``annotation``.
-
-    Used for ``--set`` values and for YAML strings, which PyYAML also
-    produces for exponent floats written without a dot (``2e-4``).
-    """
     kinds, optional = _non_null_types(annotation)
     if optional and text.strip().lower() in _NULL:
         return None
@@ -177,8 +161,6 @@ def _coerce(text: str, annotation: Any) -> object:
 
 
 def apply_override(data: dict[str, Any], override: str, cls: type) -> None:
-    """Set ``field=value`` or ``section.field=value`` in raw config
-    ``data`` for dataclass ``cls``."""
     key, sep, raw_value = override.partition("=")
     parts = key.strip().split(".")
     if not sep or not key.strip():
@@ -207,7 +189,6 @@ def apply_override(data: dict[str, Any], override: str, cls: type) -> None:
 
 
 def from_dict[T](cls: type[T], data: dict[str, Any]) -> T:
-    """Build dataclass ``cls`` from parsed YAML, recursing into sections."""
     if not dataclasses.is_dataclass(cls):
         raise TypeError(f"{cls.__name__} must be a dataclass")
     types_by_name = typing.get_type_hints(cls)
@@ -232,9 +213,6 @@ def from_dict[T](cls: type[T], data: dict[str, Any]) -> T:
     return cls(**kwargs)
 
 
-# --- Settings ---
-
-
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise ValueError(message)
@@ -246,11 +224,6 @@ def _choice(name: str, value: str, choices: set[str]) -> None:
 
 @dataclass(frozen=True)
 class DataConfig:
-    """The Foursquare global check-in release and the cities taken from it.
-
-    ``raw_dir`` is relative to ``root`` unless absolute.
-    """
-
     root: Path = Path("data")
     raw_dir: Path = Path("foursquare_global_2015")
     cities: list[str] = field(
@@ -375,9 +348,6 @@ class TokenizerConfig:
 
 @dataclass(frozen=True)
 class PlannerDataConfig:
-    """How ``semoflow planner-data`` derives the planner dataset from the
-    tokenizer's visits; the codebook size comes from its codebooks."""
-
     min_active_days: int = 5
     max_occurrences: int = 30
     city_conditioning: bool = False
@@ -440,9 +410,6 @@ class PlannerConfig:
 
 @dataclass(frozen=True)
 class RealizerConfig:
-    """Hard-prefix latent-flow realizer over whitened suffix tails, decoded
-    by the calibrated legal-catalog posterior."""
-
     max_events: int = 32
     prefix_depth: int = 3
     city_vocab: int = 0
@@ -536,12 +503,6 @@ class CompositionConfig:
 
 @dataclass(frozen=True)
 class EvaluationConfig:
-    """Per-city sampling and composition for ``semoflow evaluate``.
-
-    Each city samples one plan per week in ``reference_split``. ``cities``
-    defaults to every city in ``data.cities``.
-    """
-
     cities: list[str] | None = None
     reference_split: str = "test"
     device: str = "cuda:0"
@@ -561,9 +522,6 @@ class EvaluationConfig:
 
 @dataclass(frozen=True)
 class ExperimentConfig:
-    """One experiment: every stage's settings, with all artifacts under
-    ``run_dir`` in the fixed :class:`RunLayout`."""
-
     name: str = "semoflow"
     run_dir: Path = Path("outputs")
     data: DataConfig = field(default_factory=DataConfig)
@@ -599,7 +557,6 @@ class ExperimentConfig:
 def load_config(
     path: Path | str | None = None, overrides: Sequence[str] = ()
 ) -> ExperimentConfig:
-    """Load a YAML config (or defaults), apply ``--set`` overrides, validate."""
     raw: object = {}
     if path is not None:
         raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}

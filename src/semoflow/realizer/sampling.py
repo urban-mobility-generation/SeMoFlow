@@ -109,7 +109,6 @@ def _padded_output(
     pad_id: int,
     prefix_depth: int,
 ) -> torch.Tensor:
-    """Pad-filled [B, L, width] codes, with valid prefixes copied in."""
     output = torch.full(
         (*valid_mask.shape, width),
         pad_id,
@@ -125,11 +124,6 @@ def _padded_output(
 
 
 class _CityConstraint:
-    """Keep in-city candidates, falling back to every legal candidate.
-
-    Counts how many queries were constrained and how many fell back.
-    """
-
     def __init__(
         self,
         candidate_city: torch.Tensor | None,
@@ -189,15 +183,12 @@ class PrefixTailCatalog:
         observed_codes: torch.Tensor,
         candidate_city: torch.Tensor | None = None,
     ) -> PrefixTailCatalog:
-        """The distinct catalog SIDs sorted by prefix, with log-count priors
-        from the ``[N, M]`` observed train SIDs."""
         codebook_size = int(codebooks.shape[1])
         codes, unique_inverse = torch.unique(
             catalog_codes.long(), dim=0, return_inverse=True
         )
         codes = codes.contiguous()
         if candidate_city is not None:
-            # Each distinct SID takes the city of its first catalog row.
             city_source = candidate_city.long().cpu()
             mapped = torch.full((codes.shape[0],), -1, dtype=torch.long)
             reversed_index = torch.arange(
@@ -258,7 +249,6 @@ class PrefixTailCatalog:
         )
 
     def supports(self, prefixes: torch.Tensor) -> torch.BoolTensor:
-        """Whether each ``[..., prefix_depth]`` prefix has a catalog SID."""
         keys = self.prefix_keys_of(prefixes.to(self.prefix_keys.device))
         return find_sorted(self.prefix_keys, keys)[1]
 
@@ -276,11 +266,6 @@ _UINT32_MASK = 0xFFFFFFFF
 def _hashed_uniform(
     keys: torch.Tensor, candidate_indices: torch.Tensor
 ) -> torch.Tensor:
-    """Deterministic uniform(0, 1) noise per (key, catalog candidate) pair.
-
-    Every multiplier is below 2**31 and operands are masked to 32 bits first,
-    so no int64 product overflows on CPU or CUDA.
-    """
     h = (keys.long() * 0x5BD1E995 + candidate_indices.long()) & _UINT32_MASK
     for multiplier in (0x7FEB352D, 0x2C1B3C6D, 0x297A2D39):
         h = h ^ (h >> 16)
@@ -294,10 +279,6 @@ def _trajectory_prefix_coupling_keys(
     active_prefix: torch.Tensor,
     generator: torch.Generator,
 ) -> torch.LongTensor:
-    """One random key per (trajectory row, planned prefix), per active event.
-
-    Events are ordered as ``valid_mask`` boolean indexing orders them.
-    """
     rows = valid_mask.nonzero()[:, 0]
     _, groups = torch.unique(
         torch.cat([rows[:, None], active_prefix.long()], dim=1),
@@ -322,13 +303,6 @@ def _sample_catalog_candidates(
     generator: torch.Generator,
     coupling_keys: torch.Tensor | None,
 ) -> torch.LongTensor:
-    """Draw one candidate slot per query from ``softmax(logits / T)``.
-
-    Without coupling keys this is an independent multinomial draw.  With keys,
-    Gumbel-max noise is shared by every query carrying the same key for the
-    same catalog candidate: each query keeps exactly its softmax marginal, while
-    same-key queries with similar logits tend to choose the same candidate.
-    """
     if coupling_keys is None:
         probabilities = torch.softmax(logits / catalog_temperature, dim=-1)
         return torch.multinomial(
@@ -356,12 +330,6 @@ def _decode_calibrated_catalog(
     row_city: torch.Tensor | None = None,
     catalog_noise_coupling: str = "independent",
 ) -> tuple[torch.LongTensor, _CityConstraint | None]:
-    """Sample from a learned posterior over same-prefix catalog candidates.
-
-    ``catalog_noise_coupling="trajectory_prefix"`` shares the sampling noise
-    among a trajectory's events with the same planned prefix (see
-    ``_sample_catalog_candidates``); ``"independent"`` keeps per-event draws.
-    """
     output = _padded_output(
         valid_mask,
         prefix_codes,
@@ -462,7 +430,6 @@ def _integrate_flow(
     *,
     solver: str,
 ) -> torch.Tensor:
-    """Solve the flow ODE from noise (t=1) to data (t=0)."""
     padding = ~valid[..., None]
     rows = state.shape[0]
     num_steps = times_grid.numel() - 1
@@ -497,10 +464,6 @@ def _integrate_chunks(
     solver: str,
     city_id: torch.LongTensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Integrate the flow from ``noise`` in row chunks.
-
-    Returns the normalized endpoints and the conditioning plans.
-    """
     batch_size = valid.size(0)
     normalized_chunks: list[torch.Tensor] = []
     conditioning_chunks: list[torch.Tensor] = []
@@ -547,8 +510,6 @@ def sample_prefix_time_suffix_latent_flow(
     city_id: torch.LongTensor | None,
     catalog_noise_coupling: str,
 ) -> PrefixTimeSuffixLatentFlowSample:
-    """Complete each planned prefix with an eval-mode ``model``: integrate
-    the suffix flow, then decode it into the catalog."""
     resolved_device = next(model.parameters()).device
     prefix = prefix_codes.to(resolved_device, dtype=torch.long)
     times = time_tokens.to(resolved_device, dtype=torch.long)

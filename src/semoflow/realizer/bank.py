@@ -1,10 +1,3 @@
-"""The realizer's SID bank: each split's weekly segments as SID tensors.
-
-Bank rows are the segments of each split, in segment-table order, whose
-length lies in ``[min_length, max_events]``; :func:`bank_segments` reads the
-segment rows behind any leading slice of a split.
-"""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -126,7 +119,6 @@ def load_bank_payload(path: Path) -> dict[str, Any]:
 
 
 def bank_split_window(payload: dict[str, Any], split: str) -> tuple[int, int]:
-    """The offset and row count of ``split`` in the bank tensors."""
     counts = payload["row_counts"]
     offset = sum(
         int(counts[name]) for name in BANK_SPLITS[: BANK_SPLITS.index(split)]
@@ -141,11 +133,6 @@ def bank_segments(
     *,
     rows: int | None = None,
 ) -> pl.DataFrame:
-    """``columns`` of the segments behind the first ``rows`` rows of a split.
-
-    Defaults to the whole split; segment lengths are checked against the
-    bank's valid mask.
-    """
     offset, count = bank_split_window(payload, split)
     rows = count if rows is None else min(rows, count)
     source = payload["source"]
@@ -178,7 +165,6 @@ def bank_split_city_ids(
 def build_realizer_data(
     settings: RealizerConfig, layout: RunLayout
 ) -> dict[str, object]:
-    """Build the bank the realizer trains on, keyed by the tokenizer lookup."""
     return build_bank(
         lookup_path=layout.tokenizer.placekey_lookup,
         segments_path=layout.segments,

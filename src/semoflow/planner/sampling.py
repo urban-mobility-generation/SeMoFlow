@@ -11,9 +11,8 @@ from semoflow.planner.artifacts import (
     load_occurrence_planner_checkpoint,
     save_occurrence_planner_samples,
 )
-from semoflow.planner.decoders import sample_categorical_logits
+from semoflow.planner.layers import sample_categorical_logits
 from semoflow.planner.model import OccurrenceARPlanner
-from semoflow.planner.types import OccurrenceBatch
 
 logger = logging.getLogger(__name__)
 
@@ -27,13 +26,6 @@ def sample_occurrence_sequences(
     route_temperature: float,
     seed: int,
 ) -> dict[str, torch.Tensor]:
-    """Autoregressively sample one occurrence plan per city id with an
-    eval-mode ``model``.
-
-    Returns zero-padded ``prefix_codes`` [B, L, P], ``gap_tokens`` and
-    ``event_time_minutes`` [B, L], ``lengths`` and ``city_ids`` [B]. The
-    Explore/Retrieve gate samples at ``route_temperature``.
-    """
     device = next(model.parameters()).device
     dtype = next(model.parameters()).dtype
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -48,61 +40,49 @@ def sample_occurrence_sequences(
         + 1
     )
     max_length = int(lengths.max())
-    prefixes = torch.zeros(
-        (batch_size, max_length, model.config.prefix_depth),
+    prefixes = torch.full(
+        (batch_size, max_length + 1, model.config.prefix_depth),
+        -1,
         dtype=torch.long,
         device=device,
     )
-    gaps = torch.zeros(
-        (batch_size, max_length), dtype=torch.long, device=device
+    gaps = torch.full(
+        (batch_size, max_length + 1), -1, dtype=torch.long, device=device
     )
-    event_times = torch.zeros(
-        (batch_size, max_length), dtype=torch.float32, device=device
+    times = torch.zeros(
+        (batch_size, max_length + 1), dtype=torch.float32, device=device
     )
-    previous_prefixes = torch.full_like(prefixes, -1)
-    previous_gaps = torch.full_like(gaps, -1)
-    previous_times = torch.zeros_like(event_times)
-    valid = torch.arange(max_length, device=device)[None, :] < lengths[:, None]
     cache = model.initialize_generation_cache(
-        batch_size=batch_size, device=device, dtype=dtype
+        batch_size=batch_size,
+        max_length=max_length,
+        device=device,
+        dtype=dtype,
     )
     for step in range(max_length):
         active = lengths > step
-        batch = OccurrenceBatch(
-            previous_prefix_codes=previous_prefixes,
-            previous_gap_tokens=previous_gaps,
-            previous_event_time_minutes=previous_times,
-            target_prefix_codes=prefixes,
-            target_gap_tokens=gaps,
-            valid_mask=valid,
+        gap, prefix, time = model.sample_step(
+            prefixes,
+            gaps,
+            times,
             lengths=lengths,
             city_ids=city,
-        )
-        occurrence, cache = model.sample_next_occurrence(
-            batch,
             step=step,
             active=active,
             cache=cache,
-            gap_temperature=temperature,
-            prefix_temperature=temperature,
+            temperature=temperature,
             route_temperature=route_temperature,
             generator=generator,
         )
-        gaps[active, step] = occurrence.gap_tokens
-        prefixes[active, step] = occurrence.prefix_codes
-        event_times[active, step] = occurrence.arrival_time_minutes
-        if step + 1 < max_length:
-            continuing = lengths > step + 1
-            for previous, current in (
-                (previous_gaps, gaps),
-                (previous_prefixes, prefixes),
-                (previous_times, event_times),
-            ):
-                previous[continuing, step + 1] = current[continuing, step]
+        gaps[active, step + 1] = gap
+        prefixes[active, step + 1] = prefix
+        times[active, step + 1] = time
+    padding = torch.arange(max_length, device=device) >= lengths[:, None]
     return {
-        "prefix_codes": prefixes.cpu(),
-        "gap_tokens": gaps.cpu(),
-        "event_time_minutes": event_times.cpu(),
+        "prefix_codes": prefixes[:, 1:]
+        .masked_fill(padding[..., None], 0)
+        .cpu(),
+        "gap_tokens": gaps[:, 1:].masked_fill(padding, 0).cpu(),
+        "event_time_minutes": times[:, 1:].cpu(),
         "lengths": lengths.cpu(),
         "city_ids": city.cpu(),
     }
@@ -111,7 +91,6 @@ def sample_occurrence_sequences(
 def _concat_padded(
     chunks: list[dict[str, torch.Tensor]],
 ) -> dict[str, torch.Tensor]:
-    """Concatenate sample chunks, zero-padding the step axis."""
     width = max(int(chunk["lengths"].max()) for chunk in chunks)
     merged: dict[str, torch.Tensor] = {}
     for name in chunks[0]:
@@ -139,8 +118,6 @@ def sample_occurrence_planner(
     route_temperature: float | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
-    """Sample ``num_samples`` plans for one city into ``output_path``;
-    ``city_id`` may be omitted for a single-city checkpoint."""
     output_path = Path(output_path)
     if output_path.exists() and not force:
         raise FileExistsError(

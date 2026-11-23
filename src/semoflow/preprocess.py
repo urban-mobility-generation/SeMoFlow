@@ -1,6 +1,3 @@
-"""Turn the Foursquare global release into visits and a POI catalog, assign
-device splits, and group visits into weekly segments."""
-
 from __future__ import annotations
 
 import hashlib
@@ -12,15 +9,12 @@ import numpy as np
 import polars as pl
 
 from semoflow.config import CITY_ID
-from semoflow.utils.serialization import write_json
+from semoflow.utils import write_json
 
 if TYPE_CHECKING:
     from semoflow.config import ExperimentConfig
 
 logger = logging.getLogger(__name__)
-
-# --- Device splits ---
-
 GLOBAL_SPLIT_SEED = 20260712
 SPLIT_COLUMN = "split"
 
@@ -45,8 +39,6 @@ def assign_split(key: str, *, seed: int = GLOBAL_SPLIT_SEED) -> str:
     return "test"
 
 
-# --- Foursquare release ---
-
 SOURCE_URL = "https://sites.google.com/site/yangdingqi/home/foursquare-dataset"
 CITY_NAMES = {
     "los_angeles": "Los Angeles",
@@ -58,7 +50,6 @@ CITY_NAMES = {
 CHECKINS_FILE = "dataset_TIST2015_Checkins.txt"
 POIS_FILE = "dataset_TIST2015_POIs.txt"
 CITIES_FILE = "dataset_TIST2015_Cities.txt"
-
 _CHECKIN_COLUMNS = (
     "user_id",
     "venue_id",
@@ -403,8 +394,6 @@ def run_foursquare_pipeline(cfg: ExperimentConfig) -> None:
     )
 
 
-# --- Weekly segments ---
-
 SEGMENT_CITY_COLUMN = "_city_id"
 SEGMENT_MIN_LENGTH = 5
 SEGMENT_MAX_LENGTH = 128
@@ -417,13 +406,6 @@ def build_weekly_segment_cache(
     min_active_days: int,
     force: bool = False,
 ) -> dict[str, Any]:
-    """Group each device's visits into Monday-aligned weeks with at least
-    ``SEGMENT_MIN_LENGTH`` visits on ``min_active_days`` distinct days.
-
-    Weeks keep their first ``SEGMENT_MAX_LENGTH`` visits. Each output row
-    holds a week's ``placekey_id`` list, ``device_key``, ``_timestamps``,
-    ``_split`` and ``_city_id``.
-    """
     if min_active_days < 1:
         raise ValueError("min_active_days must be >= 1")
     if output.exists() and not force:

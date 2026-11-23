@@ -1,23 +1,3 @@
-"""Joint temporal-spatial JSDs over weekly visit sequences.
-
-Two joint histograms compare generated and real visits on one shared grid:
-
-* **Time-location:** each active visit's weekly time token (Monday-Sunday x
-  the six unequal circadian intervals of ``training/circadian.py``, 42 tokens)
-  crossed with its geohash-5 cell. A visit without a geohash gets an explicit
-  missing-location cell.
-* **Gap-distance:** each pair of immediately consecutive active visits, never
-  bridging an inactive position. The gap is reconstructed from token
-  midpoints (03, 08, 12, 16, 20, 23 h plus 24 h per day), so it is a quantized
-  time-gap proxy, not observed elapsed time; a negative gap gets its own
-  category without sorting or repair. Distance is Haversine great-circle
-  distance; a pair missing either coordinate gets a missing-distance category.
-
-JSDs use natural logarithms with no pseudocounts and weight visits or pairs
-equally. The marginals of the same histograms are reported alongside each
-joint value.
-"""
-
 from __future__ import annotations
 
 import dataclasses
@@ -46,13 +26,6 @@ N_DISTANCE_BINS = len(DISTANCE_EDGES_KM)
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class TemporalSpatialEvents:
-    """Padded per-visit inputs, all shaped ``[rows, width]``.
-
-    ``geohash`` holds geohash-5 strings, with ``None`` for a missing cell;
-    ``latitude``/``longitude`` are NaN when a coordinate is missing. Values at
-    inactive positions are ignored.
-    """
-
     time_tokens: np.ndarray
     geohash: np.ndarray
     latitude: np.ndarray
@@ -76,7 +49,6 @@ def events_from_place_ids(
     coordinates: Mapping[int, tuple[float, float]],
     geohashes: Mapping[int, str],
 ) -> TemporalSpatialEvents:
-    """Look up each visit's geohash and coordinates from its POI ID."""
     place_ids = np.asarray(place_ids, dtype=np.int64)
     valid = np.asarray(valid, dtype=bool)
     unique, inverse = np.unique(place_ids, return_inverse=True)
@@ -164,11 +136,6 @@ def temporal_spatial_jsd(
     real: TemporalSpatialEvents,
     generated: TemporalSpatialEvents,
 ) -> dict[str, dict[str, Any]]:
-    """Return time-location and gap-distance joint JSDs and their marginals.
-
-    ``time_location`` marginals are time (first) and location (second);
-    ``gap_distance`` marginals are gap (first) and distance (second).
-    """
     real_valid = np.asarray(real.valid, dtype=bool)
     generated_valid = np.asarray(generated.valid, dtype=bool)
     real_cells = np.asarray(real.geohash, dtype=object)[real_valid]

@@ -36,7 +36,6 @@ from semoflow.tokenization.sids import (
 def load_places(
     path: Path,
 ) -> tuple[dict[int, tuple[float, float]], dict[int, str], int]:
-    """In-range POI coordinates, geohashes and the placekey vocab size."""
     frame = pl.read_parquet(
         path, columns=["placekey_id", "latitude", "longitude", "geohash_5"]
     )
@@ -60,7 +59,6 @@ def load_places(
 def load_reference(
     payload: dict[str, Any], *, split: str, max_samples: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.BoolTensor, torch.Tensor]:
-    """The leading ``max_samples`` bank rows of a split, with their POIs."""
     offset, count = bank_split_window(payload, split)
     selected = min(count, max_samples)
     rows = slice(offset, offset + selected)
@@ -80,13 +78,6 @@ def load_reference(
 def aligned_reference_event_hours(
     payload: dict[str, Any], *, split: str, valid_mask: torch.Tensor
 ) -> torch.Tensor:
-    """Observed event times in nominal local hours from each row's week start.
-
-    Segments are naive local timestamps grouped into Monday-truncated weeks,
-    so each row's origin is Monday 00:00 of its first event's week and its
-    times lie in [0, 168) h. Rows are the first ``valid_mask.size(0)`` rows of
-    the split. Inactive positions are NaN.
-    """
     frame = bank_segments(
         payload, split, ["_timestamps"], rows=int(valid_mask.size(0))
     )
@@ -109,11 +100,6 @@ def elapsed_recurrence_block(
     generated_valid: torch.Tensor,
     generated_hours: torch.Tensor,
 ) -> dict[str, Any]:
-    """Elapsed-time recurrence on grounded POIs.
-
-    Events that ground to no POI (ID 0) are dropped, as the index
-    recurrence metric drops them.
-    """
 
     def events(poi, valid, hours) -> ReturnEvents:
         poi = poi.cpu().numpy()
@@ -131,8 +117,6 @@ def elapsed_recurrence_block(
 
 @dataclass(frozen=True)
 class SampledPlan:
-    """Planner samples laid out on the realizer's event grid."""
-
     prefix: torch.Tensor
     time_tokens: torch.Tensor
     valid: torch.Tensor
@@ -146,13 +130,6 @@ def plan_from_planner_samples(
     width: int,
     max_rows: int,
 ) -> SampledPlan:
-    """The leading ``max_rows`` planner samples as a realizer plan.
-
-    Continuous arrival minutes become the realizer's weekly time tokens
-    through its unequal circadian bins, and also give the continuous clock
-    (in hours) for elapsed-time recurrence. Off-plan positions get time
-    token ``-1`` and hour NaN.
-    """
     prefix = samples["prefix_codes"][:max_rows].long()
     lengths = samples["lengths"][:max_rows].long()
     minutes = samples["event_time_minutes"][:max_rows].float()
@@ -186,7 +163,6 @@ def plan_from_planner_samples(
 
 
 def load_candidate_prior(path: Path) -> dict[int, float]:
-    """Per-POI train visit counts written by ``semoflow evaluate``."""
     counts = json.loads(Path(path).read_text())["counts"]
     return {int(key): float(value) for key, value in counts.items()}
 
@@ -210,14 +186,6 @@ def metric_block(
     candidate_weights: Mapping[int, float] | None = None,
     compute_device: torch.device | str | None = None,
 ) -> dict[str, Any]:
-    """Ground both arms' SIDs to POIs and compare them.
-
-    ``real_time_tokens``/``generated_time_tokens`` are the 42 weekly time
-    tokens aligned with the codes. They give the motif day keys and the joint
-    temporal-spatial JSDs. ``real_event_hours``/``generated_event_hours`` are
-    continuous event times in hours for the elapsed-time recurrence JSDs;
-    times are never derived from tokens.
-    """
     real_poi = ground_sid_codes(
         real_codes,
         real_valid,

@@ -1,5 +1,3 @@
-"""The realizer's 42 weekly time tokens: weekday x six parts of the day."""
-
 from __future__ import annotations
 
 from datetime import datetime

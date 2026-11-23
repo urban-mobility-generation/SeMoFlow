@@ -61,12 +61,6 @@ class PrefixTimeSuffixLatentFlowRealizer(nn.Module):
         prefix_plan_codebooks: torch.Tensor,
         city_vocab: int,
     ) -> None:
-        """Hard-prefix suffix flow over summed, whitened suffix-tail latents.
-
-        Prefix codes are embedded by learned tables plus gated projections
-        of the frozen tokenizer codebooks (``prefix_plan_codebooks``); the
-        calibrated catalog head scores legal same-prefix candidates.
-        """
         super().__init__()
         self.max_seq_len = int(max_seq_len)
         self.prefix_depth = int(prefix_depth)

@@ -1,6 +1,3 @@
-"""Daily mobility-motif JSD: each day's visits as a directed graph over its
-distinct POIs, numbered in first-visit order."""
-
 from __future__ import annotations
 
 from collections import Counter, defaultdict
@@ -15,8 +12,6 @@ type MotifSignature = tuple[int, tuple[tuple[int, int], ...]]
 
 
 def _day_motif(locations: list[int]) -> MotifSignature:
-    """Node count and sorted edges of one day's visits; repeated
-    consecutive visits to one POI add no edge."""
     node_ids: dict[int, int] = {}
     edges: set[tuple[int, int]] = set()
     previous: int | None = None
@@ -34,7 +29,6 @@ def _day_motif(locations: list[int]) -> MotifSignature:
 def daily_mobility_motifs(
     locations: torch.Tensor, day_keys: torch.Tensor
 ) -> list[MotifSignature]:
-    """One motif per (row, day) with a visit; padded visits are skipped."""
     motifs: list[MotifSignature] = []
     for row, days in zip(locations.tolist(), day_keys.tolist(), strict=True):
         by_day: dict[int, list[int]] = defaultdict(list)
@@ -59,8 +53,6 @@ def mobility_motif_jsd(
     day_keys_generated: torch.Tensor,
     frequency_threshold: float = 0.005,
 ) -> float:
-    """JSD over the real arm's motifs above ``frequency_threshold`` of its
-    days, plus one bin pooling every other motif."""
     real_counts = Counter(daily_mobility_motifs(real, day_keys_real))
     generated_counts = Counter(
         daily_mobility_motifs(generated, day_keys_generated)
