@@ -17,6 +17,10 @@ from semoflow.config import (
     RealizerConfig,
     RunLayout,
 )
+from semoflow.poi.sids import (
+    load_codebooks,
+    sid_code_columns,
+)
 from semoflow.realizer.bank import (
     bank_split_city_ids,
     bank_split_window,
@@ -32,10 +36,6 @@ from semoflow.realizer.objective import (
     prefix_time_suffix_latent_flow_loss,
 )
 from semoflow.realizer.time_tokens import N_TIME_TOKENS
-from semoflow.tokenization.sids import (
-    load_codebooks,
-    sid_code_columns,
-)
 from semoflow.utils import (
     EarlyStopper,
     build_lr_scheduler,

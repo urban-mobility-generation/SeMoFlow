@@ -162,7 +162,7 @@ def preprocess(
 def encoder(
     config: Config, sets: Sets = None, log_level: LogLevel = "INFO"
 ) -> None:
-    from semoflow.poi.training import run_encoder_pipeline
+    from semoflow.poi.encoder import run_encoder_pipeline
 
     cfg = _load(config, sets, log_level)
     with _run(cfg, "encoder", cfg.layout.encoder_dir, log_level):
@@ -175,7 +175,7 @@ def encoder(
 def tokenizer(
     config: Config, sets: Sets = None, log_level: LogLevel = "INFO"
 ) -> None:
-    from semoflow.poi.training import run_semantic_id_tokenizer
+    from semoflow.poi.tokenizer import run_semantic_id_tokenizer
 
     cfg = _load(config, sets, log_level)
     with _run(cfg, "tokenizer", cfg.layout.tokenizer.run_dir, log_level):

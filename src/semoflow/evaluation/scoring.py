@@ -23,13 +23,13 @@ from semoflow.evaluation.temporal_spatial import (
     events_from_place_ids,
     temporal_spatial_jsd,
 )
+from semoflow.poi.sids import (
+    SemanticIDGroundingIndex,
+)
 from semoflow.realizer.bank import bank_segments, bank_split_window
 from semoflow.realizer.time_tokens import (
     N_PART_OF_DAY_BINS,
     PART_OF_DAY_START_MINUTES,
-)
-from semoflow.tokenization.sids import (
-    SemanticIDGroundingIndex,
 )
 
 

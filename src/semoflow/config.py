@@ -81,7 +81,7 @@ class RunLayout:
 
     @property
     def text_embeddings(self) -> Path:
-        return self.encoder_dir / "text" / "text_embeddings.npy"
+        return self.encoder_dir / "text" / "text_embeddings.pt"
 
     @property
     def graph_dir(self) -> Path:
@@ -337,6 +337,15 @@ class TokenizerConfig:
         _require(
             self.n_encoder_layers >= 1,
             "tokenizer.n_encoder_layers must be >= 1",
+        )
+        _require(
+            self.codebook_size <= 256,
+            "tokenizer.codebook_size must be <= 256",
+        )
+        _require(
+            self.sk_epsilons is None
+            or len(self.sk_epsilons) == self.n_codebooks,
+            "tokenizer.sk_epsilons needs one value per codebook",
         )
         _require(
             self.geo_relative_dim >= 2

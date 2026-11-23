@@ -97,7 +97,7 @@ uv run semoflow realizer --config $C
 | Stage | Output under `run_dir` (default `outputs/`) |
 | --- | --- |
 | Preprocessing | `preprocessing/` |
-| Encoders | `encoder/text/text_embeddings.npy`, `encoder/graph/` |
+| Encoders | `encoder/text/text_embeddings.pt`, `encoder/graph/` |
 | Tokenizer | `tokenization/` |
 | Planner data and model | `segments.parquet`, `planner_dataset.pt`, `planner/best.pt` |
 | Realizer data and model | `bank.pt`, `realizer/best.pt` |
@@ -109,7 +109,7 @@ place a whole experiment elsewhere or `--set planner.training.epochs=20`.
 and each stage saves it as `config_resolved.yaml` in its output directory.
 `semoflow --help` lists every stage. Every stage defaults to `cuda:0`; select the physical GPU with
 `CUDA_VISIBLE_DEVICES`. The text encoder reuses
-`encoder/text/text_embeddings.npy` when it already covers the POI catalog.
+`encoder/text/text_embeddings.pt` when it already covers the POI catalog.
 
 For multi-GPU training, give the planner a device list, which starts one DDP
 rank per GPU, and launch the realizer under `torchrun`:

@@ -1,27 +1,21 @@
 from __future__ import annotations
 
-import logging
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from semoflow.config import TokenizerConfig
 
-logger = logging.getLogger(__name__)
+_EMA_DECAY = 0.99
+_DEAD_THRESHOLD = 2
+_SINKHORN_ITERATIONS = 100
 
 
 @torch.no_grad()
-def sinkhorn_assign(
-    dist: torch.Tensor,
-    epsilon: float,
-    n_iters: int = 100,
-) -> torch.Tensor:
+def sinkhorn_assign(dist: torch.Tensor, epsilon: float) -> torch.Tensor:
     batch_size, codebook_size = dist.shape
     d_max = dist.max()
     d_min = dist.min()
-    if torch.isclose(d_max, d_min):
-        return dist.argmin(dim=1)
     middle = (d_max + d_min) / 2.0
     amplitude = d_max - middle + 1e-5
     centered = (dist - middle) / amplitude
@@ -29,7 +23,7 @@ def sinkhorn_assign(
     q = torch.exp(-centered.double() / epsilon)
     q /= q.sum()
 
-    for _ in range(n_iters):
+    for _ in range(_SINKHORN_ITERATIONS):
         q /= q.sum(dim=1, keepdim=True)
         q /= batch_size
         q /= q.sum(dim=0, keepdim=True)
@@ -46,17 +40,10 @@ class ResidualVQ(nn.Module):
         codebook_size: int,
         dim: int,
         *,
-        ema_decay: float = 0.99,
-        dead_threshold: int = 2,
-        sk_epsilons: list[float] | None = None,
+        sk_epsilons: list[float] | None,
     ) -> None:
         super().__init__()
-
-        self.num_codebooks = num_codebooks
         self.codebook_size = codebook_size
-        self.dim = dim
-        self.ema_decay = ema_decay
-        self.dead_threshold = dead_threshold
         self.sk_epsilons = sk_epsilons or [0.0] * num_codebooks
 
         self.codebooks = nn.ParameterList(
@@ -111,29 +98,16 @@ class ResidualVQ(nn.Module):
         residual: torch.Tensor,
     ) -> None:
         usage: torch.Tensor = getattr(self, f"_usage_{cb_idx}")
-        dead = usage < self.dead_threshold
-        n_rows = residual.shape[0]
-        if n_rows == 0:
-            return
-
+        dead = usage < _DEAD_THRESHOLD
         replacement_rows = torch.randint(
-            n_rows,
+            residual.shape[0],
             (self.codebook_size,),
             device=residual.device,
         )
         replacements = residual[replacement_rows].detach()
         replacements = replacements + torch.randn_like(replacements) * 1e-3
         cb.data.copy_(torch.where(dead.unsqueeze(1), replacements, cb.data))
-        usage.masked_fill_(dead, self.dead_threshold)
-
-        if logger.isEnabledFor(logging.DEBUG):
-            n_dead = int(dead.sum().detach().cpu().item())
-            if n_dead > 0:
-                logger.debug(
-                    "ResidualVQ codebook %d: reinitialized %d entries",
-                    cb_idx,
-                    n_dead,
-                )
+        usage.masked_fill_(dead, _DEAD_THRESHOLD)
 
     def forward(
         self, z: torch.Tensor
@@ -155,7 +129,7 @@ class ResidualVQ(nn.Module):
                 - 2.0 * (residual @ cb.T)
                 + cb.pow(2).sum(1)
             )
-            sk_eps = self.sk_epsilons[i] if i < len(self.sk_epsilons) else 0.0
+            sk_eps = self.sk_epsilons[i]
             if sk_eps > 0 and self.training:
                 idx = sinkhorn_assign(dist, sk_eps)
             else:
@@ -168,7 +142,7 @@ class ResidualVQ(nn.Module):
 
             if self.training:
                 usage: torch.Tensor = getattr(self, f"_usage_{i}")
-                usage.mul_(self.ema_decay).clamp_(min=0)
+                usage.mul_(_EMA_DECAY).clamp_(min=0)
                 usage.add_(
                     torch.bincount(idx, minlength=self.codebook_size).float()
                 )
@@ -180,23 +154,13 @@ class ResidualVQ(nn.Module):
                     1
                 )
                 assigned = (raw_counts > 0).unsqueeze(1)
-                updated = (
-                    self.ema_decay * cb.data + (1 - self.ema_decay) * centroids
-                )
+                updated = _EMA_DECAY * cb.data + (1 - _EMA_DECAY) * centroids
                 cb.data.copy_(torch.where(assigned, updated, cb.data))
 
             residual = residual - q.detach()
 
         q_st = z + (q_sum - z).detach()
         return q_st, torch.stack(code_list, 1), commit_loss
-
-
-def _mlp(input_dim: int, hidden_dim: int, output_dim: int) -> nn.Sequential:
-    return nn.Sequential(
-        nn.Linear(input_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, output_dim),
-    )
 
 
 class ResMLPBlock(nn.Module):
@@ -228,17 +192,6 @@ class ResMLPEncoder(nn.Module):
         return self.proj_out(h)
 
 
-class MLPDecoder(nn.Module):
-    def __init__(
-        self, *, latent_dim: int, output_dim: int, hidden_dim: int
-    ) -> None:
-        super().__init__()
-        self.net = _mlp(latent_dim, hidden_dim, output_dim)
-
-    def forward(self, z_q: torch.Tensor) -> torch.Tensor:
-        return self.net(z_q)
-
-
 class RQVAE(nn.Module):
     def __init__(
         self,
@@ -252,8 +205,6 @@ class RQVAE(nn.Module):
         self.encoder = encoder
         self.quantizer = quantizer
         self.decoder = decoder
-        self.n_codebooks = quantizer.num_codebooks
-        self.codebook_size = quantizer.codebook_size
         self.commit_weight = commit_weight
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -265,11 +216,7 @@ class RQVAE(nn.Module):
 
     @torch.no_grad()
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        was_training = self.training
-        self.eval()
-        codes = self.quantizer(self.encoder(x.float()))[1].long()
-        self.train(was_training)
-        return codes
+        return self.quantizer(self.encoder(x.float()))[1]
 
     def get_codebooks(self) -> torch.Tensor:
         return torch.stack(list(self.quantizer.codebooks), dim=0)
@@ -289,10 +236,10 @@ def build_tokenizer_model(config: TokenizerConfig, *, input_dim: int) -> RQVAE:
             config.latent_dim,
             sk_epsilons=config.sk_epsilons,
         ),
-        MLPDecoder(
-            latent_dim=config.latent_dim,
-            output_dim=input_dim,
-            hidden_dim=config.hidden_dim,
+        nn.Sequential(
+            nn.Linear(config.latent_dim, config.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(config.hidden_dim, input_dim),
         ),
         commit_weight=config.beta,
     )

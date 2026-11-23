@@ -8,14 +8,14 @@ from typing import cast
 import torch
 import torch.nn.functional as F
 
-from semoflow.realizer.model import (
-    LatentSuffixConditioning,
-    PrefixTimeSuffixLatentFlowRealizer,
-)
-from semoflow.tokenization.sids import (
+from semoflow.poi.sids import (
     codes_to_embeddings,
     find_sorted,
     packed_code_keys,
+)
+from semoflow.realizer.model import (
+    LatentSuffixConditioning,
+    PrefixTimeSuffixLatentFlowRealizer,
 )
 from semoflow.utils import unwrap_ddp
 

@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from semoflow.tokenization.sids import find_sorted, packed_code_keys
+from semoflow.poi.sids import find_sorted, packed_code_keys
 
 
 class RMSNorm(nn.Module):

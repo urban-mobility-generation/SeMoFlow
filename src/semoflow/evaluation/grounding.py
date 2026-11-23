@@ -18,7 +18,7 @@ from semoflow.evaluation.geo import (
     travel_distance_jsd,
 )
 from semoflow.evaluation.motifs import mobility_motif_jsd
-from semoflow.tokenization.sids import pack_code_rows
+from semoflow.poi.sids import pack_code_rows
 
 _CANDIDATE_SELECTION_SEED = 20260830
 _CANDIDATE_WEIGHT_SMOOTHING = 1.0

@@ -9,14 +9,14 @@ import polars as pl
 
 from semoflow.config import CITY_ID, EvaluationConfig, RunLayout
 from semoflow.planner.sampling import sample_occurrence_planner
+from semoflow.poi.sids import (
+    SemanticIDGroundingIndex,
+)
 from semoflow.preprocess import SEGMENT_CITY_COLUMN
 from semoflow.realizer.bank import bank_segments, build_bank, load_bank_payload
 from semoflow.realizer.evaluation import (
     evaluate_planner_realizer,
     realizer_max_events,
-)
-from semoflow.tokenization.sids import (
-    SemanticIDGroundingIndex,
 )
 from semoflow.utils import write_json
 

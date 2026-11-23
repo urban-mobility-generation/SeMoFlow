@@ -54,12 +54,6 @@ def codes_to_embeddings(
 ) -> torch.Tensor:
     codes = codes.long()
     codebooks = codebooks.to(codes.device)
-    if codes.numel() and (
-        int(codes.min()) < 0 or int(codes.max()) >= codebooks.shape[1]
-    ):
-        raise ValueError(
-            f"semantic code out of range for codebook_size={codebooks.shape[1]}"
-        )
     levels = torch.arange(codebooks.shape[0], device=codes.device)
     return codebooks[levels, codes].sum(dim=-2)
 
@@ -81,18 +75,13 @@ class SemanticIDGroundingIndex:
     ) -> None:
         self.key_columns = list(key_columns)
         self.payload_columns = list(payload_columns)
-        self.groups: dict[tuple[int, ...], list[dict[str, Any]]] = {
-            tuple(key): [dict(item) for item in payloads]
-            for key, payloads in groups.items()
-        }
+        self.groups = {key: list(items) for key, items in groups.items()}
 
     @classmethod
     def from_frame(
         cls, frame: pl.DataFrame, *, payload_columns: Sequence[str]
     ) -> SemanticIDGroundingIndex:
         keys = list(sid_code_columns(frame.columns))
-        if not keys:
-            raise ValueError("no semantic code columns found")
         payload_cols = list(dict.fromkeys(["placekey_id", *payload_columns]))
         groups: dict[tuple[int, ...], list[dict[str, Any]]] = defaultdict(list)
         seen: dict[tuple[int, ...], set[Any]] = defaultdict(set)
@@ -111,10 +100,6 @@ class SemanticIDGroundingIndex:
         self,
     ) -> tuple[np.ndarray, list[list[dict[str, Any]]]]:
         key_rows = np.asarray(list(self.groups), dtype=np.int64)
-        if np.any((key_rows < 0) | (key_rows > 255)):
-            raise ValueError(
-                "bulk grounding lookup supports code values in [0, 255]"
-            )
         packed = pack_code_rows(key_rows)
         order = np.argsort(packed, kind="mergesort")
         payload_rows = list(self.groups.values())
@@ -135,18 +120,22 @@ class SemanticIDGroundingIndex:
                 for col, code in zip(self.key_columns, key, strict=True):
                     row[col] = code
                 rows.append(row)
-        return pl.DataFrame(rows) if rows else pl.DataFrame()
+        return pl.DataFrame(rows)
 
-    def save(self, path: str | Path) -> None:
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "wb") as f:
-            pickle.dump(self, f)
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = {
+            "key_columns": self.key_columns,
+            "payload_columns": self.payload_columns,
+            "groups": self.groups,
+        }
+        with open(path, "wb") as f:
+            pickle.dump(state, f)
 
     @classmethod
-    def load(cls, path: str | Path) -> SemanticIDGroundingIndex:
+    def load(cls, path: Path) -> SemanticIDGroundingIndex:
         with open(path, "rb") as f:
-            return pickle.load(f)
+            return cls(**pickle.load(f))
 
 
 __all__ = [

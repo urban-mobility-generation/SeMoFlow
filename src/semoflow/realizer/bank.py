@@ -11,9 +11,9 @@ from semoflow.config import (
     RealizerConfig,
     RunLayout,
 )
+from semoflow.poi.sids import sid_code_columns
 from semoflow.preprocess import SEGMENT_CITY_COLUMN
 from semoflow.realizer.time_tokens import time_tokens_from_timestamps
-from semoflow.tokenization.sids import sid_code_columns
 
 BANK_SPLITS = ("train", "val", "test")
 MIN_LENGTH = 5

@@ -1,164 +1,150 @@
 from __future__ import annotations
 
 import logging
-import re
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-import numpy as np
 import polars as pl
 import torch
 from sentence_transformers import SentenceTransformer
 
-from semoflow.poi.embeddings import (
-    load_poi_embeddings,
-    write_poi_embeddings,
-)
-
-if TYPE_CHECKING:
-    from semoflow.config import TextEncoderConfig
+from semoflow.config import TextEncoderConfig
+from semoflow.utils import parse_device_spec, write_json
 
 logger = logging.getLogger(__name__)
+_PRECISIONS = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
 
 
-def _parse_devices(device: str) -> list[str]:
-    match = re.fullmatch(r"\[(.+)\]", device.strip())
-    if match is None:
-        return [device.strip()]
-    return [
-        f"cuda:{item}" if item.isdigit() else item
-        for item in (part.strip() for part in match.group(1).split(","))
-    ]
+def _index_path(path: Path) -> Path:
+    return path.with_suffix(".index.parquet")
+
+
+def write_poi_embeddings(
+    path: Path,
+    embeddings: torch.Tensor,
+    placekey_ids: pl.Series,
+    *,
+    metadata: dict[str, object] | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(embeddings.detach().cpu().float(), path)
+    pl.DataFrame({"placekey_id": placekey_ids}).with_row_index(
+        "embedding_row"
+    ).write_parquet(_index_path(path))
+    if metadata is not None:
+        write_json(_index_path(path).with_suffix(".json"), metadata)
+
+
+def load_poi_embeddings(
+    path: Path, places_index: pl.DataFrame
+) -> torch.Tensor:
+    matrix = torch.load(path, map_location="cpu")
+    rows = places_index.select("placekey_id").join(
+        pl.read_parquet(_index_path(path)),
+        on="placekey_id",
+        how="left",
+        maintain_order="left",
+    )["embedding_row"]
+    if rows.null_count():
+        raise ValueError(
+            f"{path} is missing {rows.null_count()} places-index POIs"
+        )
+    return matrix.index_select(
+        0, torch.from_numpy(rows.cast(pl.Int64).to_numpy().copy())
+    )
+
+
+def _join(values: list[str], separator: str) -> str:
+    return separator.join(value for value in values if value)
 
 
 def render_poi_texts(
-    places: pl.DataFrame,
-    *,
-    include_address: bool = True,
-    include_name: bool = True,
+    places: pl.DataFrame, *, include_address: bool, include_name: bool
 ) -> list[str]:
     texts = []
     for row in places.iter_rows(named=True):
+        field = {key: str(value or "").strip() for key, value in row.items()}
         parts = []
         if include_name:
-            name = str(row.get("location_name") or "").strip()
-            if name:
-                parts.append(name)
-            brand = str(row.get("brands") or "").strip()
+            name, brand = (
+                field.get("location_name", ""),
+                field.get("brands", ""),
+            )
+            parts.append(name)
             if brand and brand.lower() != name.lower():
                 parts.append(f"({brand})")
         if include_address:
-            addr = ", ".join(
-                b
-                for b in [
-                    str(row.get(c) or "").strip()
-                    for c in ("street_address", "city", "state", "zipcode")
-                ]
-                if b
+            parts.append(
+                _join(
+                    [
+                        field.get(column, "")
+                        for column in (
+                            "street_address",
+                            "city",
+                            "state",
+                            "zipcode",
+                        )
+                    ],
+                    ", ",
+                )
             )
-            if addr:
-                parts.append(addr)
-        cats = " > ".join(
-            b
-            for b in [
-                str(row.get(c) or "").strip()
-                for c in ("top_category", "sub_category")
-            ]
-            if b
+        category = _join(
+            [field.get("top_category", ""), field.get("sub_category", "")],
+            " > ",
         )
-        naics = str(row.get("naics_code") or "").strip()
-        if naics and naics not in ("", "000000"):
-            cats += f" (NAICS {naics})"
-        if cats:
-            parts.append(cats)
-        texts.append(" | ".join(parts) if parts else "unknown location")
+        naics = field.get("naics_code", "")
+        if naics and naics != "000000":
+            category += f" (NAICS {naics})"
+        parts.append(category)
+        texts.append(_join(parts, " | ") or "unknown location")
     return texts
-
-
-def encode_texts(
-    texts: list[str],
-    model_name: str,
-    device: str,
-    batch_size: int,
-    precision: str = "float32",
-) -> np.ndarray:
-    dtypes = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }
-    devices = _parse_devices(device)
-    multi_gpu = len(devices) > 1
-
-    if multi_gpu:
-        logger.info(
-            "multi-GPU text encoding  devices=%s  texts=%d",
-            devices,
-            len(texts),
-        )
-        encoder = SentenceTransformer(model_name, device="cpu").to(
-            dtype=dtypes[precision]
-        )
-        pool = encoder.start_multi_process_pool(target_devices=devices)
-        try:
-            emb = encoder.encode(
-                texts,
-                batch_size=batch_size,
-                show_progress_bar=True,
-                normalize_embeddings=True,
-                pool=pool,
-            )
-        finally:
-            encoder.stop_multi_process_pool(pool)
-        return np.asarray(emb, dtype=np.float32)
-
-    encoder = SentenceTransformer(model_name, device=devices[0]).to(
-        dtype=dtypes[precision]
-    )
-    return np.asarray(
-        encoder.encode(
-            texts,
-            batch_size=batch_size,
-            show_progress_bar=True,
-            normalize_embeddings=True,
-        ),
-        dtype=np.float32,
-    )
 
 
 def build_text_embeddings(
     places: pl.DataFrame, config: TextEncoderConfig, *, path: Path
-) -> np.ndarray:
+) -> None:
     if path.exists():
         try:
-            return load_poi_embeddings(path, places).numpy()
+            load_poi_embeddings(path, places)
+            return
         except (FileNotFoundError, ValueError):
-            logger.info(
-                "text embedding cache identity mismatch; rebuilding path=%s",
-                path,
-            )
-
-    include_address = config.include_address_in_template
-    include_name = config.include_name_in_template
+            logger.info("text embeddings do not cover the places; rebuilding")
     texts = render_poi_texts(
-        places, include_address=include_address, include_name=include_name
+        places,
+        include_address=config.include_address_in_template,
+        include_name=config.include_name_in_template,
     )
-    embeddings = encode_texts(
+    _, device_ids = parse_device_spec(config.device)
+    devices = [f"cuda:{index}" for index in device_ids]
+    encoder = SentenceTransformer(
+        config.model, device="cpu" if devices else config.device
+    ).to(dtype=_PRECISIONS[config.precision])
+    embeddings = encoder.encode(
         texts,
-        model_name=config.model,
-        device=config.device,
-        batch_size=int(config.batch_size),
-        precision=config.precision,
+        batch_size=config.batch_size,
+        show_progress_bar=True,
+        normalize_embeddings=True,
+        convert_to_tensor=True,
+        device=devices or None,
     )
     write_poi_embeddings(
         path,
-        torch.from_numpy(embeddings.astype(np.float32, copy=False)),
+        embeddings,
         places["placekey_id"],
         metadata={
             "model": config.model,
             "precision": config.precision,
-            "include_address_in_template": include_address,
-            "include_name_in_template": include_name,
+            "include_address_in_template": config.include_address_in_template,
+            "include_name_in_template": config.include_name_in_template,
         },
     )
-    return embeddings
+
+
+__all__ = [
+    "build_text_embeddings",
+    "load_poi_embeddings",
+    "write_poi_embeddings",
+]

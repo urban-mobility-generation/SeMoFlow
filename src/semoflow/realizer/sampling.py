@@ -5,6 +5,11 @@ from dataclasses import dataclass
 
 import torch
 
+from semoflow.poi.sids import (
+    codes_to_embeddings,
+    find_sorted,
+    packed_code_keys,
+)
 from semoflow.realizer.model import (
     LatentSuffixConditioning,
     PrefixTimeSuffixLatentFlowRealizer,
@@ -14,11 +19,6 @@ from semoflow.realizer.objective import (
     normalize_tail,
     suffix_tail_level_embeddings,
     velocity_from_x0,
-)
-from semoflow.tokenization.sids import (
-    codes_to_embeddings,
-    find_sorted,
-    packed_code_keys,
 )
 
 _CATALOG_DECODE_QUERY_CHUNK_SIZE = 4096
