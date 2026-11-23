@@ -3,7 +3,6 @@ from __future__ import annotations
 import random
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from functools import partial
 from pathlib import Path
 
@@ -20,8 +19,12 @@ from torch.utils.data import (
 from semoflow.config import PlannerDataConfig, RunLayout
 from semoflow.planner.layers import LegalPrefixIndex
 from semoflow.planner.model import OccurrenceBatch, OccurrencePlannerConfig
-from semoflow.poi.sids import load_codebooks, sid_code_columns
-from semoflow.preprocess import build_weekly_segment_cache
+from semoflow.poi.sids import load_codebooks, sid_code_names
+from semoflow.preprocess import (
+    build_weekly_segment_cache,
+    pad_events,
+    segment_events,
+)
 from semoflow.utils import load_artifact, save_torch_atomic
 
 PLANNER_GAP_CODEC_VERSION = "positive_duration_v1"
@@ -81,7 +84,10 @@ def reconstruct_event_time_minutes(
 def gap_tokens_from_event_time_minutes(
     event_time_minutes: torch.Tensor,
 ) -> torch.Tensor:
-    durations = torch.diff(event_time_minutes, prepend=torch.zeros(1))
+    durations = torch.diff(
+        event_time_minutes,
+        prepend=torch.zeros_like(event_time_minutes[..., :1]),
+    )
     edges = torch.tensor(
         PLANNER_GAP_BUCKET_EDGES_MINUTES, dtype=durations.dtype
     )
@@ -247,41 +253,16 @@ def build_occurrence_tensor_dataloader(
 
 OBSERVATION_WINDOW_MINUTES = 7.0 * 24.0 * 60.0
 PREFIX_DEPTH = 3
+_PREFIX_COLUMNS = sid_code_names(PREFIX_DEPTH)
 
 
-def _event_minutes(timestamps: list[datetime]) -> torch.Tensor:
-    first = timestamps[0]
-    week_start = first.replace(
-        hour=0, minute=0, second=0, microsecond=0
-    ) - timedelta(days=first.weekday())
-    return torch.tensor(
-        [(value - week_start).total_seconds() / 60.0 for value in timestamps],
-        dtype=torch.float32,
-    )
-
-
-def _load_prefix_lookup(
-    lookup_path: Path, *, prefix_depth: int
-) -> tuple[
-    dict[int, tuple[torch.Tensor, int]],
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-]:
-    selected = list(sid_code_columns(pl.read_parquet_schema(lookup_path)))
-    frame = pl.read_parquet(
-        lookup_path,
-        columns=["placekey_id", "city_id", *selected[:prefix_depth]],
-    )
-    mapping: dict[int, tuple[torch.Tensor, int]] = {}
+def _legal_prefixes(
+    lookup_path: Path,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    frame = pl.read_parquet(lookup_path, columns=["city_id", *_PREFIX_COLUMNS])
     city_tuples: dict[int, set[tuple[int, ...]]] = {}
-    for placekey_id, city_id, *prefix in frame.iter_rows():
-        codes = tuple(int(value) for value in prefix)
-        mapping[int(placekey_id)] = (
-            torch.tensor(codes, dtype=torch.long),
-            int(city_id),
-        )
-        city_tuples.setdefault(city_id, set()).add(codes)
+    for city_id, *prefix in frame.iter_rows():
+        city_tuples.setdefault(city_id, set()).add(tuple(prefix))
 
     ordered_tuples = sorted(set().union(*city_tuples.values()))
     legal_prefixes = torch.tensor(ordered_tuples, dtype=torch.long)
@@ -294,7 +275,7 @@ def _load_prefix_lookup(
     for row, city_id in enumerate(catalog_city_ids.tolist()):
         for codes in city_tuples[city_id]:
             city_legal_prefix_mask[row, tuple_to_id[codes]] = True
-    return mapping, legal_prefixes, catalog_city_ids, city_legal_prefix_mask
+    return legal_prefixes, catalog_city_ids, city_legal_prefix_mask
 
 
 def _load_prefix_centroids(
@@ -302,11 +283,8 @@ def _load_prefix_centroids(
     places_path: Path,
     *,
     legal_prefixes: torch.Tensor,
-    prefix_depth: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    selected = list(sid_code_columns(pl.read_parquet_schema(lookup_path)))[
-        :prefix_depth
-    ]
+    selected = list(_PREFIX_COLUMNS)
     places = pl.read_parquet(
         places_path, columns=["placekey", "latitude", "longitude"]
     ).unique(subset=["placekey"], keep="first")
@@ -325,42 +303,38 @@ def _load_prefix_centroids(
         for position, row in enumerate(legal_prefixes)
     }
     for row in grouped.iter_rows():
-        position = index_of[tuple(int(value) for value in row[:prefix_depth])]
-        centroids[position] = torch.tensor(row[prefix_depth:])
+        position = index_of[tuple(int(value) for value in row[:PREFIX_DEPTH])]
+        centroids[position] = torch.tensor(row[PREFIX_DEPTH:])
         available[position] = True
     return centroids, available
 
 
 def _materialize_split(
-    frame: pl.DataFrame,
-    *,
-    lookup: dict[int, tuple[torch.Tensor, int]],
-    prefix_depth: int,
-    max_occurrences: int,
+    frame: pl.DataFrame, lookup_path: Path, *, max_occurrences: int
 ) -> dict[str, torch.Tensor]:
-    rows = frame.height
-    prefixes = torch.zeros(
-        (rows, max_occurrences, prefix_depth), dtype=torch.long
+    events = segment_events(frame, lookup_path, [*_PREFIX_COLUMNS, "city_id"])
+    pad = partial(
+        pad_events, events, rows=frame.height, width=max_occurrences, fill=0
     )
-    gaps = torch.zeros((rows, max_occurrences), dtype=torch.long)
-    lengths = torch.empty(rows, dtype=torch.long)
-    city_ids = torch.empty(rows, dtype=torch.long)
-    for row_index, row in enumerate(frame.iter_rows(named=True)):
-        lookup_rows = [lookup[int(value)] for value in row["placekey_id"]]
-        length = len(lookup_rows)
-        lengths[row_index] = length
-        city_ids[row_index] = lookup_rows[0][1]
-        prefixes[row_index, :length] = torch.stack(
-            [prefix for prefix, _ in lookup_rows]
-        )
-        gaps[row_index, :length] = gap_tokens_from_event_time_minutes(
-            _event_minutes(list(row["_timestamps"]))
-        )
+    lengths = torch.from_numpy(
+        frame["placekey_id"].list.len().to_numpy().astype("int64")
+    )
+    minutes = torch.from_numpy(
+        pad(events["_minutes"].to_numpy().astype("float32"))
+    )
+    valid = torch.arange(max_occurrences)[None, :] < lengths[:, None]
+    gaps = gap_tokens_from_event_time_minutes(minutes).masked_fill(~valid, 0)
     return {
-        "prefix_codes": prefixes,
+        "prefix_codes": torch.from_numpy(
+            pad(events.select(_PREFIX_COLUMNS).to_numpy().astype("int64"))
+        ),
         "gap_tokens": gaps,
         "lengths": lengths,
-        "city_ids": city_ids,
+        "city_ids": torch.from_numpy(
+            events.filter(pl.col("_pos") == 0)["city_id"]
+            .to_numpy()
+            .astype("int64")
+        ),
     }
 
 
@@ -380,14 +354,13 @@ def build_planner_data(
     )
     lookup_path = tokenizer.placekey_lookup
     codebook_size = int(load_codebooks(tokenizer.tokenizer_codebooks).shape[1])
-    lookup, legal_prefixes, catalog_city_ids, city_legal_prefix_mask = (
-        _load_prefix_lookup(lookup_path, prefix_depth=PREFIX_DEPTH)
+    legal_prefixes, catalog_city_ids, city_legal_prefix_mask = _legal_prefixes(
+        lookup_path
     )
     centroids = _load_prefix_centroids(
         lookup_path,
         layout.preprocessing.places_index,
         legal_prefixes=legal_prefixes,
-        prefix_depth=PREFIX_DEPTH,
     )
 
     length = pl.col("placekey_id").list.len()
@@ -423,10 +396,7 @@ def build_planner_data(
         "city_legal_prefix_mask": city_legal_prefix_mask,
         **{
             name: _materialize_split(
-                split,
-                lookup=lookup,
-                prefix_depth=PREFIX_DEPTH,
-                max_occurrences=data.max_occurrences,
+                split, lookup_path, max_occurrences=data.max_occurrences
             )
             for name, split in splits.items()
         },

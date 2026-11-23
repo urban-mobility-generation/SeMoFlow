@@ -395,6 +395,50 @@ def run_foursquare_pipeline(cfg: ExperimentConfig) -> None:
 
 
 SEGMENT_CITY_COLUMN = "_city_id"
+
+
+def segment_events(
+    segments: pl.DataFrame, lookup_path: Path, columns: list[str]
+) -> pl.DataFrame:
+    timestamp = pl.col("_timestamps")
+    return (
+        segments.select(
+            pl.int_range(pl.len()).alias("_row"), "placekey_id", "_timestamps"
+        )
+        .explode("placekey_id", "_timestamps")
+        .with_columns(
+            pl.int_range(pl.len()).over("_row").alias("_pos"),
+            (
+                (
+                    timestamp - timestamp.dt.truncate("1w")
+                ).dt.total_microseconds()
+                / 1_000_000
+                / 60.0
+            ).alias("_minutes"),
+        )
+        .join(
+            pl.read_parquet(lookup_path, columns=["placekey_id", *columns]),
+            on="placekey_id",
+            maintain_order="left",
+        )
+    )
+
+
+def pad_events(
+    events: pl.DataFrame,
+    values: np.ndarray,
+    *,
+    rows: int,
+    width: int,
+    fill: float | int,
+) -> np.ndarray:
+    padded = np.full(
+        (rows, width, *values.shape[1:]), fill, dtype=values.dtype
+    )
+    padded[events["_row"].to_numpy(), events["_pos"].to_numpy()] = values
+    return padded
+
+
 SEGMENT_MIN_LENGTH = 5
 SEGMENT_MAX_LENGTH = 128
 

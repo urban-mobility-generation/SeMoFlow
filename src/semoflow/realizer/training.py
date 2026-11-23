@@ -1,13 +1,10 @@
 from __future__ import annotations
 
-import contextlib
 import functools
 import logging
 from dataclasses import asdict
-from pathlib import Path
 from typing import Any
 
-import polars as pl
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -17,21 +14,18 @@ from semoflow.config import (
     RealizerConfig,
     RunLayout,
 )
-from semoflow.poi.sids import (
-    load_codebooks,
-    sid_code_columns,
-)
+from semoflow.poi.sids import load_codebooks
 from semoflow.realizer.bank import (
     bank_split_city_ids,
     bank_split_window,
     load_bank_payload,
 )
+from semoflow.realizer.catalog import SuffixCatalog
 from semoflow.realizer.model import (
     MODEL_TYPE,
     PrefixTimeSuffixLatentFlowRealizer,
 )
 from semoflow.realizer.objective import (
-    CatalogCandidateBank,
     compute_tail_whitening_stats,
     prefix_time_suffix_latent_flow_loss,
 )
@@ -166,12 +160,6 @@ def _loader(
     )
 
 
-def _catalog_codes(path: Path) -> torch.Tensor:
-    fields = sid_code_columns(pl.read_parquet_schema(path))
-    frame = pl.read_parquet(path, columns=list(fields))
-    return torch.tensor(frame.to_numpy(), dtype=torch.long).contiguous()
-
-
 def _run_epoch(
     model: torch.nn.Module,
     loader: DataLoader,
@@ -187,10 +175,10 @@ def _run_epoch(
     training = optimizer is not None
     model.train(training)
     totals = torch.zeros(2, dtype=torch.float64, device=device)
-    autocast = (
-        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        if bf16 and device.type == "cuda"
-        else contextlib.nullcontext()
+    autocast = torch.autocast(
+        device_type=device.type,
+        dtype=torch.bfloat16,
+        enabled=bf16 and device.type == "cuda",
     )
     with torch.set_grad_enabled(training):
         for batch in loader:
@@ -264,14 +252,17 @@ def train_prefix_time_suffix_latent_flow_realizer(
             compute_device=device,
         )
     )
-    candidate_bank = CatalogCandidateBank.from_codes(
-        _catalog_codes(tokenizer.placekey_lookup),
-        codebooks,
-        prefix_depth=config.prefix_depth,
-        observed_codes=train.codes[train.valid],
-        count_device=device,
-        max_candidates=config.catalog_candidate_count,
-    ).to(device)
+    candidates = (
+        SuffixCatalog.from_lookup(
+            tokenizer.placekey_lookup,
+            codebooks,
+            prefix_depth=config.prefix_depth,
+            observed_codes=train.codes[train.valid],
+            count_device=device,
+        )
+        .candidate_table(config.catalog_candidate_count)
+        .to(device)
+    )
     model: torch.nn.Module = PrefixTimeSuffixLatentFlowRealizer(
         max_seq_len=int(train.codes.shape[1]),
         prefix_depth=config.prefix_depth,
@@ -342,7 +333,7 @@ def train_prefix_time_suffix_latent_flow_realizer(
             codebooks=codebooks.to(device),
             tail_mean=tail_mean,
             tail_whitener=tail_whitener,
-            candidate_bank=candidate_bank,
+            candidates=candidates,
             catalog_loss_weight=config.catalog_loss_weight,
             catalog_temperature=config.catalog_temperature,
             endpoint_loss_weight=config.endpoint_loss_weight,
@@ -362,8 +353,9 @@ def train_prefix_time_suffix_latent_flow_realizer(
         train_loss = run_epoch(
             model, train_loader, optimizer=optimizer, scheduler=scheduler
         )
-        validation_model = model.module if isinstance(model, DDP) else model
-        val_loss = run_epoch(validation_model, val_loader)
+        val_loss = run_epoch(
+            model.module if isinstance(model, DDP) else model, val_loader
+        )
         learning_rate = float(optimizer.param_groups[0]["lr"])
         history.append(
             {

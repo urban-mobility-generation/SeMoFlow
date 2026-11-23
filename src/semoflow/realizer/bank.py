@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 from pathlib import Path
 from typing import Any, cast
 
@@ -12,8 +13,8 @@ from semoflow.config import (
     RunLayout,
 )
 from semoflow.poi.sids import sid_code_columns
-from semoflow.preprocess import SEGMENT_CITY_COLUMN
-from semoflow.realizer.time_tokens import time_tokens_from_timestamps
+from semoflow.preprocess import SEGMENT_CITY_COLUMN, pad_events, segment_events
+from semoflow.realizer.time_tokens import time_tokens_from_week_minutes
 
 BANK_SPLITS = ("train", "val", "test")
 MIN_LENGTH = 5
@@ -30,20 +31,9 @@ def _split_segments(
     )
 
 
-def _load_lookup(path: Path) -> dict[int, np.ndarray]:
-    columns = list(
-        sid_code_columns(pl.scan_parquet(path).collect_schema().names())
-    )
-    frame = pl.read_parquet(path).select(["placekey_id", *columns])
-    return {
-        int(row[0]): np.asarray(row[1:], dtype=np.int16)
-        for row in frame.iter_rows()
-    }
-
-
 def _build_split(
     segments_path: Path,
-    lookup: dict[int, np.ndarray],
+    lookup_path: Path,
     *,
     split: str,
     max_events: int,
@@ -54,25 +44,19 @@ def _build_split(
             segments_path, split, min_length=MIN_LENGTH, max_events=max_events
         ).collect(),
     )
-    if frame.is_empty():
-        raise ValueError(f"no usable {split} segments found")
-    rows = frame.iter_rows(named=True)
-    selected: list[tuple[np.ndarray, np.ndarray]] = []
-    for row in rows:
-        codes = np.stack([lookup[int(pid)] for pid in row["placekey_id"]])
-        selected.append(
-            (codes, time_tokens_from_timestamps(row["_timestamps"]))
-        )
-    depth = int(selected[0][0].shape[1])
-    sid_codes = np.zeros((len(selected), max_events, depth), dtype=np.int16)
-    time_tokens = np.full((len(selected), max_events), -1, dtype=np.int16)
-    valid_mask = np.zeros((len(selected), max_events), dtype=np.bool_)
-    for index, (codes, times) in enumerate(selected):
-        length = len(codes)
-        sid_codes[index, :length] = codes
-        time_tokens[index, :length] = times
-        valid_mask[index, :length] = True
-    return sid_codes, time_tokens, valid_mask
+    columns = list(sid_code_columns(pl.read_parquet_schema(lookup_path)))
+    events = segment_events(frame, lookup_path, columns)
+    pad = functools.partial(
+        pad_events, events, rows=frame.height, width=max_events
+    )
+    tokens = time_tokens_from_week_minutes(
+        torch.from_numpy(events["_minutes"].to_numpy())
+    )
+    return (
+        pad(events.select(columns).to_numpy().astype(np.int16), fill=0),
+        pad(tokens.numpy().astype(np.int16), fill=-1),
+        pad(np.ones(events.height, dtype=np.bool_), fill=False),
+    )
 
 
 def build_bank(
@@ -82,9 +66,10 @@ def build_bank(
     output_path: Path,
     max_events: int,
 ) -> dict[str, object]:
-    lookup = _load_lookup(lookup_path)
     parts = [
-        _build_split(segments_path, lookup, split=split, max_events=max_events)
+        _build_split(
+            segments_path, lookup_path, split=split, max_events=max_events
+        )
         for split in BANK_SPLITS
     ]
     row_counts = {

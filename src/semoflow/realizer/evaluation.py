@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-import polars as pl
 import torch
 
 from semoflow.evaluation.scoring import (
@@ -18,20 +17,15 @@ from semoflow.evaluation.scoring import (
     metric_block,
     plan_from_planner_samples,
 )
-from semoflow.poi.sids import (
-    SemanticIDGroundingIndex,
-    sid_code_columns,
-)
+from semoflow.poi.sids import SemanticIDGroundingIndex
 from semoflow.realizer.bank import (
     bank_split_city_ids,
     bank_split_window,
     load_bank_payload,
 )
+from semoflow.realizer.catalog import SuffixCatalog
 from semoflow.realizer.model import PrefixTimeSuffixLatentFlowRealizer
-from semoflow.realizer.sampling import (
-    PrefixTailCatalog,
-    sample_prefix_time_suffix_latent_flow,
-)
+from semoflow.realizer.sampling import sample_prefix_time_suffix_latent_flow
 from semoflow.utils import normalize_value, write_json
 
 LOGGER = logging.getLogger(__name__)
@@ -111,26 +105,17 @@ def _catalog(
     payload: dict[str, Any],
     *,
     lookup_path: Path,
-) -> PrefixTailCatalog:
-    lookup = pl.read_parquet(lookup_path)
-    columns = list(sid_code_columns(lookup.columns))
-    catalog_codes = torch.from_numpy(
-        lookup.select(columns).to_numpy().astype("int64")
-    )
+) -> SuffixCatalog:
     offset, count = bank_split_window(payload, "train")
     rows = slice(offset, offset + count)
-    observed = payload["sid_codes"][rows][payload["valid_mask"][rows].bool()]
-    city = (
-        torch.from_numpy(lookup["city_id"].to_numpy().astype("int64"))
-        if model.city_vocab > 0
-        else None
-    )
-    return PrefixTailCatalog.from_codes(
-        catalog_codes,
+    return SuffixCatalog.from_lookup(
+        lookup_path,
         codebooks,
         prefix_depth=model.prefix_depth,
-        observed_codes=observed,
-        candidate_city=city,
+        observed_codes=payload["sid_codes"][rows][
+            payload["valid_mask"][rows].bool()
+        ],
+        with_city=model.city_vocab > 0,
     )
 
 
@@ -158,7 +143,7 @@ def _sample_arm(
     model: PrefixTimeSuffixLatentFlowRealizer,
     arm: _Arm,
     *,
-    catalog: PrefixTailCatalog,
+    catalog: SuffixCatalog,
     checkpoint: Mapping[str, Any],
     catalog_temperature: float,
     batch_size: int,

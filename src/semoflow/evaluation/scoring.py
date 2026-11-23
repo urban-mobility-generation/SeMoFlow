@@ -29,7 +29,7 @@ from semoflow.poi.sids import (
 from semoflow.realizer.bank import bank_segments, bank_split_window
 from semoflow.realizer.time_tokens import (
     N_PART_OF_DAY_BINS,
-    PART_OF_DAY_START_MINUTES,
+    time_tokens_from_week_minutes,
 )
 
 
@@ -142,18 +142,11 @@ def plan_from_planner_samples(
     prefix = F.pad(prefix[:, :width], (0, 0, 0, max(padding, 0)))
     minutes = F.pad(minutes[:, :width], (0, max(padding, 0)))
     valid = torch.arange(width)[None, :] < lengths[:, None]
-    clamped = minutes.clamp(0.0, 10079.999)
-    part_of_day = torch.bucketize(
-        clamped % 1440.0,
-        torch.tensor(PART_OF_DAY_START_MINUTES[1:], dtype=clamped.dtype),
-        right=True,
-    )
-    day = (clamped / 1440.0).long()
     return SampledPlan(
         prefix=prefix,
-        time_tokens=(day * N_PART_OF_DAY_BINS + part_of_day).masked_fill(
-            ~valid, -1
-        ),
+        time_tokens=time_tokens_from_week_minutes(
+            minutes.clamp(0.0, 10079.999)
+        ).masked_fill(~valid, -1),
         valid=valid,
         event_hours=(minutes.double() / 60.0).masked_fill(
             ~valid, float("nan")

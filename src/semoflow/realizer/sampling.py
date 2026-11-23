@@ -1,22 +1,17 @@
 from __future__ import annotations
 
-import dataclasses
 from dataclasses import dataclass
 
 import torch
 
-from semoflow.poi.sids import (
-    codes_to_embeddings,
-    find_sorted,
-    packed_code_keys,
-)
+from semoflow.realizer.catalog import SuffixCatalog
 from semoflow.realizer.model import (
     LatentSuffixConditioning,
     PrefixTimeSuffixLatentFlowRealizer,
 )
 from semoflow.realizer.objective import (
-    count_catalog_occurrences,
     normalize_tail,
+    suffix_tail_embeddings,
     suffix_tail_level_embeddings,
     velocity_from_x0,
 )
@@ -24,23 +19,6 @@ from semoflow.realizer.objective import (
 _CATALOG_DECODE_QUERY_CHUNK_SIZE = 4096
 _CATALOG_DECODE_MAX_CANDIDATE_PAIRS = 65536
 _CATALOG_FEATURE_CHUNK_SIZE = 16384
-
-
-def _catalog_query_ranges(
-    catalog: PrefixTailCatalog,
-    active_prefix: torch.Tensor,
-) -> tuple[torch.LongTensor, torch.LongTensor]:
-    query_keys = catalog.prefix_keys_of(active_prefix)
-    left = torch.searchsorted(catalog.prefix_keys, query_keys, side="left")
-    right = torch.searchsorted(catalog.prefix_keys, query_keys, side="right")
-    missing = left == right
-    if missing.any():
-        row = int(torch.where(missing)[0][0])
-        prefix = tuple(int(value) for value in active_prefix[row])
-        raise ValueError(
-            f"catalog has no legal SID continuation for prefix {prefix}"
-        )
-    return left, right
 
 
 def _candidate_index_block(
@@ -163,101 +141,10 @@ class _CityConstraint:
 
 
 @dataclass(frozen=True, slots=True)
-class PrefixTailCatalog:
-    codes: torch.LongTensor
-    tail_embeddings: torch.Tensor
-    prefix_keys: torch.LongTensor
-    codebook_size: int
-    prefix_depth: int
-    codebooks: torch.Tensor
-    log_prior: torch.Tensor
-    candidate_city: torch.LongTensor | None = None
-
-    @classmethod
-    def from_codes(
-        cls,
-        catalog_codes: torch.Tensor,
-        codebooks: torch.Tensor,
-        *,
-        prefix_depth: int,
-        observed_codes: torch.Tensor,
-        candidate_city: torch.Tensor | None = None,
-    ) -> PrefixTailCatalog:
-        codebook_size = int(codebooks.shape[1])
-        codes, unique_inverse = torch.unique(
-            catalog_codes.long(), dim=0, return_inverse=True
-        )
-        codes = codes.contiguous()
-        if candidate_city is not None:
-            city_source = candidate_city.long().cpu()
-            mapped = torch.full((codes.shape[0],), -1, dtype=torch.long)
-            reversed_index = torch.arange(
-                city_source.shape[0] - 1, -1, -1, dtype=torch.long
-            )
-            mapped[unique_inverse.cpu()[reversed_index]] = city_source[
-                reversed_index
-            ]
-            candidate_city = mapped
-        tail = codes_to_embeddings(
-            codes[:, prefix_depth:],
-            codebooks[prefix_depth:],
-        ).float()
-        keys = packed_code_keys(
-            codes[:, :prefix_depth], codebook_size=codebook_size
-        )
-        order = torch.argsort(keys, stable=True)
-        counts = count_catalog_occurrences(
-            packed_code_keys(codes, codebook_size=codebook_size),
-            observed_codes,
-            codebook_size=codebook_size,
-        )
-        log_prior = torch.log1p(counts.float()).to(codes.device)
-        return cls(
-            codes=codes[order],
-            tail_embeddings=tail[order],
-            prefix_keys=keys[order],
-            codebook_size=codebook_size,
-            prefix_depth=int(prefix_depth),
-            codebooks=codebooks.float().cpu().contiguous(),
-            log_prior=log_prior[order],
-            candidate_city=(
-                None
-                if candidate_city is None
-                else candidate_city.long().cpu()[order].contiguous()
-            ),
-        )
-
-    def to(self, device: torch.device | str) -> PrefixTailCatalog:
-        return dataclasses.replace(
-            self,
-            codes=self.codes.to(device),
-            tail_embeddings=self.tail_embeddings.to(device),
-            prefix_keys=self.prefix_keys.to(device),
-            codebooks=self.codebooks.to(device),
-            log_prior=self.log_prior.to(device),
-            candidate_city=(
-                None
-                if self.candidate_city is None
-                else self.candidate_city.to(device)
-            ),
-        )
-
-    def prefix_keys_of(self, prefixes: torch.Tensor) -> torch.LongTensor:
-        return packed_code_keys(
-            prefixes[..., : self.prefix_depth],
-            codebook_size=self.codebook_size,
-        )
-
-    def supports(self, prefixes: torch.Tensor) -> torch.BoolTensor:
-        keys = self.prefix_keys_of(prefixes.to(self.prefix_keys.device))
-        return find_sorted(self.prefix_keys, keys)[1]
-
-
-@dataclass(frozen=True, slots=True)
 class PrefixTimeSuffixLatentFlowSample:
     full_sids: torch.LongTensor
-    city_constrained_events: int = 0
-    city_constraint_fallback_events: int = 0
+    city_constrained_events: int
+    city_constraint_fallback_events: int
 
 
 _UINT32_MASK = 0xFFFFFFFF
@@ -316,7 +203,7 @@ def _sample_catalog_candidates(
 
 def _decode_calibrated_catalog(
     model: PrefixTimeSuffixLatentFlowRealizer,
-    catalog: PrefixTailCatalog,
+    catalog: SuffixCatalog,
     prefix_codes: torch.Tensor,
     normalized_tail: torch.Tensor,
     conditioning: LatentSuffixConditioning,
@@ -327,9 +214,9 @@ def _decode_calibrated_catalog(
     catalog_prior_weight: float,
     catalog_temperature: float,
     generator: torch.Generator,
-    row_city: torch.Tensor | None = None,
-    catalog_noise_coupling: str = "independent",
-) -> tuple[torch.LongTensor, _CityConstraint | None]:
+    row_city: torch.Tensor | None,
+    catalog_noise_coupling: str,
+) -> tuple[torch.LongTensor, _CityConstraint]:
     output = _padded_output(
         valid_mask,
         prefix_codes,
@@ -337,9 +224,6 @@ def _decode_calibrated_catalog(
         pad_id=model.pad_id,
         prefix_depth=model.prefix_depth,
     )
-    if not valid_mask.any():
-        return output, None
-
     active_tail = normalized_tail[valid_mask].float()
     coupling_keys = (
         _trajectory_prefix_coupling_keys(
@@ -350,10 +234,15 @@ def _decode_calibrated_catalog(
     )
     active_codes = output[valid_mask].clone()
     city = _CityConstraint(
-        catalog.candidate_city, row_city, valid_mask, active_tail.device
+        catalog.city, row_city, valid_mask, active_tail.device
     )
+    catalog_tail = suffix_tail_embeddings(
+        catalog.codes.cpu(),
+        catalog.codebooks.cpu(),
+        prefix_depth=model.prefix_depth,
+    ).to(active_tail.device)
     normalized_catalog_tail = normalize_tail(
-        catalog.tail_embeddings, tail_mean, tail_whitener
+        catalog_tail, tail_mean, tail_whitener
     )
     catalog_levels = suffix_tail_level_embeddings(
         catalog.codes, catalog.codebooks, prefix_depth=model.prefix_depth
@@ -362,9 +251,7 @@ def _decode_calibrated_catalog(
         model, normalized_catalog_tail, catalog_levels
     )
     del catalog_levels
-    left, right = _catalog_query_ranges(
-        catalog, prefix_codes[valid_mask].long()
-    )
+    left, right = catalog.prefix_ranges(prefix_codes[valid_mask].long())
     widths = right - left
     query_chunks = _catalog_decode_query_chunks(
         torch.argsort(widths, stable=True), widths
@@ -498,7 +385,7 @@ def sample_prefix_time_suffix_latent_flow(
     time_tokens: torch.Tensor,
     valid_mask: torch.BoolTensor,
     *,
-    catalog: PrefixTailCatalog,
+    catalog: SuffixCatalog,
     tail_mean: torch.Tensor,
     tail_whitener: torch.Tensor,
     num_steps: int,
@@ -557,15 +444,12 @@ def sample_prefix_time_suffix_latent_flow(
     )
     return PrefixTimeSuffixLatentFlowSample(
         full_sids=full_sids,
-        city_constrained_events=0 if city is None else int(city.constrained),
-        city_constraint_fallback_events=(
-            0 if city is None else int(city.fallback)
-        ),
+        city_constrained_events=int(city.constrained),
+        city_constraint_fallback_events=int(city.fallback),
     )
 
 
 __all__ = [
-    "PrefixTailCatalog",
     "PrefixTimeSuffixLatentFlowSample",
     "sample_prefix_time_suffix_latent_flow",
 ]

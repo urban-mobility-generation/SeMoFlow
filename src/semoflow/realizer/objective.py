@@ -1,224 +1,27 @@
 from __future__ import annotations
 
-import dataclasses
 import functools
-from dataclasses import dataclass
 from typing import cast
 
 import torch
 import torch.nn.functional as F
 
-from semoflow.poi.sids import (
-    codes_to_embeddings,
-    find_sorted,
-    packed_code_keys,
-)
+from semoflow.poi.sids import codes_to_embeddings
+from semoflow.realizer.catalog import CandidateTable
 from semoflow.realizer.model import (
     LatentSuffixConditioning,
     PrefixTimeSuffixLatentFlowRealizer,
 )
 from semoflow.utils import unwrap_ddp
 
-
-def sample_logit_normal_timesteps(
-    batch_size: int,
-    device: torch.device | str,
-    *,
-    p_mean: float = -0.5,
-    p_std: float = 1.2,
-) -> torch.Tensor:
-    z = torch.randn(batch_size, device=device) * p_std + p_mean
-    return torch.sigmoid(z)
+_TIMESTEP_MEAN = -0.5
+_TIMESTEP_STD = 1.2
 
 
 def velocity_from_x0(
     zt: torch.Tensor, x0_pred: torch.Tensor, t: torch.Tensor
 ) -> torch.Tensor:
     return (zt - x0_pred) / t[:, None, None].clamp_min(1e-6)
-
-
-def count_catalog_occurrences(
-    catalog_keys: torch.Tensor,
-    observed_codes: torch.Tensor,
-    *,
-    codebook_size: int,
-    count_device: torch.device | str = "cpu",
-    chunk_size: int = 1_048_576,
-) -> torch.Tensor:
-    catalog_order = torch.argsort(catalog_keys, stable=True)
-    sorted_catalog_keys = catalog_keys[catalog_order].to(count_device)
-    sorted_counts = torch.zeros(
-        catalog_keys.numel(), dtype=torch.long, device=count_device
-    )
-    for chunk in observed_codes.split(chunk_size):
-        chunk_keys = packed_code_keys(
-            chunk.to(count_device, dtype=torch.long, non_blocking=True),
-            codebook_size=codebook_size,
-        )
-        safe, matched = find_sorted(sorted_catalog_keys, chunk_keys)
-        sorted_counts.scatter_add_(
-            0, safe[matched], torch.ones_like(safe[matched])
-        )
-    counts = torch.zeros(catalog_keys.numel(), dtype=torch.long)
-    counts[catalog_order] = sorted_counts.cpu()
-    return counts
-
-
-def _prefix_candidate_rows(
-    rows: list[int],
-    *,
-    catalog_counts: torch.Tensor,
-    catalog_rows: list[list[int]],
-    max_candidates: int,
-) -> torch.Tensor:
-    rows = sorted(
-        rows,
-        key=lambda row_index: (
-            -int(catalog_counts[row_index]),
-            tuple(catalog_rows[row_index]),
-        ),
-    )
-    if len(rows) > max_candidates:
-        frequent_count = max_candidates // 2
-        remainder = rows[frequent_count:]
-        stride = max(1, len(remainder) // max_candidates)
-        rows = (rows[:frequent_count] + remainder[::stride])[:max_candidates]
-    return torch.tensor(rows, dtype=torch.long)
-
-
-def _candidate_table(
-    catalog: torch.Tensor,
-    catalog_log_prior: torch.Tensor,
-    groups: list[torch.Tensor],
-    max_candidates: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    shape = (len(groups), max_candidates)
-    codes = torch.zeros((*shape, catalog.shape[1]), dtype=torch.long)
-    log_prior = torch.full(shape, float("-inf"), dtype=torch.float32)
-    mask = torch.zeros(shape, dtype=torch.bool)
-    for index, rows in enumerate(groups):
-        count = rows.numel()
-        codes[index, :count] = catalog[rows]
-        log_prior[index, :count] = catalog_log_prior[rows]
-        mask[index, :count] = True
-    return codes, log_prior, mask
-
-
-@dataclass(frozen=True, slots=True)
-class CatalogCandidateBank:
-    prefix_depth: int
-    codebook_size: int
-    max_candidates: int
-    codebooks: torch.Tensor
-    prefix_keys: torch.LongTensor
-    candidate_codes: torch.LongTensor
-    candidate_log_prior: torch.Tensor
-    candidate_mask: torch.BoolTensor
-    full_code_keys: torch.LongTensor
-    full_log_prior: torch.Tensor
-
-    @classmethod
-    def from_codes(
-        cls,
-        catalog_codes: torch.Tensor,
-        codebooks: torch.Tensor,
-        *,
-        prefix_depth: int,
-        observed_codes: torch.Tensor,
-        count_device: torch.device | str,
-        max_candidates: int,
-    ) -> CatalogCandidateBank:
-        codebook_size = int(codebooks.shape[1])
-
-        catalog = torch.unique(catalog_codes.long().cpu(), dim=0).contiguous()
-        catalog_keys = packed_code_keys(
-            catalog,
-            codebook_size=codebook_size,
-        )
-        catalog_counts = count_catalog_occurrences(
-            catalog_keys,
-            observed_codes,
-            codebook_size=codebook_size,
-            count_device=count_device,
-        )
-        catalog_log_prior = torch.log1p(catalog_counts.float())
-        full_order = torch.argsort(catalog_keys, stable=True)
-
-        prefix_groups: dict[tuple[int, ...], list[int]] = {}
-        catalog_rows = catalog.tolist()
-        for row_index, row in enumerate(catalog_rows):
-            prefix_groups.setdefault(tuple(row[:prefix_depth]), []).append(
-                row_index
-            )
-        sorted_prefixes = sorted(prefix_groups)
-        prefix_keys = packed_code_keys(
-            torch.tensor(sorted_prefixes, dtype=torch.long),
-            codebook_size=codebook_size,
-        )
-        groups = [
-            _prefix_candidate_rows(
-                prefix_groups[prefix],
-                catalog_counts=catalog_counts,
-                catalog_rows=catalog_rows,
-                max_candidates=max_candidates,
-            )
-            for prefix in sorted_prefixes
-        ]
-        candidate_codes, candidate_log_prior, candidate_mask = (
-            _candidate_table(
-                catalog, catalog_log_prior, groups, max_candidates
-            )
-        )
-        return cls(
-            prefix_depth=prefix_depth,
-            codebook_size=codebook_size,
-            max_candidates=max_candidates,
-            codebooks=codebooks.float().cpu().contiguous(),
-            prefix_keys=prefix_keys,
-            candidate_codes=candidate_codes,
-            candidate_log_prior=candidate_log_prior,
-            candidate_mask=candidate_mask,
-            full_code_keys=catalog_keys[full_order].contiguous(),
-            full_log_prior=catalog_log_prior[full_order].contiguous(),
-        )
-
-    def to(self, device: torch.device | str) -> CatalogCandidateBank:
-        return dataclasses.replace(
-            self,
-            codebooks=self.codebooks.to(device),
-            prefix_keys=self.prefix_keys.to(device),
-            candidate_codes=self.candidate_codes.to(device),
-            candidate_log_prior=self.candidate_log_prior.to(device),
-            candidate_mask=self.candidate_mask.to(device),
-            full_code_keys=self.full_code_keys.to(device),
-            full_log_prior=self.full_log_prior.to(device),
-        )
-
-    def _prefix_indices(self, prefixes: torch.Tensor) -> torch.LongTensor:
-        keys = packed_code_keys(
-            prefixes[..., : self.prefix_depth],
-            codebook_size=self.codebook_size,
-        )
-        indices, valid = find_sorted(self.prefix_keys, keys)
-        if not valid.all():
-            missing = prefixes[~valid][0].tolist()
-            raise ValueError(
-                "catalog has no legal SID continuation for prefix "
-                f"{tuple(int(value) for value in missing)}"
-            )
-        return indices
-
-    def log_prior_for_codes(self, codes: torch.Tensor) -> torch.Tensor:
-        keys = packed_code_keys(
-            codes,
-            codebook_size=self.codebook_size,
-        )
-        safe, valid = find_sorted(self.full_code_keys, keys)
-        return torch.where(
-            valid,
-            self.full_log_prior[safe],
-            torch.zeros_like(keys, dtype=torch.float32),
-        )
 
 
 def suffix_tail_embeddings(
@@ -258,18 +61,14 @@ def compute_tail_whitening_stats(
     codebooks: torch.Tensor,
     *,
     prefix_depth: int,
+    chunk_size: int,
+    compute_device: torch.device,
     shrinkage: float = 0.05,
     eps: float = 1e-4,
-    chunk_size: int = 16384,
-    compute_device: torch.device | str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     flat_codes = clean_codes.reshape(-1, clean_codes.shape[-1])
     flat_valid = valid_mask.reshape(-1)
-    stats_device = (
-        clean_codes.device
-        if compute_device is None
-        else torch.device(compute_device)
-    )
+    stats_device = compute_device
     codebooks = codebooks.float().to(stats_device)
     latent_dim = int(codebooks.shape[-1])
     total = torch.zeros((), dtype=torch.float64, device=stats_device)
@@ -282,21 +81,12 @@ def compute_tail_whitening_stats(
     )
     for start in range(0, flat_codes.size(0), chunk_size):
         end = min(start + chunk_size, flat_codes.size(0))
-        chunk_mask = flat_valid[start:end]
-        if not chunk_mask.any():
-            continue
-        chunk = flat_codes[start:end][chunk_mask].to(
+        chunk = flat_codes[start:end][flat_valid[start:end]].to(
             stats_device, dtype=torch.long, non_blocking=True
         )
-        tail = (
-            suffix_tail_embeddings(
-                chunk.unsqueeze(1),
-                codebooks,
-                prefix_depth=prefix_depth,
-            )
-            .squeeze(1)
-            .double()
-        )
+        tail = suffix_tail_embeddings(
+            chunk, codebooks, prefix_depth=prefix_depth
+        ).double()
         total += tail.size(0)
         first += tail.sum(dim=0)
         second += tail.transpose(0, 1).matmul(tail)
@@ -325,13 +115,10 @@ def _catalog_features(
     *,
     prefix_depth: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    rows = codes if codes.ndim == 3 else codes.unsqueeze(1)
-    raw = suffix_tail_embeddings(rows, codebooks, prefix_depth=prefix_depth)
+    raw = suffix_tail_embeddings(codes, codebooks, prefix_depth=prefix_depth)
     levels = suffix_tail_level_embeddings(
-        rows, codebooks, prefix_depth=prefix_depth
+        codes, codebooks, prefix_depth=prefix_depth
     )
-    if codes.ndim == 2:
-        raw, levels = raw.squeeze(1), levels.squeeze(1)
     normalized = normalize_tail(raw, tail_mean, tail_whitener)
     return normalized, model.catalog_candidate_features(normalized, levels)
 
@@ -375,7 +162,7 @@ def _catalog_losses(
     clean_codes: torch.Tensor,
     valid_mask: torch.BoolTensor,
     codebooks: torch.Tensor,
-    candidates: CatalogCandidateBank,
+    candidates: CandidateTable,
     tail_mean: torch.Tensor,
     tail_whitener: torch.Tensor,
     *,
@@ -385,9 +172,8 @@ def _catalog_losses(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     active_codes = clean_codes[valid_mask].long()
     active_pred = predicted_normalized[valid_mask]
-    prefix_indices = candidates._prefix_indices(
-        active_codes[:, : candidates.prefix_depth]
-    )
+    prefix_depth = candidates.catalog.prefix_depth
+    prefix_indices = candidates.prefix_index(active_codes)
     unique_indices, inverse = torch.unique(
         prefix_indices, sorted=True, return_inverse=True
     )
@@ -397,11 +183,9 @@ def _catalog_losses(
         codebooks=codebooks,
         tail_mean=tail_mean,
         tail_whitener=tail_whitener,
-        prefix_depth=candidates.prefix_depth,
+        prefix_depth=prefix_depth,
     )
-    base_normalized, base_features = features(
-        candidates.candidate_codes[unique_indices]
-    )
+    base_normalized, base_features = features(candidates.codes[unique_indices])
     target_normalized, target_features = features(active_codes)
     query = model.catalog_query_features(conditioning, active_pred, valid_mask)
     scale = model.model_dim**0.5
@@ -424,14 +208,14 @@ def _catalog_losses(
     ).clamp_min(0.0)
 
     duplicate = (
-        candidates.candidate_codes[prefix_indices]
+        candidates.codes[prefix_indices]
         .eq(active_codes[:, None, :])
         .all(dim=-1)
     )
     valid_candidates = torch.cat(
         (
             torch.ones_like(duplicate[:, :1]),
-            candidates.candidate_mask[prefix_indices] & ~duplicate,
+            candidates.mask[prefix_indices] & ~duplicate,
         ),
         dim=-1,
     )
@@ -441,8 +225,8 @@ def _catalog_losses(
     distance = torch.cat((target_distance[:, None], base_distance), dim=-1)
     log_prior = torch.cat(
         (
-            candidates.log_prior_for_codes(active_codes)[:, None],
-            candidates.candidate_log_prior[prefix_indices],
+            candidates.catalog.log_prior_for_codes(active_codes)[:, None],
+            candidates.log_prior[prefix_indices],
         ),
         dim=-1,
     )
@@ -463,16 +247,14 @@ def prefix_time_suffix_latent_flow_loss(
     codebooks: torch.Tensor,
     tail_mean: torch.Tensor,
     tail_whitener: torch.Tensor,
-    candidate_bank: CatalogCandidateBank,
+    candidates: CandidateTable,
     *,
-    p_mean: float = -0.5,
-    p_std: float = 1.2,
     catalog_loss_weight: float,
-    catalog_temperature: float = 1.0,
-    endpoint_loss_weight: float = 0.0,
-    population_loss_weight: float = 0.0,
-    catalog_prior_weight: float = 0.25,
-    city_id: torch.LongTensor | None = None,
+    catalog_temperature: float,
+    endpoint_loss_weight: float,
+    population_loss_weight: float,
+    catalog_prior_weight: float,
+    city_id: torch.LongTensor | None,
 ) -> torch.Tensor:
     core = cast(PrefixTimeSuffixLatentFlowRealizer, unwrap_ddp(model))
 
@@ -486,8 +268,10 @@ def prefix_time_suffix_latent_flow_loss(
     padding = ~valid_mask[..., None]
     clean_tail = clean_tail.masked_fill(padding, 0.0)
     noise = torch.randn_like(clean_tail).masked_fill(padding, 0.0)
-    timesteps = sample_logit_normal_timesteps(
-        clean_codes.size(0), clean_codes.device, p_mean=p_mean, p_std=p_std
+    timesteps = torch.sigmoid(
+        torch.randn(clean_codes.size(0), device=clean_codes.device)
+        * _TIMESTEP_STD
+        + _TIMESTEP_MEAN
     )
     t = timesteps[:, None, None]
     noisy_tail = ((1.0 - t) * clean_tail + t * noise).masked_fill(padding, 0.0)
@@ -518,7 +302,7 @@ def prefix_time_suffix_latent_flow_loss(
         clean_codes,
         valid_mask,
         codebooks,
-        candidate_bank,
+        candidates,
         tail_mean,
         tail_whitener,
         catalog_prior_weight=catalog_prior_weight,
@@ -533,11 +317,10 @@ def prefix_time_suffix_latent_flow_loss(
 
 
 __all__ = [
-    "CatalogCandidateBank",
     "compute_tail_whitening_stats",
-    "count_catalog_occurrences",
     "normalize_tail",
     "prefix_time_suffix_latent_flow_loss",
     "suffix_tail_embeddings",
     "suffix_tail_level_embeddings",
+    "velocity_from_x0",
 ]
