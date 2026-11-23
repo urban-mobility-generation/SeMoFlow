@@ -16,6 +16,8 @@ from semoflow.utils import unwrap_ddp
 
 _TIMESTEP_MEAN = -0.5
 _TIMESTEP_STD = 1.2
+_WHITENING_SHRINKAGE = 0.05
+_WHITENING_EPS = 1e-4
 
 
 def velocity_from_x0(
@@ -63,8 +65,6 @@ def compute_tail_whitening_stats(
     prefix_depth: int,
     chunk_size: int,
     compute_device: torch.device,
-    shrinkage: float = 0.05,
-    eps: float = 1e-4,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     flat_codes = clean_codes.reshape(-1, clean_codes.shape[-1])
     flat_valid = valid_mask.reshape(-1)
@@ -93,13 +93,13 @@ def compute_tail_whitening_stats(
     mean = first / total
     covariance = second / total - torch.outer(mean, mean)
     covariance = (covariance + covariance.transpose(0, 1)) * 0.5
-    average_variance = covariance.diagonal().mean().clamp_min(eps)
+    average_variance = covariance.diagonal().mean().clamp_min(_WHITENING_EPS)
     identity = torch.eye(latent_dim, dtype=torch.float64, device=stats_device)
     covariance = (
-        1.0 - shrinkage
-    ) * covariance + shrinkage * average_variance * identity
+        1.0 - _WHITENING_SHRINKAGE
+    ) * covariance + _WHITENING_SHRINKAGE * average_variance * identity
     eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
-    eigenvalues = eigenvalues.clamp_min(eps)
+    eigenvalues = eigenvalues.clamp_min(_WHITENING_EPS)
     whitener = (
         eigenvectors * eigenvalues.rsqrt().unsqueeze(0)
     ) @ eigenvectors.transpose(0, 1)

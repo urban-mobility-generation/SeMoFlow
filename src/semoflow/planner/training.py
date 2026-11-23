@@ -12,7 +12,6 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn as nn
 from torch import optim
 from torch.nn.parallel import DistributedDataParallel
@@ -25,7 +24,7 @@ from torch.utils.data import (
 )
 from torch.utils.data.distributed import DistributedSampler
 
-from semoflow.config import PlannerConfig, PlannerTrainingConfig, RunLayout
+from semoflow.config import PlannerConfig, RunLayout
 from semoflow.data import DATASET_ARTIFACT_TYPE, reconstruct_event_time_minutes
 from semoflow.planner.model import (
     OccurrenceARPlanner,
@@ -38,13 +37,10 @@ from semoflow.planner.prefix_decoder import LegalPrefixIndex
 from semoflow.utils import (
     EarlyStopper,
     build_lr_scheduler,
-    ddp_worker,
-    find_free_port,
-    get_configured_log_file,
     load_artifact,
     log_epoch_summary,
     log_training_step,
-    parse_device_spec,
+    run_on_devices,
     set_seed_all,
     write_json,
 )
@@ -57,7 +53,6 @@ class OccurrencePlannerDataConfig:
     prefix_depth: int
     max_occurrences: int
     city_conditioning: bool
-    gap_codec_version: str
     gap_bucket_edges_minutes: tuple[float, ...]
     gap_duration_minutes: tuple[float, ...]
     observation_window_minutes: float
@@ -83,7 +78,6 @@ class OccurrencePlannerDataset:
     city_legal_prefix_mask: torch.Tensor
     train: OccurrencePlannerSplit
     validation: OccurrencePlannerSplit
-    source_path: Path
     legal_prefix_centroids: torch.Tensor | None = None
     legal_prefix_centroid_available: torch.Tensor | None = None
 
@@ -101,7 +95,6 @@ def load_occurrence_planner_dataset(path: Path) -> OccurrencePlannerDataset:
         city_legal_prefix_mask=payload["city_legal_prefix_mask"],
         train=OccurrencePlannerSplit(**payload["train"]),
         validation=OccurrencePlannerSplit(**payload["validation"]),
-        source_path=Path(path).resolve(),
     )
 
 
@@ -301,7 +294,12 @@ def _planner_config(
     dataset: OccurrencePlannerDataset, settings: PlannerConfig
 ) -> OccurrencePlannerConfig:
     return OccurrencePlannerConfig(
-        **asdict(dataset.config), **asdict(settings.architecture)
+        **asdict(dataset.config),
+        model_dim=settings.model_dim,
+        n_heads=settings.n_heads,
+        n_layers=settings.n_layers,
+        dropout=settings.dropout,
+        use_distance_prior=settings.use_distance_prior,
     )
 
 
@@ -340,8 +338,7 @@ def _synchronize(device: torch.device) -> None:
 @dataclass
 class _Run:
     ctx: _Rank
-    options: PlannerTrainingConfig
-    seed: int
+    settings: PlannerConfig
     config: OccurrencePlannerConfig
     model: OccurrenceARPlanner
     train_model: nn.Module
@@ -355,22 +352,11 @@ class _Run:
 
     @property
     def total_steps(self) -> int:
-        return len(self.train_loader) * self.options.epochs
+        return len(self.train_loader) * self.settings.epochs
 
 
-def _rank(options: PlannerTrainingConfig) -> _Rank:
-    if dist.is_available() and dist.is_initialized():
-        return _Rank(
-            dist.get_rank(),
-            dist.get_world_size(),
-            torch.device("cuda", torch.cuda.current_device()),
-        )
-    return _Rank(0, 1, parse_device_spec(options.device)[0])
-
-
-def _setup(settings: PlannerConfig, layout: RunLayout) -> _Run:
-    options, seed = settings.training, settings.seed
-    ctx = _rank(options)
+def _setup(settings: PlannerConfig, layout: RunLayout, ctx: _Rank) -> _Run:
+    seed = settings.seed
     device = ctx.device
     dataset = load_occurrence_planner_dataset(layout.planner_dataset)
     if ctx.primary:
@@ -389,7 +375,7 @@ def _setup(settings: PlannerConfig, layout: RunLayout) -> _Run:
     set_seed_all(seed)
     catalog = _catalog_tensors(config, dataset)
     model = OccurrenceARPlanner(config, **catalog).to(device)
-    if options.compile_model:
+    if settings.compile:
         model.compile(fullgraph=True)
     train_model: nn.Module = model
     if ctx.distributed:
@@ -402,8 +388,8 @@ def _setup(settings: PlannerConfig, layout: RunLayout) -> _Run:
     set_seed_all(seed + ctx.rank)
     optimizer = optim.AdamW(
         model.parameters(),
-        lr=options.learning_rate,
-        weight_decay=options.weight_decay,
+        lr=settings.learning_rate,
+        weight_decay=settings.weight_decay,
     )
     if ctx.primary:
         logger.info(
@@ -414,22 +400,22 @@ def _setup(settings: PlannerConfig, layout: RunLayout) -> _Run:
             device,
             ctx.world_size,
             seed,
-            options.epochs,
-            options.batch_size,
-            options.learning_rate,
+            settings.epochs,
+            settings.batch_size,
+            settings.learning_rate,
             config.model_dim,
             config.n_layers,
-            options.lr_scheduler,
-            options.warmup_steps,
-            options.min_lr,
-            options.compile_model,
+            settings.lr_scheduler,
+            settings.warmup_steps,
+            settings.min_lr,
+            settings.compile,
         )
     build = partial(
         build_occurrence_tensor_dataloader,
         config=config,
         legality=model.legality,
-        batch_size=options.batch_size,
-        num_workers=options.num_workers,
+        batch_size=settings.batch_size,
+        num_workers=settings.num_workers,
         pin_memory=device.type == "cuda",
     )
     sampler = (
@@ -447,19 +433,18 @@ def _setup(settings: PlannerConfig, layout: RunLayout) -> _Run:
     train_loader = build(dataset.train, sampler=sampler)
     return _Run(
         ctx=ctx,
-        options=options,
-        seed=seed,
+        settings=settings,
         config=config,
         model=model,
         train_model=train_model,
         optimizer=optimizer,
         scheduler=build_lr_scheduler(
             optimizer,
-            schedule=options.lr_scheduler,
-            warmup_steps=options.warmup_steps,
-            total_updates=len(train_loader) * options.epochs,
-            base_lr=options.learning_rate,
-            min_lr=options.min_lr,
+            schedule=settings.lr_scheduler,
+            warmup_steps=settings.warmup_steps,
+            total_updates=len(train_loader) * settings.epochs,
+            base_lr=settings.learning_rate,
+            min_lr=settings.min_lr,
         ),
         sampler=sampler,
         train_loader=train_loader,
@@ -468,8 +453,7 @@ def _setup(settings: PlannerConfig, layout: RunLayout) -> _Run:
         save=partial(
             save_occurrence_planner_checkpoint,
             config=config,
-            seed=seed,
-            options=options,
+            settings=settings,
             **catalog,
         ),
     )
@@ -504,7 +488,7 @@ def _train_epoch(run: _Run, epoch: int, step: int) -> tuple[_NLL, int]:
                 step=step,
                 total_steps=run.total_steps,
                 epoch=epoch,
-                total_epochs=run.options.epochs,
+                total_epochs=run.settings.epochs,
                 metrics={
                     "loss": float(loss.total.detach()),
                     "prefix_loss": float(loss.prefix.detach()),
@@ -533,7 +517,7 @@ def _log_epoch(
     log_epoch_summary(
         logger,
         epoch=epoch,
-        total_epochs=run.options.epochs,
+        total_epochs=run.settings.epochs,
         epoch_elapsed_s=row["train_elapsed_s"],
         samples_per_sec=row["train_samples_per_sec"],
         gpu_allocated_gb=torch.cuda.memory_allocated(device) / 1e9
@@ -547,7 +531,7 @@ def _log_epoch(
         "epoch %d/%d  lr=%.6g  train_nll=%.4f  validation_nll=%.4f  "
         "val[length=%.4f gap=%.4f prefix=%.4f]%s",
         epoch,
-        run.options.epochs,
+        run.settings.epochs,
         row["learning_rate"],
         train["nll"],
         validation["nll"],
@@ -558,20 +542,24 @@ def _log_epoch(
     )
 
 
-def train_occurrence_planner(
-    settings: PlannerConfig, layout: RunLayout
+def _train_on_device(
+    device: torch.device,
+    rank: int,
+    world_size: int,
+    settings: PlannerConfig,
+    layout: RunLayout,
 ) -> dict[str, Any]:
-    run = _setup(settings, layout)
+    run = _setup(settings, layout, _Rank(rank, world_size, device))
     ctx, device = run.ctx, run.ctx.device
     best_path, last_path, metrics_path = (
         layout.planner_dir / name for name in _OUTPUT_NAMES
     )
-    stopper = EarlyStopper(patience=run.options.early_stopping_patience)
+    stopper = EarlyStopper(patience=run.settings.early_stopping_patience)
     history: list[dict[str, float]] = []
     validation: dict[str, float] = {}
     step = 0
     epoch = 0
-    for epoch in range(1, run.options.epochs + 1):
+    for epoch in range(1, run.settings.epochs + 1):
         if device.type == "cuda":
             torch.cuda.synchronize(device)
             torch.cuda.reset_peak_memory_stats(device)
@@ -645,38 +633,14 @@ def train_occurrence_planner(
     return summary
 
 
-def _spawn_worker(
-    rank: int,
-    device_ids: list[int],
-    port: int,
-    settings: PlannerConfig,
-    layout: RunLayout,
-    log_level: str,
-    log_file: Path | None,
-) -> None:
-    with ddp_worker(rank, device_ids, port, log_level, log_file):
-        train_occurrence_planner(settings, layout)
-
-
 def train_planner(
-    settings: PlannerConfig, layout: RunLayout, *, log_level: str = "INFO"
+    settings: PlannerConfig, layout: RunLayout
 ) -> dict[str, Any]:
-    _, device_ids = parse_device_spec(settings.training.device)
-    if len(device_ids) < 2:
-        return train_occurrence_planner(settings, layout)
-    mp.spawn(
-        _spawn_worker,
-        args=(
-            device_ids,
-            find_free_port(),
-            settings,
-            layout,
-            log_level,
-            get_configured_log_file(),
-        ),
-        nprocs=len(device_ids),
-        join=True,
+    result = run_on_devices(
+        _train_on_device, settings.device, settings, layout
     )
+    if result is not None:
+        return result
     metrics = json.loads((layout.planner_dir / "metrics.json").read_text())
     metrics.pop("epochs")
     return metrics

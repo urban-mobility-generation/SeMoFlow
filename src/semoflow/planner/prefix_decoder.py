@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from semoflow.geodesy import EARTH_RADIUS_KM, unit_vectors
 from semoflow.poi.sids import find_sorted, packed_code_keys
 
 
@@ -113,26 +114,10 @@ class LegalPrefixIndex(nn.Module):
         return city_masks[catalog_rows, rows] & found[..., None]
 
 
-EARTH_RADIUS_KM = 6371.0088
-
-
 DISTANCE_BUCKET_EDGES_KM = (0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0)
 
 
 DISTANCE_BUCKETS = len(DISTANCE_BUCKET_EDGES_KM) + 1
-
-
-def unit_vectors(coordinates: torch.Tensor) -> torch.Tensor:
-    latitude = torch.deg2rad(coordinates[..., 0].double())
-    longitude = torch.deg2rad(coordinates[..., 1].double())
-    return torch.stack(
-        (
-            latitude.cos() * longitude.cos(),
-            latitude.cos() * longitude.sin(),
-            latitude.sin(),
-        ),
-        dim=-1,
-    )
 
 
 class PrefixDistancePrior(nn.Module):

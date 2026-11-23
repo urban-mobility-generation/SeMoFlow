@@ -11,8 +11,6 @@ encoder:
     model: sentence-t5-xxl
     batch_size: 256
     precision: float32
-    include_address_in_template: false
-    include_name_in_template: true
   graph:
     hidden_dim: 512
     out_dim: 128
@@ -55,27 +53,24 @@ tokenizer:
   num_workers: 4
 
 planner:
-  data:
-    min_active_days: 2
-    max_occurrences: 128
-    city_conditioning: true
-  architecture:
-    model_dim: 256
-    n_heads: 8
-    n_layers: 6
-    dropout: 0.2
-    use_distance_prior: true
-  training:
-    epochs: 60
-    batch_size: 512
-    learning_rate: 0.0003
-    weight_decay: 0.0001
-    lr_scheduler: cosine
-    warmup_steps: 100
-    min_lr: 0.00003
-    early_stopping_patience: 5
-    num_workers: 8
-    compile_model: true
+  min_active_days: 2
+  max_occurrences: 128
+  city_conditioning: true
+  model_dim: 256
+  n_heads: 8
+  n_layers: 6
+  dropout: 0.2
+  use_distance_prior: true
+  epochs: 60
+  batch_size: 512
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  lr_scheduler: cosine
+  warmup_steps: 100
+  min_lr: 0.00003
+  early_stopping_patience: 5
+  num_workers: 8
+  compile: true
 
 realizer:
   max_events: 128

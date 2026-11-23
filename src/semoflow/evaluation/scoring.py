@@ -175,10 +175,10 @@ def metric_block(
     generated_time_tokens: torch.Tensor,
     real_event_hours: torch.Tensor,
     generated_event_hours: torch.Tensor,
-    reference_placekey_ids: torch.Tensor | None = None,
-    candidate_selection: str = "first",
-    candidate_weights: Mapping[int, float] | None = None,
-    compute_device: torch.device | str | None = None,
+    reference_placekey_ids: torch.Tensor | None,
+    candidate_selection: str,
+    candidate_weights: Mapping[int, float] | None,
+    compute_device: torch.device | str | None,
 ) -> dict[str, Any]:
     real_poi = ground_sid_codes(
         real_codes,
@@ -230,6 +230,7 @@ def metric_block(
 
 
 __all__ = [
+    "SampledPlan",
     "aligned_reference_event_hours",
     "load_candidate_prior",
     "load_places",

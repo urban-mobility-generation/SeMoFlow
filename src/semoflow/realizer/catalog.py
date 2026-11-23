@@ -43,8 +43,8 @@ class SuffixCatalog:
         *,
         prefix_depth: int,
         observed_codes: torch.Tensor,
-        count_device: torch.device | str = "cpu",
-        city: torch.Tensor | None = None,
+        count_device: torch.device | str,
+        city: torch.Tensor | None,
     ) -> SuffixCatalog:
         size = int(codebooks.shape[1])
         codes, inverse = torch.unique(

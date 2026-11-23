@@ -7,8 +7,10 @@ from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import polars as pl
+import torch
 
 from semoflow.config import CITY_ID
+from semoflow.geodesy import unit_vectors
 from semoflow.utils import write_json
 
 if TYPE_CHECKING:
@@ -30,8 +32,8 @@ def hash_fraction(value: str, seed: int) -> float:
     return int.from_bytes(digest, "little") / 2**64
 
 
-def assign_split(key: str, *, seed: int = GLOBAL_SPLIT_SEED) -> str:
-    fraction = hash_fraction(key, seed)
+def assign_split(key: str) -> str:
+    fraction = hash_fraction(key, GLOBAL_SPLIT_SEED)
     if fraction < 0.70:
         return "train"
     if fraction < 0.85:
@@ -71,29 +73,10 @@ _CITY_COLUMNS = (
     "country_name",
     "city_type",
 )
-_EMPTY_PLACE_COLUMNS = (
-    "location_name",
-    "sub_category",
-    "naics_code",
-    "street_address",
-    "city",
-    "state",
-    "zipcode",
-    "census_block_group",
-    "brands",
-)
 _PLACE_COLUMNS = (
     "placekey",
-    "location_name",
     "top_category",
-    "sub_category",
-    "naics_code",
-    "street_address",
-    "city",
-    "state",
-    "zipcode",
     "census_block_group",
-    "brands",
     "geohash_5",
     "latitude",
     "longitude",
@@ -102,6 +85,7 @@ _PLACE_COLUMNS = (
 )
 _TIMESTAMP_FORMAT = "%a %b %d %H:%M:%S %z %Y"
 _GEOHASH_ALPHABET = "0123456789bcdefghjkmnpqrstuvwxyz"
+_GEOHASH_PRECISION = 5
 _CHUNK = 100_000
 
 
@@ -155,21 +139,17 @@ def _bad_coordinates() -> pl.Expr:
 
 
 def _unit_vectors(frame: pl.DataFrame) -> np.ndarray:
-    lat = np.deg2rad(frame["latitude"].to_numpy())
-    lon = np.deg2rad(frame["longitude"].to_numpy())
-    return np.column_stack(
-        [np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)]
-    )
+    return unit_vectors(
+        torch.from_numpy(frame.select("latitude", "longitude").to_numpy())
+    ).numpy()
 
 
-def encode_geohash(
-    latitude: float, longitude: float, *, precision: int = 5
-) -> str:
+def encode_geohash(latitude: float, longitude: float) -> str:
     lat_interval = [-90.0, 90.0]
     lon_interval = [-180.0, 180.0]
     bits: list[int] = []
     even = True
-    while len(bits) < precision * 5:
+    while len(bits) < _GEOHASH_PRECISION * 5:
         interval = lon_interval if even else lat_interval
         value = longitude if even else latitude
         midpoint = (interval[0] + interval[1]) / 2.0
@@ -187,7 +167,7 @@ def encode_geohash(
                 for offset, bit in enumerate(bits[start : start + 5])
             )
         ]
-        for start in range(0, precision * 5, 5)
+        for start in range(0, _GEOHASH_PRECISION * 5, 5)
     )
 
 
@@ -290,7 +270,7 @@ def read_checkins(source: Path, catalog: pl.DataFrame) -> pl.DataFrame:
             .alias("device_key"),
             pl.col("caid")
             .map_elements(
-                lambda caid: assign_split(caid, seed=GLOBAL_SPLIT_SEED),
+                assign_split,
                 return_dtype=pl.Utf8,
             )
             .alias(SPLIT_COLUMN),
@@ -327,10 +307,7 @@ def place_index(events: pl.DataFrame) -> pl.DataFrame:
     return (
         events.unique("placekey", keep="first", maintain_order=True)
         .rename({"venue_id": "source_venue_id"})
-        .with_columns(
-            pl.lit(None, dtype=pl.Utf8).alias(column)
-            for column in _EMPTY_PLACE_COLUMNS
-        )
+        .with_columns(pl.lit(None, dtype=pl.Utf8).alias("census_block_group"))
         .select(_PLACE_COLUMNS)
         .with_columns(
             pl.int_range(1, pl.len() + 1, dtype=pl.Int32).alias("placekey_id")

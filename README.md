@@ -104,19 +104,19 @@ uv run semoflow realizer --config $C
 | Evaluation | `evaluation/<city>/` |
 
 Override any setting with `--set`, for example `--set run_dir=/data/run1` to
-place a whole experiment elsewhere or `--set planner.training.epochs=20`.
+place a whole experiment elsewhere or `--set planner.epochs=20`.
 `semoflow config --config $C` prints the config with your overrides applied,
 and each stage saves it as `config_resolved.yaml` in its output directory.
 `semoflow --help` lists every stage. Every stage defaults to `cuda:0`; select the physical GPU with
 `CUDA_VISIBLE_DEVICES`. The text encoder reuses
 `encoder/text/text_embeddings.pt` when it already covers the POI catalog.
 
-For multi-GPU training, give the planner a device list, which starts one DDP
-rank per GPU, and launch the realizer under `torchrun`:
+For multi-GPU training, give the encoder, planner or realizer a device list;
+each starts one DDP rank per GPU:
 
 ```bash
-uv run semoflow planner --config $C --set 'planner.training.device=[0,1]'
-uv run torchrun --nproc_per_node=2 -m semoflow.cli realizer --config $C
+uv run semoflow planner --config $C --set 'planner.device=[0,1]'
+uv run semoflow realizer --config $C --set 'realizer.device=[0,1]'
 ```
 
 ## Sampling

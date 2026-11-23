@@ -7,11 +7,11 @@ from typing import Any
 import numpy as np
 
 from semoflow.evaluation.distribution import (
-    jensen_shannon_divergence,
+    jsd,
 )
 
 DEFINITION_VERSION = "elapsed_recurrence_v1"
-DEFAULT_GRID_HOURS = 3.0
+GRID_HOURS = 3.0
 WEEK_HOURS = 168.0
 
 
@@ -120,9 +120,7 @@ def _composite(real: _Side, gen: _Side, q_real, q_gen) -> float:
         shape = q / total if total > 0 else np.zeros_like(q)
         return np.concatenate([[1.0 - rate], rate * shape])
 
-    return jensen_shannon_divergence(
-        vector(r_real, q_real), vector(r_gen, q_gen)
-    )
+    return jsd(vector(r_real, q_real), vector(r_gen, q_gen))
 
 
 def _summary(side: _Side, grid_hours: float) -> dict[str, Any]:
@@ -153,18 +151,15 @@ def _summary(side: _Side, grid_hours: float) -> dict[str, Any]:
 def elapsed_recurrence_jsd(
     real: ReturnEvents,
     generated: ReturnEvents,
-    *,
-    grid_hours: float = DEFAULT_GRID_HOURS,
-    horizon_hours: float = WEEK_HOURS,
 ) -> dict[str, Any]:
-    real_side = _collect(real, horizon_hours)
-    gen_side = _collect(generated, horizon_hours)
-    n_bins = math.floor(horizon_hours / grid_hours) + 2
+    real_side = _collect(real, WEEK_HOURS)
+    gen_side = _collect(generated, WEEK_HOURS)
+    n_bins = math.floor(WEEK_HOURS / GRID_HOURS) + 2
     q_real = soft_time_histogram(
-        real_side.hour_gaps, grid_hours=grid_hours, n_bins=n_bins
+        real_side.hour_gaps, grid_hours=GRID_HOURS, n_bins=n_bins
     )
     q_gen = soft_time_histogram(
-        gen_side.hour_gaps, grid_hours=grid_hours, n_bins=n_bins
+        gen_side.hour_gaps, grid_hours=GRID_HOURS, n_bins=n_bins
     )
     n_index_bins = (
         max(
@@ -176,7 +171,7 @@ def elapsed_recurrence_jsd(
     joint_real, joint_gen = (
         soft_time_histogram(
             side.hour_gaps,
-            grid_hours=grid_hours,
+            grid_hours=GRID_HOURS,
             n_bins=n_bins,
             index_gaps=side.index_gaps,
             n_index_bins=n_index_bins,
@@ -187,27 +182,27 @@ def elapsed_recurrence_jsd(
     def non_adjacent(side: _Side) -> np.ndarray:
         return soft_time_histogram(
             side.hour_gaps[~side.adjacent],
-            grid_hours=grid_hours,
+            grid_hours=GRID_HOURS,
             n_bins=n_bins,
         )
 
     return {
-        "inter_return_time_jsd": jensen_shannon_divergence(q_real, q_gen),
-        "return_index_time_joint_jsd": jensen_shannon_divergence(
+        "inter_return_time_jsd": jsd(q_real, q_gen),
+        "return_index_time_joint_jsd": jsd(
             joint_real.ravel(), joint_gen.ravel()
         ),
         "rate_aware_return_time_jsd": _composite(
             real_side, gen_side, q_real, q_gen
         ),
-        "non_adjacent_inter_return_time_jsd": jensen_shannon_divergence(
+        "non_adjacent_inter_return_time_jsd": jsd(
             non_adjacent(real_side), non_adjacent(gen_side)
         ),
-        "real": _summary(real_side, grid_hours),
-        "generated": _summary(gen_side, grid_hours),
+        "real": _summary(real_side, GRID_HOURS),
+        "generated": _summary(gen_side, GRID_HOURS),
         "protocol": {
             "definition_version": DEFINITION_VERSION,
-            "grid_hours": grid_hours,
-            "horizon_hours": horizon_hours,
+            "grid_hours": GRID_HOURS,
+            "horizon_hours": WEEK_HOURS,
             "time_bins": n_bins,
             "binning": "linear interpolation between adjacent centers",
             "horizon_rule": "keep events through the first at the horizon",

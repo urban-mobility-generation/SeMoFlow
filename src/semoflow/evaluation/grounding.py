@@ -9,7 +9,7 @@ import torch
 
 from semoflow.config import PAD_ID
 from semoflow.evaluation.distribution import (
-    jensen_shannon_divergence,
+    jsd,
     token_marginal_jsd,
 )
 from semoflow.evaluation.geo import (
@@ -150,7 +150,7 @@ def grounded_poi_metrics(
     geohashes: dict[int, str],
     day_keys_real: Any,
     day_keys_generated: Any,
-    compute_device: torch.device | str | None = None,
+    compute_device: torch.device | str | None,
 ) -> dict[str, float | None]:
     real_gaps, real_multiplicity = _return_histograms(real)
     generated_gaps, generated_multiplicity = _return_histograms(generated)
@@ -161,30 +161,22 @@ def grounded_poi_metrics(
     generated_unique = torch.unique(generated[generated != PAD_ID])
     return {
         "poi_frequency_jsd": token_marginal_jsd(
-            real, generated, placekey_vocab_size, pad_id=PAD_ID
+            real, generated, placekey_vocab_size
         ),
         "poi_coverage": float(
             torch.isin(real_unique, generated_unique).float().mean().item()
         ),
-        "geohash_jsd": spatial_jsd(real, generated, geohashes, pad_id=PAD_ID),
-        "travel_jsd": travel_distance_jsd(
-            real, generated, coordinates, pad_id=PAD_ID
-        ),
-        "radius_jsd": radius_of_gyration_jsd(
-            real, generated, coordinates, pad_id=PAD_ID
-        ),
+        "geohash_jsd": spatial_jsd(real, generated, geohashes),
+        "travel_jsd": travel_distance_jsd(real, generated, coordinates),
+        "radius_jsd": radius_of_gyration_jsd(real, generated, coordinates),
         "mobility_motif_jsd": mobility_motif_jsd(
             real,
             generated,
             day_keys_real=day_keys_real,
             day_keys_generated=day_keys_generated,
         ),
-        "mobility_recurrence_pattern_jsd": jensen_shannon_divergence(
-            real_gaps, generated_gaps
-        ),
-        "multiplicity_jsd": jensen_shannon_divergence(
-            real_multiplicity, generated_multiplicity
-        ),
+        "mobility_recurrence_pattern_jsd": jsd(real_gaps, generated_gaps),
+        "multiplicity_jsd": jsd(real_multiplicity, generated_multiplicity),
     }
 
 

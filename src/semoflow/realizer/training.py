@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import logging
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -35,6 +36,7 @@ from semoflow.realizer.objective import (
 from semoflow.utils import (
     EarlyStopper,
     build_lr_scheduler,
+    run_on_devices,
     set_seed_all,
     unwrap_ddp,
     write_json,
@@ -237,13 +239,16 @@ class _Run:
         return unwrap_ddp(self.model)
 
 
-def _setup(config: RealizerConfig, layout: RunLayout) -> _Run:
+def _setup(
+    config: RealizerConfig,
+    layout: RunLayout,
+    device: torch.device,
+    rank: int,
+    world_size: int,
+) -> _Run:
     set_seed_all(config.seed)
     torch.set_num_threads(_CPU_THREADS)
-    device = torch.device(config.device)
-    distributed = dist.is_available() and dist.is_initialized()
-    rank = dist.get_rank() if distributed else 0
-    world_size = dist.get_world_size() if distributed else 1
+    distributed = world_size > 1
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -393,10 +398,14 @@ def _save_checkpoint(
         torch.save(checkpoint, output_dir / "best.pt")
 
 
-def train_prefix_time_suffix_latent_flow_realizer(
-    config: RealizerConfig, layout: RunLayout
+def _train_on_device(
+    device: torch.device,
+    rank: int,
+    world_size: int,
+    config: RealizerConfig,
+    layout: RunLayout,
 ) -> dict[str, Any]:
-    run = _setup(config, layout)
+    run = _setup(config, layout, device, rank, world_size)
     output_dir = layout.realizer_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     model = run.model
@@ -446,7 +455,7 @@ def train_prefix_time_suffix_latent_flow_realizer(
                 )
             break
 
-    if dist.is_available() and dist.is_initialized():
+    if run.world_size > 1:
         dist.barrier()
     extra = run.checkpoint_extra
     result: dict[str, Any] = {
@@ -473,6 +482,15 @@ def train_prefix_time_suffix_latent_flow_realizer(
     return result
 
 
+def train_realizer(
+    config: RealizerConfig, layout: RunLayout
+) -> dict[str, Any]:
+    result = run_on_devices(_train_on_device, config.device, config, layout)
+    if result is not None:
+        return result
+    return json.loads((layout.realizer_dir / "metrics.json").read_text())
+
+
 __all__ = [
-    "train_prefix_time_suffix_latent_flow_realizer",
+    "train_realizer",
 ]

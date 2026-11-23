@@ -250,8 +250,6 @@ class TextEncoderConfig:
     device: str = "cuda:0"
     batch_size: int = 512
     precision: str = "float16"
-    include_address_in_template: bool = True
-    include_name_in_template: bool = True
 
     def __post_init__(self) -> None:
         _choice(
@@ -355,66 +353,50 @@ class TokenizerConfig:
         )
 
 
+def _check_schedule(
+    section: str, schedule: str, learning_rate: float, min_lr: float
+) -> None:
+    _choice(f"{section}.lr_scheduler", schedule, {"constant", "cosine"})
+    _require(
+        0.0 <= min_lr <= learning_rate
+        and (schedule == "cosine" or min_lr == 0.0),
+        f"{section}.min_lr must lie in [0, learning_rate] and requires "
+        "the cosine scheduler",
+    )
+
+
 @dataclass(frozen=True)
-class PlannerDataConfig:
+class PlannerConfig:
     min_active_days: int = 5
     max_occurrences: int = 30
     city_conditioning: bool = False
-
-
-@dataclass(frozen=True)
-class PlannerArchitectureConfig:
     model_dim: int = 128
     n_heads: int = 4
     n_layers: int = 4
     dropout: float = 0.1
     use_distance_prior: bool = False
+    epochs: int = 10
+    batch_size: int = 64
+    learning_rate: float = 0.002
+    weight_decay: float = 0.0001
+    lr_scheduler: str = "constant"
+    warmup_steps: int = 0
+    min_lr: float = 0.0
+    early_stopping_patience: int | None = None
+    num_workers: int = 0
+    device: str = "cuda:0"
+    seed: int = 0
+    compile: bool = False
 
     def __post_init__(self) -> None:
         head_dim, rest = divmod(self.model_dim, self.n_heads)
         _require(
             rest == 0 and head_dim % 2 == 0,
-            "planner.architecture.model_dim must split into n_heads "
-            "even-sized heads",
+            "planner.model_dim must split into n_heads even-sized heads",
         )
-
-
-@dataclass(frozen=True)
-class PlannerTrainingConfig:
-    epochs: int = 10
-    batch_size: int = 64
-    learning_rate: float = 0.002
-    weight_decay: float = 0.0001
-    device: str = "cuda:0"
-    lr_scheduler: str = "constant"
-    warmup_steps: int = 0
-    min_lr: float = 0.0
-    num_workers: int = 0
-    early_stopping_patience: int | None = None
-    compile_model: bool = False
-
-    def __post_init__(self) -> None:
-        _choice(
-            "planner.training.lr_scheduler",
-            self.lr_scheduler,
-            {"constant", "cosine"},
+        _check_schedule(
+            "planner", self.lr_scheduler, self.learning_rate, self.min_lr
         )
-        _require(
-            self.lr_scheduler == "cosine" or self.min_lr == 0.0,
-            "planner.training.min_lr requires the cosine scheduler",
-        )
-
-
-@dataclass(frozen=True)
-class PlannerConfig:
-    data: PlannerDataConfig = field(default_factory=PlannerDataConfig)
-    seed: int = 0
-    architecture: PlannerArchitectureConfig = field(
-        default_factory=PlannerArchitectureConfig
-    )
-    training: PlannerTrainingConfig = field(
-        default_factory=PlannerTrainingConfig
-    )
 
 
 @dataclass(frozen=True)
@@ -455,14 +437,8 @@ class RealizerConfig:
             self.epochs > 0 and self.batch_size > 0,
             "realizer.epochs and batch_size must be positive",
         )
-        _choice(
-            "realizer.lr_scheduler", self.lr_scheduler, {"constant", "cosine"}
-        )
-        _require(
-            0.0 <= self.min_lr <= self.learning_rate
-            and (self.lr_scheduler == "cosine" or self.min_lr == 0.0),
-            "realizer.min_lr must lie in [0, learning_rate] and requires "
-            "the cosine scheduler",
+        _check_schedule(
+            "realizer", self.lr_scheduler, self.learning_rate, self.min_lr
         )
         _require(
             self.catalog_loss_weight > 0.0,
@@ -563,20 +539,14 @@ class ExperimentConfig:
         Path(path).write_text(self.to_yaml(), encoding="utf-8")
 
 
-def load_config(
-    path: Path | str | None = None, overrides: Sequence[str] = ()
-) -> ExperimentConfig:
-    raw: object = {}
-    if path is not None:
-        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+def load_config(path: Path, overrides: Sequence[str]) -> ExperimentConfig:
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
     if not isinstance(raw, dict):
         raise ValueError(f"YAML at {path} did not parse to a mapping")
     for override in overrides:
         apply_override(raw, override, ExperimentConfig)
     cfg = from_dict(ExperimentConfig, raw)
-    logger.info(
-        "config  path=%s  overrides=%s", path or "defaults", list(overrides)
-    )
+    logger.info("config  path=%s  overrides=%s", path, list(overrides))
     return cfg
 
 
@@ -588,8 +558,6 @@ __all__ = [
     "ExperimentConfig",
     "GraphEncoderConfig",
     "PlannerConfig",
-    "PlannerDataConfig",
-    "PlannerTrainingConfig",
     "RealizerConfig",
     "RunLayout",
     "TextEncoderConfig",

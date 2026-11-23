@@ -8,13 +8,14 @@ import math
 import os
 import random
 import socket
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn as nn
 import yaml
 from torch import optim
@@ -40,9 +41,7 @@ def _handler(name: str) -> logging.Handler | None:
     )
 
 
-def configure_logging(
-    *, level: str = "INFO", log_file: Path | None = None
-) -> None:
+def configure_logging(*, level: str, log_file: Path | None = None) -> None:
     numeric_level = logging.getLevelNamesMapping().get(level.upper())
     if numeric_level is None:
         raise ValueError(
@@ -109,16 +108,15 @@ def log_training_step(
     total_epochs: int,
     metrics: Mapping[str, float],
     lr: float,
-    samples_per_sec: float | None = None,
+    samples_per_sec: float,
 ) -> None:
     parts = [
         f"Epoch {_progress(epoch, total_epochs)}",
         f"step {_progress(step, total_steps)}",
         *(f"{name} {_fmt_value(value)}" for name, value in metrics.items()),
         f"lr {lr:.2e}",
+        f"{int(samples_per_sec):,} sps",
     ]
-    if samples_per_sec is not None:
-        parts.append(f"{int(samples_per_sec):,} sps")
     logger.info("%s", " | ".join(parts))
 
 
@@ -139,22 +137,6 @@ def log_epoch_summary(
         f"{int(samples_per_sec):,}",
         gpu_allocated_gb,
         gpu_peak_gb,
-    )
-
-
-def log_ddp_summary(
-    logger: logging.Logger,
-    *,
-    device_ids: list[int],
-    port: int,
-    batch_per_rank: int,
-) -> None:
-    logger.info(
-        "DDP world_size=%d  devices=%s  port=%d  batch_per_rank=%d",
-        len(device_ids),
-        ", ".join(f"cuda:{device}" for device in device_ids),
-        port,
-        batch_per_rank,
     )
 
 
@@ -184,25 +166,30 @@ def to_yaml_string(obj: object) -> str:
     )
 
 
-def dump_json(payload: object, *, indent: int | None = 2) -> str:
+def dump_json(payload: object) -> str:
     return json.dumps(
         normalize_value(payload),
-        indent=indent,
+        indent=2,
         sort_keys=True,
         default=str,
         allow_nan=False,
     )
 
 
-def write_json(path: str | Path, payload: object) -> Path:
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(f"{target.name}.tmp-{os.getpid()}")
+def _write_atomic(path: Path, write: Callable[[Path], object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
     try:
-        tmp.write_text(dump_json(payload) + "\n", encoding="utf-8")
-        os.replace(tmp, target)
+        write(tmp)
+        os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def write_json(path: str | Path, payload: object) -> Path:
+    target = Path(path)
+    text = dump_json(payload) + "\n"
+    _write_atomic(target, lambda tmp: tmp.write_text(text, encoding="utf-8"))
     return target
 
 
@@ -224,6 +211,48 @@ def parse_device_spec(spec: str) -> tuple[torch.device, list[int]]:
     return torch.device(stripped), []
 
 
+def _spawned_worker(
+    rank: int,
+    worker: Callable[..., object],
+    device_ids: list[int],
+    port: int,
+    log_level: str,
+    log_file: Path | None,
+    args: tuple[Any, ...],
+) -> None:
+    with ddp_worker(rank, device_ids, port, log_level, log_file) as device:
+        worker(device, rank, len(device_ids), *args)
+
+
+def run_on_devices[R](
+    worker: Callable[..., R], device_spec: str, *args: Any
+) -> R | None:
+    device, device_ids = parse_device_spec(device_spec)
+    if len(device_ids) < 2:
+        return worker(device, 0, 1, *args)
+    port = find_free_port()
+    logging.getLogger(__name__).info(
+        "DDP world_size=%d  devices=%s  port=%d",
+        len(device_ids),
+        ", ".join(f"cuda:{index}" for index in device_ids),
+        port,
+    )
+    mp.spawn(
+        _spawned_worker,
+        args=(
+            worker,
+            device_ids,
+            port,
+            logging.getLevelName(logging.getLogger().level),
+            get_configured_log_file(),
+            args,
+        ),
+        nprocs=len(device_ids),
+        join=True,
+    )
+    return None
+
+
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
@@ -235,8 +264,8 @@ def ddp_worker(
     rank: int,
     device_ids: list[int],
     port: int,
-    log_level: str = "INFO",
-    log_file: Path | None = None,
+    log_level: str,
+    log_file: Path | None,
 ) -> Generator[torch.device, None, None]:
     if rank == 0:
         configure_logging(level=log_level, log_file=log_file)
@@ -315,21 +344,13 @@ def build_lr_scheduler(
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def save_torch_atomic(
-    path: Path, payload: object, *, force: bool = False
-) -> None:
+def save_torch_atomic(path: Path, payload: object, *, force: bool) -> None:
     path = Path(path)
     if path.exists() and not force:
         raise FileExistsError(
             f"refusing to overwrite existing artifact: {path}"
         )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
-    try:
-        torch.save(payload, tmp)
-        os.replace(tmp, path)
-    finally:
-        tmp.unlink(missing_ok=True)
+    _write_atomic(path, lambda tmp: torch.save(payload, tmp))
 
 
 def load_artifact(path: Path, artifact_type: str) -> dict[str, Any]:
@@ -343,16 +364,13 @@ __all__ = [
     "EarlyStopper",
     "build_lr_scheduler",
     "configure_logging",
-    "ddp_worker",
     "dump_json",
-    "find_free_port",
-    "get_configured_log_file",
     "load_artifact",
-    "log_ddp_summary",
     "log_epoch_summary",
     "log_training_step",
     "normalize_value",
     "parse_device_spec",
+    "run_on_devices",
     "save_torch_atomic",
     "set_seed_all",
     "to_yaml_string",

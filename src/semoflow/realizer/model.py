@@ -208,7 +208,7 @@ class PrefixTimeSuffixLatentFlowRealizer(nn.Module):
         time_tokens: torch.Tensor,
         valid_mask: torch.BoolTensor,
         *,
-        city_id: torch.LongTensor | None = None,
+        city_id: torch.LongTensor | None,
     ) -> LatentSuffixConditioning:
         valid = valid_mask.bool()
         prefix = torch.where(

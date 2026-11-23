@@ -5,18 +5,19 @@ from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
+import torch
 
 from semoflow.data import N_PART_OF_DAY_BINS, N_TIME_TOKENS
 from semoflow.evaluation.distribution import (
-    jensen_shannon_divergence,
+    jsd,
 )
+from semoflow.geodesy import haversine_km
 
 TIME_TOKEN_MIDPOINT_HOURS = np.array([3, 8, 12, 16, 20, 23], dtype=np.int64)
 GAP_EDGES_HOURS = np.array([0, 2, 4, 8, 12, 24, 48, 96, 168, np.inf])
 DISTANCE_EDGES_KM = np.array(
     [0, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, np.inf]
 )
-EARTH_RADIUS_KM = 6371.0088
 N_GAP_BINS = len(GAP_EDGES_HOURS)
 N_DISTANCE_BINS = len(DISTANCE_EDGES_KM)
 
@@ -66,16 +67,6 @@ def events_from_place_ids(
     )
 
 
-def _haversine_km(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    a, b = np.radians(a), np.radians(b)
-    delta = b - a
-    term = (
-        np.sin(delta[:, 0] / 2) ** 2
-        + np.cos(a[:, 0]) * np.cos(b[:, 0]) * np.sin(delta[:, 1] / 2) ** 2
-    )
-    return EARTH_RADIUS_KM * 2 * np.arcsin(np.sqrt(np.clip(term, 0, 1)))
-
-
 def _gap_distance_counts(
     events: TemporalSpatialEvents,
 ) -> tuple[np.ndarray, dict[str, int]]:
@@ -97,7 +88,10 @@ def _gap_distance_counts(
     distance_bins[located] = (
         np.searchsorted(
             DISTANCE_EDGES_KM,
-            _haversine_km(start[located], end[located]),
+            haversine_km(
+                *torch.from_numpy(start[located]).unbind(-1),
+                *torch.from_numpy(end[located]).unbind(-1),
+            ).numpy(),
             side="right",
         )
         - 1
@@ -117,15 +111,9 @@ def _gap_distance_counts(
 
 def _compare(real: np.ndarray, generated: np.ndarray) -> dict[str, float]:
     return {
-        "joint_jsd": jensen_shannon_divergence(
-            real.ravel(), generated.ravel()
-        ),
-        "first_marginal_jsd": jensen_shannon_divergence(
-            real.sum(1), generated.sum(1)
-        ),
-        "second_marginal_jsd": jensen_shannon_divergence(
-            real.sum(0), generated.sum(0)
-        ),
+        "joint_jsd": jsd(real.ravel(), generated.ravel()),
+        "first_marginal_jsd": jsd(real.sum(1), generated.sum(1)),
+        "second_marginal_jsd": jsd(real.sum(0), generated.sum(0)),
     }
 
 

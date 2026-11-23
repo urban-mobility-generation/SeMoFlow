@@ -10,7 +10,7 @@ import polars as pl
 import torch
 
 from semoflow.config import (
-    PlannerDataConfig,
+    PlannerConfig,
     RealizerConfig,
     RunLayout,
 )
@@ -76,7 +76,7 @@ def build_weekly_segment_cache(
     stays_path: Path,
     output: Path,
     min_active_days: int,
-    force: bool = False,
+    force: bool,
 ) -> dict[str, Any]:
     if min_active_days < 1:
         raise ValueError("min_active_days must be >= 1")
@@ -169,9 +169,6 @@ def time_tokens_from_week_minutes(minutes: torch.Tensor) -> torch.Tensor:
         right=True,
     )
     return (minutes / 1440.0).long() * N_PART_OF_DAY_BINS + part_of_day
-
-
-PLANNER_GAP_CODEC_VERSION = "positive_duration_v1"
 
 
 PLANNER_GAP_BUCKET_EDGES_MINUTES = (
@@ -337,10 +334,10 @@ def _materialize_split(
 
 
 def build_planner_data(
-    data: PlannerDataConfig,
+    data: PlannerConfig,
     layout: RunLayout,
     *,
-    force: bool = False,
+    force: bool,
 ) -> dict[str, object]:
     tokenizer = layout.tokenizer
     dataset_path = layout.planner_dataset
@@ -382,7 +379,6 @@ def build_planner_data(
             "prefix_depth": PREFIX_DEPTH,
             "max_occurrences": data.max_occurrences,
             "city_conditioning": data.city_conditioning,
-            "gap_codec_version": PLANNER_GAP_CODEC_VERSION,
             "gap_bucket_edges_minutes": PLANNER_GAP_BUCKET_EDGES_MINUTES,
             "gap_duration_minutes": PLANNER_GAP_REPRESENTATIVES_MINUTES,
             "observation_window_minutes": OBSERVATION_WINDOW_MINUTES,

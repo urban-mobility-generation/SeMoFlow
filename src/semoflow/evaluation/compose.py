@@ -445,10 +445,10 @@ def evaluate_planner_realizer(
     num_steps: int,
     solver: str,
     candidate_selection: str,
-    candidate_prior: Path | None = None,
-    catalog_temperature: float | None = None,
-    reference_split: str = "val",
-    catalog_noise_coupling: str = "independent",
+    candidate_prior: Path | None,
+    catalog_temperature: float | None,
+    reference_split: str,
+    catalog_noise_coupling: str,
 ) -> dict[str, Any]:
     if candidate_selection != "first" and candidate_prior is None:
         raise ValueError("--candidate-selection requires --candidate-prior")

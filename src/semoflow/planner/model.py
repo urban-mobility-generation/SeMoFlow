@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from semoflow.config import PlannerTrainingConfig
+from semoflow.config import PlannerConfig
 from semoflow.planner.prefix_decoder import (
     HierarchicalPrefixDecoder,
     LegalPrefixIndex,
@@ -36,7 +36,6 @@ from semoflow.utils import load_artifact, save_torch_atomic
 class OccurrencePlannerConfig:
     codebook_size: int
     gap_vocab: int
-    gap_codec_version: str
     gap_bucket_edges_minutes: tuple[float, ...]
     gap_duration_minutes: tuple[float, ...]
     observation_window_minutes: float
@@ -612,11 +611,10 @@ def save_occurrence_planner_checkpoint(
     model_state: dict[str, Any],
     epoch: int,
     validation_metric: float,
-    seed: int,
-    options: PlannerTrainingConfig,
-    legal_prefix_centroids: torch.Tensor | None = None,
-    legal_prefix_centroid_available: torch.Tensor | None = None,
-    force: bool = False,
+    settings: PlannerConfig,
+    legal_prefix_centroids: torch.Tensor | None,
+    legal_prefix_centroid_available: torch.Tensor | None,
+    force: bool,
 ) -> None:
     payload = {
         "artifact_type": CHECKPOINT_ARTIFACT_TYPE,
@@ -631,8 +629,7 @@ def save_occurrence_planner_checkpoint(
         "model_state": model_state,
         "epoch": int(epoch),
         "validation_metric": float(validation_metric),
-        "seed": int(seed),
-        "options": asdict(options),
+        "settings": asdict(settings),
     }
     save_torch_atomic(path, payload, force=force)
 
@@ -643,6 +640,7 @@ _RETIRED_CONFIG = {
     "prefix_decoder": "hierarchical",
     "mobility_router": "explore_retrieve",
     "use_tokenizer_latent": False,
+    "gap_codec_version": "positive_duration_v1",
 }
 
 

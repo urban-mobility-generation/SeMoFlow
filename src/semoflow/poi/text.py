@@ -57,50 +57,11 @@ def load_poi_embeddings(
     )
 
 
-def _join(values: list[str], separator: str) -> str:
-    return separator.join(value for value in values if value)
-
-
-def render_poi_texts(
-    places: pl.DataFrame, *, include_address: bool, include_name: bool
-) -> list[str]:
-    texts = []
-    for row in places.iter_rows(named=True):
-        field = {key: str(value or "").strip() for key, value in row.items()}
-        parts = []
-        if include_name:
-            name, brand = (
-                field.get("location_name", ""),
-                field.get("brands", ""),
-            )
-            parts.append(name)
-            if brand and brand.lower() != name.lower():
-                parts.append(f"({brand})")
-        if include_address:
-            parts.append(
-                _join(
-                    [
-                        field.get(column, "")
-                        for column in (
-                            "street_address",
-                            "city",
-                            "state",
-                            "zipcode",
-                        )
-                    ],
-                    ", ",
-                )
-            )
-        category = _join(
-            [field.get("top_category", ""), field.get("sub_category", "")],
-            " > ",
-        )
-        naics = field.get("naics_code", "")
-        if naics and naics != "000000":
-            category += f" (NAICS {naics})"
-        parts.append(category)
-        texts.append(_join(parts, " | ") or "unknown location")
-    return texts
+def render_poi_texts(places: pl.DataFrame) -> list[str]:
+    return [
+        str(category or "").strip() or "unknown location"
+        for category in places["top_category"]
+    ]
 
 
 def build_text_embeddings(
@@ -112,11 +73,7 @@ def build_text_embeddings(
             return
         except (FileNotFoundError, ValueError):
             logger.info("text embeddings do not cover the places; rebuilding")
-    texts = render_poi_texts(
-        places,
-        include_address=config.include_address_in_template,
-        include_name=config.include_name_in_template,
-    )
+    texts = render_poi_texts(places)
     _, device_ids = parse_device_spec(config.device)
     devices = [f"cuda:{index}" for index in device_ids]
     encoder = SentenceTransformer(
@@ -137,8 +94,7 @@ def build_text_embeddings(
         metadata={
             "model": config.model,
             "precision": config.precision,
-            "include_address_in_template": config.include_address_in_template,
-            "include_name_in_template": config.include_name_in_template,
+            "template": "top_category",
         },
     )
 

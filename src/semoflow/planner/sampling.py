@@ -28,7 +28,7 @@ def save_occurrence_planner_samples(
     seed: int,
     temperature: float,
     route_temperature: float,
-    force: bool = False,
+    force: bool,
 ) -> None:
     payload = {
         "artifact_type": SAMPLES_ARTIFACT_TYPE,
@@ -140,13 +140,13 @@ def sample_occurrence_planner(
     checkpoint_path: Path,
     output_path: Path,
     num_samples: int,
-    city_id: int | None = None,
-    batch_size: int = 1024,
-    device: str = "cpu",
-    seed: int = 0,
-    temperature: float = 1.0,
-    route_temperature: float | None = None,
-    force: bool = False,
+    city_id: int | None,
+    batch_size: int,
+    device: str,
+    seed: int,
+    temperature: float,
+    route_temperature: float | None,
+    force: bool,
 ) -> dict[str, Any]:
     output_path = Path(output_path)
     if output_path.exists() and not force:

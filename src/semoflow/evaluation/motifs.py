@@ -6,8 +6,9 @@ import numpy as np
 import torch
 
 from semoflow.config import PAD_ID
-from semoflow.evaluation.distribution import jensen_shannon_divergence
+from semoflow.evaluation.distribution import jsd
 
+_FREQUENT_MOTIF_SHARE = 0.005
 type MotifSignature = tuple[int, tuple[tuple[int, int], ...]]
 
 
@@ -51,7 +52,6 @@ def mobility_motif_jsd(
     *,
     day_keys_real: torch.Tensor,
     day_keys_generated: torch.Tensor,
-    frequency_threshold: float = 0.005,
 ) -> float:
     real_counts = Counter(daily_mobility_motifs(real, day_keys_real))
     generated_counts = Counter(
@@ -62,7 +62,7 @@ def mobility_motif_jsd(
         (
             motif
             for motif, count in real_counts.items()
-            if count / n_real > frequency_threshold
+            if count / n_real > _FREQUENT_MOTIF_SHARE
         ),
         key=_signature_key,
     )
@@ -76,9 +76,7 @@ def mobility_motif_jsd(
             [counts[motif] for motif in frequent] + [other], dtype=np.float64
         )
 
-    return jensen_shannon_divergence(
-        histogram(real_counts), histogram(generated_counts)
-    )
+    return jsd(histogram(real_counts), histogram(generated_counts))
 
 
 __all__ = [

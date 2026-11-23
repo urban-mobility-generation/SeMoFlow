@@ -11,7 +11,6 @@ from typing import Any
 import polars as pl
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
@@ -25,11 +24,8 @@ from semoflow.poi.graph import (
 )
 from semoflow.poi.text import build_text_embeddings, write_poi_embeddings
 from semoflow.utils import (
-    ddp_worker,
-    find_free_port,
-    get_configured_log_file,
-    log_ddp_summary,
     parse_device_spec,
+    run_on_devices,
     set_seed_all,
     unwrap_ddp,
     write_json,
@@ -221,8 +217,8 @@ def _train(
     data: Any,
     val_edges: torch.Tensor,
     device: torch.device,
-    rank: int = 0,
-    world_size: int = 1,
+    rank: int,
+    world_size: int,
 ) -> None:
     is_main = rank == 0
     graph_cfg = cfg.encoder.graph
@@ -341,18 +337,15 @@ def _train(
     )
 
 
-def _train_worker(
+def _train_saved_graph(
+    device: torch.device,
     rank: int,
-    device_ids: list[int],
-    port: int,
+    world_size: int,
     cfg: ExperimentConfig,
     graph_data_path: str,
-    log_level: str,
-    log_file: Path | None,
 ) -> None:
-    with ddp_worker(rank, device_ids, port, log_level, log_file) as device:
-        data, val_edges = torch.load(graph_data_path, weights_only=False)
-        _train(cfg, data, val_edges, device, rank, len(device_ids))
+    data, val_edges = torch.load(graph_data_path, weights_only=False)
+    _train(cfg, data, val_edges, device, rank, world_size)
 
 
 def _train_heterosage(cfg: ExperimentConfig) -> None:
@@ -360,34 +353,16 @@ def _train_heterosage(cfg: ExperimentConfig) -> None:
     set_seed_all(graph_cfg.seed)
     device, device_ids = parse_device_spec(graph_cfg.device)
     data, val_edges = _build_graph_data(cfg)
-    if not device_ids:
-        _train(cfg, data, val_edges, device)
+    if len(device_ids) < 2:
+        _train(cfg, data, val_edges, device, 0, 1)
         return
-
-    port = find_free_port()
-    log_ddp_summary(
-        logger,
-        device_ids=device_ids,
-        port=port,
-        batch_per_rank=graph_cfg.batch_size,
-    )
     fd, graph_data_path = tempfile.mkstemp(suffix=".pt")
     os.close(fd)
     try:
         torch.save((data, val_edges), graph_data_path)
         del data, val_edges
-        mp.spawn(
-            _train_worker,
-            args=(
-                device_ids,
-                port,
-                cfg,
-                graph_data_path,
-                logging.getLevelName(logging.getLogger().level),
-                get_configured_log_file(),
-            ),
-            nprocs=len(device_ids),
-            join=True,
+        run_on_devices(
+            _train_saved_graph, graph_cfg.device, cfg, graph_data_path
         )
     finally:
         os.unlink(graph_data_path)

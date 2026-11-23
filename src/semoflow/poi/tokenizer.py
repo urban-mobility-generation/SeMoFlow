@@ -21,7 +21,6 @@ _GROUNDING_COLUMNS = (
     "placekey_id",
     "placekey",
     "top_category",
-    "naics_code",
     "latitude",
     "longitude",
 )

@@ -8,8 +8,8 @@ import torch
 
 from semoflow.config import PAD_ID
 from semoflow.evaluation.distribution import jsd
+from semoflow.geodesy import haversine_km
 
-_EARTH_RADIUS_KM = 6371.0
 _DISTANCE_BINS = 50
 _CACHE_CAPACITY = 16
 _table_caches: dict[Callable[..., Any], list[tuple[Any, Any]]] = {}
@@ -67,14 +67,13 @@ def _table_rows(
     tokens: torch.Tensor,
     lookup_valid: torch.Tensor,
     max_id: int,
-    pad_id: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     values = tokens.long()
     rows = values.clamp(0, max_id)
     keep = (
         (values >= 0)
         & (values <= max_id)
-        & (values != pad_id)
+        & (values != PAD_ID)
         & lookup_valid[rows]
     )
     return rows, keep
@@ -83,42 +82,19 @@ def _table_rows(
 def _lookup_coordinates(
     tokens: torch.Tensor,
     placekey_latlon: dict[int, tuple[float, float]],
-    pad_id: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     coords, lookup_valid, max_id = _cached_table(
         _latlon_table, placekey_latlon
     )
-    rows, valid = _table_rows(
-        tokens, lookup_valid.to(tokens.device), max_id, pad_id
-    )
+    rows, valid = _table_rows(tokens, lookup_valid.to(tokens.device), max_id)
     return coords.to(tokens.device)[rows], valid
-
-
-def _pairwise_haversine_km(
-    lat1: torch.Tensor,
-    lon1: torch.Tensor,
-    lat2: torch.Tensor,
-    lon2: torch.Tensor,
-) -> torch.Tensor:
-    phi1 = torch.deg2rad(lat1)
-    phi2 = torch.deg2rad(lat2)
-    dphi = torch.deg2rad(lat2 - lat1)
-    dlam = torch.deg2rad(lon2 - lon1)
-    a = (
-        torch.sin(dphi / 2) ** 2
-        + torch.cos(phi1) * torch.cos(phi2) * torch.sin(dlam / 2) ** 2
-    )
-    a = a.clamp(0.0, 1.0)
-    return 2 * _EARTH_RADIUS_KM * torch.arcsin(torch.sqrt(a))
 
 
 def per_sequence_travel_distance(
     tokens: torch.Tensor,
     placekey_latlon: dict[int, tuple[float, float]],
-    *,
-    pad_id: int = PAD_ID,
 ) -> torch.Tensor:
-    gathered, valid = _lookup_coordinates(tokens, placekey_latlon, pad_id)
+    gathered, valid = _lookup_coordinates(tokens, placekey_latlon)
     n, t = valid.shape
     if t < 2:
         return torch.zeros(n, dtype=gathered.dtype, device=gathered.device)
@@ -138,7 +114,7 @@ def per_sequence_travel_distance(
     lon1 = compact[:, :-1, 1]
     lat2 = compact[:, 1:, 0]
     lon2 = compact[:, 1:, 1]
-    dists = _pairwise_haversine_km(lat1, lon1, lat2, lon2)
+    dists = haversine_km(lat1, lon1, lat2, lon2)
     dists = torch.where(pair_valid, dists, torch.zeros_like(dists))
     return dists.sum(dim=1)
 
@@ -174,15 +150,9 @@ def travel_distance_jsd(
     tokens_real: torch.Tensor,
     tokens_gen: torch.Tensor,
     placekey_latlon: dict[int, tuple[float, float]],
-    *,
-    pad_id: int = PAD_ID,
 ) -> float:
-    d_real = per_sequence_travel_distance(
-        tokens_real, placekey_latlon, pad_id=pad_id
-    )
-    d_gen = per_sequence_travel_distance(
-        tokens_gen, placekey_latlon, pad_id=pad_id
-    )
+    d_real = per_sequence_travel_distance(tokens_real, placekey_latlon)
+    d_gen = per_sequence_travel_distance(tokens_gen, placekey_latlon)
     if d_real.numel() == 0 or d_gen.numel() == 0:
         return float("nan")
     return _binned_jsd(d_real, d_gen)
@@ -192,17 +162,11 @@ def radius_of_gyration_jsd(
     tokens_real: torch.Tensor,
     tokens_gen: torch.Tensor,
     placekey_latlon: dict[int, tuple[float, float]],
-    *,
-    pad_id: int = PAD_ID,
 ) -> float | None:
     if not placekey_latlon:
         return None
-    r = per_sequence_radius_of_gyration(
-        tokens_real, placekey_latlon, pad_id=pad_id
-    )
-    g = per_sequence_radius_of_gyration(
-        tokens_gen, placekey_latlon, pad_id=pad_id
-    )
+    r = per_sequence_radius_of_gyration(tokens_real, placekey_latlon)
+    g = per_sequence_radius_of_gyration(tokens_gen, placekey_latlon)
     if r.numel() == 0 or g.numel() == 0:
         return None
     return _binned_jsd(r, g)
@@ -211,10 +175,8 @@ def radius_of_gyration_jsd(
 def per_sequence_radius_of_gyration(
     tokens: torch.Tensor,
     placekey_latlon: dict[int, tuple[float, float]],
-    *,
-    pad_id: int = PAD_ID,
 ) -> torch.Tensor:
-    gathered, valid = _lookup_coordinates(tokens, placekey_latlon, pad_id)
+    gathered, valid = _lookup_coordinates(tokens, placekey_latlon)
     mask_f = valid.float().unsqueeze(-1)
     totals = (gathered * mask_f).sum(dim=1)
     counts = mask_f.sum(dim=1).squeeze(-1)
@@ -222,7 +184,7 @@ def per_sequence_radius_of_gyration(
     mean = totals / safe_counts.unsqueeze(-1)
     mean_lat = mean[:, 0].unsqueeze(1).expand_as(gathered[..., 0])
     mean_lon = mean[:, 1].unsqueeze(1).expand_as(gathered[..., 1])
-    distances = _pairwise_haversine_km(
+    distances = haversine_km(
         gathered[..., 0], gathered[..., 1], mean_lat, mean_lon
     )
     distances = torch.where(valid, distances, torch.zeros_like(distances))
@@ -234,8 +196,6 @@ def spatial_jsd(
     tokens_real: torch.Tensor,
     tokens_gen: torch.Tensor,
     geohash_lookup: dict[int, str],
-    *,
-    pad_id: int = PAD_ID,
 ) -> float:
     gh_table, valid_tbl, max_id, gh_index = _cached_table(
         _geohash_table, geohash_lookup
@@ -244,9 +204,7 @@ def spatial_jsd(
 
     def _hist(tokens: torch.Tensor) -> torch.Tensor:
         flat = tokens.flatten()
-        safe, keep = _table_rows(
-            flat, valid_tbl.to(flat.device), max_id, pad_id
-        )
+        safe, keep = _table_rows(flat, valid_tbl.to(flat.device), max_id)
         idx = gh_table.to(flat.device)[safe][keep]
         counts = torch.bincount(idx, minlength=n_hashes).float()
         total = counts.sum()

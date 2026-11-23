@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import platform
 import shlex
 import subprocess
@@ -9,7 +8,6 @@ import sys
 import time
 from collections.abc import Generator
 from contextlib import contextmanager
-from dataclasses import replace
 from importlib import metadata
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -44,7 +42,7 @@ Sets = Annotated[
         "--set",
         help=(
             "Override a config field, for example run_dir=/data/run or "
-            "planner.training.epochs=20. May be repeated."
+            "planner.epochs=20. May be repeated."
         ),
     ),
 ]
@@ -71,13 +69,8 @@ def _refuse_overwrite(path: Path, force: bool) -> None:
         raise typer.BadParameter(f"{path} exists; pass --force to overwrite")
 
 
-def _is_rank_zero() -> bool:
-    return int(os.environ.get("RANK", "0")) == 0
-
-
 def _echo(payload: object) -> None:
-    if _is_rank_zero():
-        typer.echo(dump_json(payload))
+    typer.echo(dump_json(payload))
 
 
 def _git(*args: str) -> str:
@@ -115,9 +108,6 @@ def _write_manifest(directory: Path, **fields: Any) -> None:
 def _run(
     cfg: ExperimentConfig, stage: str, output_dir: Path, log_level: str
 ) -> Generator[None, None, None]:
-    if not _is_rank_zero():
-        yield
-        return
     configure_logging(
         level=log_level, log_file=output_dir / "logs" / "run.log"
     )
@@ -194,12 +184,12 @@ def planner_data(
     from semoflow.data import build_planner_data
 
     cfg = _load(config, sets, log_level)
-    _echo(build_planner_data(cfg.planner.data, cfg.layout, force=force))
+    _echo(build_planner_data(cfg.planner, cfg.layout, force=force))
 
 
 @app.command(
     help=(
-        "Train the SID-prefix planner. planner.training.device='[0,1]' "
+        "Train the SID-prefix planner. planner.device='[0,1]' "
         "trains on several GPUs."
     )
 )
@@ -214,7 +204,7 @@ def planner(
     cfg = _load(config, sets, log_level)
     _refuse_overwrite(cfg.layout.planner_dir / "best.pt", force)
     with _run(cfg, "planner", cfg.layout.planner_dir, log_level):
-        result = train_planner(cfg.planner, cfg.layout, log_level=log_level)
+        result = train_planner(cfg.planner, cfg.layout)
     _echo(result)
 
 
@@ -230,45 +220,20 @@ def realizer_data(
     _echo(build_realizer_data(cfg.realizer, cfg.layout))
 
 
-@contextmanager
-def _torchrun_device() -> Generator[str | None, None, None]:
-    if int(os.environ.get("WORLD_SIZE", "1")) <= 1:
-        yield None
-        return
-    import torch
-    import torch.distributed as dist
-
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend="nccl")
-    try:
-        yield f"cuda:{local_rank}"
-    finally:
-        dist.destroy_process_group()
-
-
 @app.command(
     help=(
-        "Train the suffix realizer. Launch under torchrun to train on "
+        "Train the suffix realizer. realizer.device='[0,1]' trains on "
         "several GPUs."
     )
 )
 def realizer(
     config: Config, sets: Sets = None, log_level: LogLevel = "INFO"
 ) -> None:
-    from semoflow.realizer.training import (
-        train_prefix_time_suffix_latent_flow_realizer,
-    )
+    from semoflow.realizer.training import train_realizer
 
     cfg = _load(config, sets, log_level)
-    settings = cfg.realizer
-    with _torchrun_device() as device:
-        if device is not None:
-            settings = replace(settings, device=device)
-        with _run(cfg, "realizer", cfg.layout.realizer_dir, log_level):
-            result = train_prefix_time_suffix_latent_flow_realizer(
-                settings, cfg.layout
-            )
+    with _run(cfg, "realizer", cfg.layout.realizer_dir, log_level):
+        result = train_realizer(cfg.realizer, cfg.layout)
     _echo(result)
 
 
