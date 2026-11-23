@@ -191,7 +191,7 @@ def planner_data(
     force: Force = False,
     log_level: LogLevel = "INFO",
 ) -> None:
-    from semoflow.planner.data import build_planner_data
+    from semoflow.data import build_planner_data
 
     cfg = _load(config, sets, log_level)
     _echo(build_planner_data(cfg.planner.data, cfg.layout, force=force))
@@ -224,7 +224,7 @@ def planner(
 def realizer_data(
     config: Config, sets: Sets = None, log_level: LogLevel = "INFO"
 ) -> None:
-    from semoflow.realizer.bank import build_realizer_data
+    from semoflow.data import build_realizer_data
 
     cfg = _load(config, sets, log_level)
     _echo(build_realizer_data(cfg.realizer, cfg.layout))
@@ -284,7 +284,7 @@ def evaluate(
     force: Force = False,
     log_level: LogLevel = "INFO",
 ) -> None:
-    from semoflow.evaluation.cities import evaluate_cities
+    from semoflow.evaluation.compose import evaluate_cities
 
     cfg = _load(config, sets, log_level)
     layout, cities = cfg.layout, cfg.evaluation_cities
@@ -390,7 +390,7 @@ def compose(
     ] = "independent",
     log_level: LogLevel = "INFO",
 ) -> None:
-    from semoflow.realizer.evaluation import evaluate_planner_realizer
+    from semoflow.evaluation.compose import evaluate_planner_realizer
 
     configure_logging(level=log_level)
     report = evaluate_planner_realizer(

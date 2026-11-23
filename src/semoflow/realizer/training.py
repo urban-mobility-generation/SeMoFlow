@@ -14,12 +14,13 @@ from semoflow.config import (
     RealizerConfig,
     RunLayout,
 )
-from semoflow.poi.sids import load_codebooks
-from semoflow.realizer.bank import (
+from semoflow.data import (
+    N_TIME_TOKENS,
     bank_split_city_ids,
     bank_split_window,
     load_bank_payload,
 )
+from semoflow.poi.sids import load_codebooks
 from semoflow.realizer.catalog import SuffixCatalog
 from semoflow.realizer.model import (
     MODEL_TYPE,
@@ -29,7 +30,6 @@ from semoflow.realizer.objective import (
     compute_tail_whitening_stats,
     prefix_time_suffix_latent_flow_loss,
 )
-from semoflow.realizer.time_tokens import N_TIME_TOKENS
 from semoflow.utils import (
     EarlyStopper,
     build_lr_scheduler,
@@ -424,4 +424,6 @@ def train_prefix_time_suffix_latent_flow_realizer(
     return result
 
 
-__all__ = ["train_prefix_time_suffix_latent_flow_realizer"]
+__all__ = [
+    "train_prefix_time_suffix_latent_flow_realizer",
+]

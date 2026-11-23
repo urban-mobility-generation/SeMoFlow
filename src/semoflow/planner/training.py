@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import time
+from collections.abc import Iterator
 from dataclasses import asdict, dataclass
 from functools import partial
 from pathlib import Path
@@ -14,21 +16,24 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 from torch import optim
 from torch.nn.parallel import DistributedDataParallel
-from torch.utils.data import DataLoader
+from torch.utils.data import (
+    BatchSampler,
+    DataLoader,
+    Sampler,
+    SequentialSampler,
+    TensorDataset,
+)
 from torch.utils.data.distributed import DistributedSampler
 
 from semoflow.config import PlannerConfig, RunLayout
-from semoflow.planner.artifacts import save_occurrence_planner_checkpoint
-from semoflow.planner.data import (
-    OccurrencePlannerDataset,
-    SeededShuffleSampler,
-    build_occurrence_tensor_dataloader,
-    load_occurrence_planner_dataset,
-)
+from semoflow.data import DATASET_ARTIFACT_TYPE, reconstruct_event_time_minutes
+from semoflow.planner.layers import LegalPrefixIndex
 from semoflow.planner.model import (
     OccurrenceARPlanner,
+    OccurrenceBatch,
     OccurrencePlannerConfig,
     occurrence_planner_loss,
+    save_occurrence_planner_checkpoint,
 )
 from semoflow.utils import (
     EarlyStopper,
@@ -36,6 +41,7 @@ from semoflow.utils import (
     ddp_worker,
     find_free_port,
     get_configured_log_file,
+    load_artifact,
     log_epoch_summary,
     log_training_step,
     parse_device_spec,
@@ -43,8 +49,167 @@ from semoflow.utils import (
     write_json,
 )
 
+
+@dataclass(frozen=True, slots=True)
+class OccurrencePlannerDataConfig:
+    codebook_size: int
+    gap_vocab: int
+    prefix_depth: int
+    max_occurrences: int
+    city_conditioning: bool
+    gap_codec_version: str
+    gap_bucket_edges_minutes: tuple[float, ...]
+    gap_duration_minutes: tuple[float, ...]
+    observation_window_minutes: float
+
+
+@dataclass(frozen=True, slots=True)
+class OccurrencePlannerSplit:
+    prefix_codes: torch.Tensor
+    gap_tokens: torch.Tensor
+    lengths: torch.Tensor
+    city_ids: torch.Tensor
+
+    @property
+    def size(self) -> int:
+        return int(self.lengths.shape[0])
+
+
+@dataclass(frozen=True, slots=True)
+class OccurrencePlannerDataset:
+    config: OccurrencePlannerDataConfig
+    legal_prefixes: torch.Tensor
+    catalog_city_ids: torch.Tensor
+    city_legal_prefix_mask: torch.Tensor
+    train: OccurrencePlannerSplit
+    validation: OccurrencePlannerSplit
+    source_path: Path
+    legal_prefix_centroids: torch.Tensor | None = None
+    legal_prefix_centroid_available: torch.Tensor | None = None
+
+
+def load_occurrence_planner_dataset(path: Path) -> OccurrencePlannerDataset:
+    payload = load_artifact(path, DATASET_ARTIFACT_TYPE)
+    return OccurrencePlannerDataset(
+        config=OccurrencePlannerDataConfig(**payload["data_config"]),
+        legal_prefixes=payload["legal_prefixes"],
+        legal_prefix_centroids=payload["legal_prefix_centroids"],
+        legal_prefix_centroid_available=payload[
+            "legal_prefix_centroid_available"
+        ],
+        catalog_city_ids=payload["catalog_city_ids"],
+        city_legal_prefix_mask=payload["city_legal_prefix_mask"],
+        train=OccurrencePlannerSplit(**payload["train"]),
+        validation=OccurrencePlannerSplit(**payload["validation"]),
+        source_path=Path(path).resolve(),
+    )
+
+
+def _shift_right(
+    values: torch.Tensor, valid_mask: torch.Tensor, fill: float
+) -> torch.Tensor:
+    shifted = torch.full_like(values, fill)
+    previous_valid = valid_mask[:, 1:]
+    if values.ndim == 3:
+        previous_valid = previous_valid[..., None]
+    shifted[:, 1:] = torch.where(previous_valid, values[:, :-1], fill)
+    return shifted
+
+
+def collate_occurrence_tensors(
+    tensors: tuple[torch.Tensor, ...],
+    *,
+    config: OccurrencePlannerConfig,
+    legality: LegalPrefixIndex,
+) -> OccurrenceBatch:
+    prefix_codes, gap_tokens, lengths, city_ids = tensors
+    batch_size = prefix_codes.shape[0]
+    device = prefix_codes.device
+    max_len = int(lengths.max().item())
+
+    sub_prefix = prefix_codes[:, :max_len]
+    sub_gaps = gap_tokens[:, :max_len]
+    valid_mask = (
+        torch.arange(max_len, device=device)[None, :] < lengths[:, None]
+    )
+    default_prefix = (
+        legality.codes[0]
+        .to(device)
+        .view(1, 1, -1)
+        .expand(batch_size, max_len, -1)
+    )
+    target_prefixes = torch.where(
+        valid_mask[..., None], sub_prefix, default_prefix
+    )
+    target_gaps = torch.where(valid_mask, sub_gaps, 0)
+    event_times = reconstruct_event_time_minutes(
+        target_gaps,
+        valid_mask,
+        representative_minutes=config.gap_duration_minutes,
+        observation_window_minutes=config.observation_window_minutes,
+    )
+    return OccurrenceBatch(
+        previous_prefix_codes=_shift_right(sub_prefix, valid_mask, -1),
+        previous_gap_tokens=_shift_right(sub_gaps, valid_mask, -1),
+        previous_event_time_minutes=_shift_right(event_times, valid_mask, 0.0),
+        target_prefix_codes=target_prefixes,
+        target_gap_tokens=target_gaps,
+        valid_mask=valid_mask,
+        lengths=lengths,
+        city_ids=city_ids,
+    )
+
+
+class SeededShuffleSampler(Sampler[int]):
+    def __init__(self, size: int, *, seed: int) -> None:
+        self._size = int(size)
+        self._random = random.Random(seed)
+
+    def __iter__(self) -> Iterator[int]:
+        order = list(range(self._size))
+        self._random.shuffle(order)
+        return iter(order)
+
+    def __len__(self) -> int:
+        return self._size
+
+
+def build_occurrence_tensor_dataloader(
+    split: OccurrencePlannerSplit,
+    *,
+    config: OccurrencePlannerConfig,
+    legality: LegalPrefixIndex,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    sampler: Sampler[int] | None = None,
+) -> DataLoader:
+    dataset = TensorDataset(
+        split.prefix_codes, split.gap_tokens, split.lengths, split.city_ids
+    )
+    return DataLoader(
+        dataset,
+        batch_size=None,
+        sampler=BatchSampler(
+            SequentialSampler(dataset) if sampler is None else sampler,
+            batch_size=batch_size,
+            drop_last=False,
+        ),
+        collate_fn=partial(
+            collate_occurrence_tensors, config=config, legality=legality
+        ),
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0),
+    )
+
+
 logger = logging.getLogger(__name__)
+
+
 _OUTPUT_NAMES = ("best.pt", "last.pt", "metrics.json")
+
+
 _METRIC_NAMES = (
     "nll",
     "length_nll",
@@ -463,4 +628,6 @@ def train_planner(
     return metrics
 
 
-__all__ = ["train_occurrence_planner", "train_planner"]
+__all__ = [
+    "train_planner",
+]

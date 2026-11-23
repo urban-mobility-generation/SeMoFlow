@@ -61,7 +61,6 @@ def token_marginal_jsd(
 
 
 __all__ = [
-    "JSD_MAX_NATS",
     "jensen_shannon_divergence",
     "jsd",
     "token_marginal_jsd",

@@ -139,7 +139,6 @@ class SemanticIDGroundingIndex:
 
 
 __all__ = [
-    "SID_CODE_PREFIX",
     "SemanticIDGroundingIndex",
     "codes_to_embeddings",
     "find_sorted",

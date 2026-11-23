@@ -450,6 +450,8 @@ def sample_prefix_time_suffix_latent_flow(
 
 
 __all__ = [
-    "PrefixTimeSuffixLatentFlowSample",
+    "_hashed_uniform",
+    "_sample_catalog_candidates",
+    "_trajectory_prefix_coupling_keys",
     "sample_prefix_time_suffix_latent_flow",
 ]

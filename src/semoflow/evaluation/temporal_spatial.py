@@ -6,12 +6,9 @@ from typing import Any
 
 import numpy as np
 
+from semoflow.data import N_PART_OF_DAY_BINS, N_TIME_TOKENS
 from semoflow.evaluation.distribution import (
     jensen_shannon_divergence,
-)
-from semoflow.realizer.time_tokens import (
-    N_PART_OF_DAY_BINS,
-    N_TIME_TOKENS,
 )
 
 TIME_TOKEN_MIDPOINT_HOURS = np.array([3, 8, 12, 16, 20, 23], dtype=np.int64)
@@ -202,6 +199,7 @@ def temporal_spatial_jsd(
 
 
 __all__ = [
+    "N_GAP_BINS",
     "TemporalSpatialEvents",
     "events_from_place_ids",
     "temporal_spatial_jsd",

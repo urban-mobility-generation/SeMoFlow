@@ -1,14 +1,76 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn as nn
 
-from semoflow.realizer.modules import (
-    CircadianTokenEncoder,
-    TimestepEmbedder,
-)
+
+class TimestepEmbedder(nn.Module):
+    def __init__(self, dim: int, freq_dim: int = 256) -> None:
+        super().__init__()
+        half = freq_dim // 2
+        freqs = torch.exp(
+            -math.log(10_000.0) * torch.arange(half) / max(half - 1, 1)
+        )
+        self.register_buffer("freqs", freqs)
+        self.proj = nn.Sequential(
+            nn.Linear(freq_dim, dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+        )
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        angles = t.float().unsqueeze(1) * self.freqs.unsqueeze(0)
+        return self.proj(torch.cat([angles.sin(), angles.cos()], dim=1))
+
+
+class CircadianTokenEncoder(nn.Module):
+    def __init__(
+        self,
+        time_vocab: int,
+        output_dim: int,
+        *,
+        n_harmonics: int = 3,
+        n_parts_of_day: int = 6,
+    ) -> None:
+        super().__init__()
+        self.time_vocab = time_vocab
+        self.n_harmonics = n_harmonics
+        self.n_parts_of_day = n_parts_of_day
+        self.n_weekdays = math.ceil(time_vocab / n_parts_of_day)
+        self.weekday_embedding = nn.Embedding(self.n_weekdays, output_dim)
+        self.part_embedding = nn.Embedding(n_parts_of_day, output_dim)
+        self.projection = nn.Sequential(
+            nn.Linear(4 * n_harmonics, output_dim),
+            nn.GELU(),
+            nn.Linear(output_dim, output_dim),
+        )
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        valid = (tokens >= 0) & (tokens < self.time_vocab)
+        safe = tokens.clamp(min=0, max=self.time_vocab - 1)
+        weekday = (safe // self.n_parts_of_day).clamp(max=self.n_weekdays - 1)
+        part = safe % self.n_parts_of_day
+        weekly_phase = 2.0 * math.pi * safe.float() / self.time_vocab
+        daily_phase = 2.0 * math.pi * part.float() / self.n_parts_of_day
+        harmonic_ids = torch.arange(
+            1, self.n_harmonics + 1, device=tokens.device, dtype=tokens.dtype
+        )
+        weekly = weekly_phase[..., None] * harmonic_ids
+        daily = daily_phase[..., None] * harmonic_ids
+        periodic = torch.cat(
+            [weekly.sin(), weekly.cos(), daily.sin(), daily.cos()], dim=-1
+        )
+        encoded = (
+            self.weekday_embedding(weekday)
+            + self.part_embedding(part)
+            + self.projection(periodic)
+        )
+        return encoded.masked_fill(~valid[..., None], 0.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,8 +293,47 @@ class PrefixTimeSuffixLatentFlowRealizer(nn.Module):
         return self.catalog_score_norm(candidate)
 
 
+def load_realizer_checkpoint(
+    checkpoint_path: Path, device: torch.device
+) -> tuple[PrefixTimeSuffixLatentFlowRealizer, dict[str, Any]]:
+    checkpoint = torch.load(
+        checkpoint_path, map_location="cpu", weights_only=False
+    )
+    config = checkpoint["config"]
+    state = checkpoint["model_state_dict"]
+    codebooks = checkpoint["codebooks"].float().contiguous()
+    prefix_depth = int(checkpoint["prefix_depth"])
+    model = PrefixTimeSuffixLatentFlowRealizer(
+        max_seq_len=int(state["event_position_embedding.weight"].size(0)),
+        prefix_depth=prefix_depth,
+        num_codebooks=int(checkpoint["num_codebooks"]),
+        codebook_size=int(checkpoint["codebook_size"]),
+        time_vocab=int(checkpoint["time_vocab"]),
+        latent_dim=int(checkpoint["latent_dim"]),
+        model_dim=int(config["model_dim"]),
+        condition_depth=int(config["condition_depth"]),
+        depth=int(config["depth"]),
+        num_heads=int(config["num_heads"]),
+        mlp_ratio=float(config["mlp_ratio"]),
+        dropout=float(config["dropout"]),
+        prefix_plan_codebooks=codebooks[:prefix_depth],
+        city_vocab=int(config["city_vocab"]),
+    ).to(device)
+    model.load_state_dict(state)
+    model.eval()
+    return model, checkpoint
+
+
+def realizer_max_events(checkpoint: Path) -> int:
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    position = payload["model_state_dict"]["event_position_embedding.weight"]
+    return int(position.shape[0])
+
+
 __all__ = [
     "MODEL_TYPE",
     "LatentSuffixConditioning",
     "PrefixTimeSuffixLatentFlowRealizer",
+    "load_realizer_checkpoint",
+    "realizer_max_events",
 ]

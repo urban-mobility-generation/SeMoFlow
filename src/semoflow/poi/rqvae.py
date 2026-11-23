@@ -245,4 +245,7 @@ def build_tokenizer_model(config: TokenizerConfig, *, input_dim: int) -> RQVAE:
     )
 
 
-__all__ = ["RQVAE", "ResidualVQ", "build_tokenizer_model"]
+__all__ = [
+    "RQVAE",
+    "build_tokenizer_model",
+]

@@ -382,4 +382,6 @@ def run_encoder_pipeline(cfg: ExperimentConfig) -> None:
     )
 
 
-__all__ = ["run_encoder_pipeline"]
+__all__ = [
+    "run_encoder_pipeline",
+]

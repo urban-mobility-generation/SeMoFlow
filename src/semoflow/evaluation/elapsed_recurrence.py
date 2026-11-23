@@ -217,9 +217,6 @@ def elapsed_recurrence_jsd(
 
 
 __all__ = [
-    "DEFAULT_GRID_HOURS",
-    "DEFINITION_VERSION",
-    "WEEK_HOURS",
     "ReturnEvents",
     "elapsed_recurrence_jsd",
     "soft_time_histogram",

@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import polars as pl
@@ -394,140 +394,7 @@ def run_foursquare_pipeline(cfg: ExperimentConfig) -> None:
     )
 
 
-SEGMENT_CITY_COLUMN = "_city_id"
-
-
-def segment_events(
-    segments: pl.DataFrame, lookup_path: Path, columns: list[str]
-) -> pl.DataFrame:
-    timestamp = pl.col("_timestamps")
-    return (
-        segments.select(
-            pl.int_range(pl.len()).alias("_row"), "placekey_id", "_timestamps"
-        )
-        .explode("placekey_id", "_timestamps")
-        .with_columns(
-            pl.int_range(pl.len()).over("_row").alias("_pos"),
-            (
-                (
-                    timestamp - timestamp.dt.truncate("1w")
-                ).dt.total_microseconds()
-                / 1_000_000
-                / 60.0
-            ).alias("_minutes"),
-        )
-        .join(
-            pl.read_parquet(lookup_path, columns=["placekey_id", *columns]),
-            on="placekey_id",
-            maintain_order="left",
-        )
-    )
-
-
-def pad_events(
-    events: pl.DataFrame,
-    values: np.ndarray,
-    *,
-    rows: int,
-    width: int,
-    fill: float | int,
-) -> np.ndarray:
-    padded = np.full(
-        (rows, width, *values.shape[1:]), fill, dtype=values.dtype
-    )
-    padded[events["_row"].to_numpy(), events["_pos"].to_numpy()] = values
-    return padded
-
-
-SEGMENT_MIN_LENGTH = 5
-SEGMENT_MAX_LENGTH = 128
-
-
-def build_weekly_segment_cache(
-    *,
-    stays_path: Path,
-    output: Path,
-    min_active_days: int,
-    force: bool = False,
-) -> dict[str, Any]:
-    if min_active_days < 1:
-        raise ValueError("min_active_days must be >= 1")
-    if output.exists() and not force:
-        raise FileExistsError(
-            f"refusing to overwrite existing artifact: {output}"
-        )
-    window = ["device_key", "_week"]
-    stays = (
-        pl.read_parquet(
-            stays_path,
-            columns=[
-                "device_key",
-                "timestamp",
-                "placekey_id",
-                SPLIT_COLUMN,
-                "city_id",
-            ],
-        )
-        .sort(["device_key", "timestamp"])
-        .with_columns(pl.col("timestamp").dt.truncate("1w").alias("_week"))
-        .with_columns(
-            pl.int_range(0, pl.len()).over(window).alias("_pos"),
-            pl.len().over(window).alias("_length"),
-            pl.col("timestamp")
-            .dt.date()
-            .n_unique()
-            .over(window)
-            .alias("_active_days"),
-        )
-    )
-    n_before = stays.select(pl.struct(window).n_unique()).item()
-    stays = stays.filter(
-        (pl.col("_length") >= SEGMENT_MIN_LENGTH)
-        & (pl.col("_active_days") >= min_active_days)
-    )
-    logger.info(
-        "weekly quality gate: %s -> %s windows (min_seq_len=%d, min_active_days=%d)",
-        f"{n_before:,}",
-        f"{stays.select(pl.struct(window).n_unique()).item():,}",
-        SEGMENT_MIN_LENGTH,
-        min_active_days,
-    )
-    grouped = (
-        stays.with_columns(
-            (pl.struct(window).rank("dense") - 1)
-            .cast(pl.UInt32)
-            .alias("_seg_id")
-        )
-        .filter(pl.col("_pos") < SEGMENT_MAX_LENGTH)
-        .sort(["_seg_id", "_pos"])
-        .group_by("_seg_id", maintain_order=True)
-        .agg(
-            pl.col("placekey_id"),
-            pl.col("device_key").first(),
-            pl.col("timestamp").alias("_timestamps"),
-            pl.col(SPLIT_COLUMN).first().alias("_split"),
-            pl.col("city_id").first().alias(SEGMENT_CITY_COLUMN),
-        )
-    )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_suffix(output.suffix + ".tmp")
-    grouped.write_parquet(temporary)
-    temporary.replace(output)
-    return {
-        "output": str(output),
-        "segments": grouped.height,
-        "segments_by_split": dict(
-            grouped["_split"].value_counts().iter_rows()
-        ),
-        "min_seq_len": SEGMENT_MIN_LENGTH,
-        "max_seq_len": SEGMENT_MAX_LENGTH,
-        "min_active_days": min_active_days,
-    }
-
-
 __all__ = [
-    "GLOBAL_SPLIT_SEED",
-    "SEGMENT_CITY_COLUMN",
-    "build_weekly_segment_cache",
+    "SPLIT_COLUMN",
     "run_foursquare_pipeline",
 ]

@@ -245,4 +245,6 @@ def run_semantic_id_tokenizer(cfg: ExperimentConfig) -> None:
     )
 
 
-__all__ = ["run_semantic_id_tokenizer"]
+__all__ = [
+    "run_semantic_id_tokenizer",
+]

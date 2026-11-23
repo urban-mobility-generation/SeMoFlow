@@ -2,13 +2,24 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+import polars as pl
 import torch
 
+from semoflow.config import CITY_ID, EvaluationConfig, RunLayout
+from semoflow.data import (
+    SEGMENT_CITY_COLUMN,
+    bank_segments,
+    bank_split_city_ids,
+    bank_split_window,
+    build_bank,
+    load_bank_payload,
+)
 from semoflow.evaluation.scoring import (
     aligned_reference_event_hours,
     load_candidate_prior,
@@ -17,18 +28,158 @@ from semoflow.evaluation.scoring import (
     metric_block,
     plan_from_planner_samples,
 )
+from semoflow.planner.sampling import sample_occurrence_planner
 from semoflow.poi.sids import SemanticIDGroundingIndex
-from semoflow.realizer.bank import (
-    bank_split_city_ids,
-    bank_split_window,
-    load_bank_payload,
-)
 from semoflow.realizer.catalog import SuffixCatalog
-from semoflow.realizer.model import PrefixTimeSuffixLatentFlowRealizer
+from semoflow.realizer.model import (
+    PrefixTimeSuffixLatentFlowRealizer,
+    load_realizer_checkpoint,
+    realizer_max_events,
+)
 from semoflow.realizer.sampling import sample_prefix_time_suffix_latent_flow
 from semoflow.utils import normalize_value, write_json
 
-LOGGER = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
+
+
+SEGMENTS_NAME = "segments.parquet"
+
+
+LOOKUP_NAME = "placekey_lookup.parquet"
+
+
+GROUNDING_NAME = "grounding_index.pkl"
+
+
+def evaluate_cities(
+    settings: EvaluationConfig,
+    layout: RunLayout,
+    cities: list[str],
+) -> dict[str, dict[str, Any]]:
+    max_events = realizer_max_events(layout.realizer_dir / "best.pt")
+    return {
+        name: _evaluate_city(
+            settings,
+            layout,
+            CITY_ID[name],
+            max_events=max_events,
+            output_dir=layout.evaluation_dir / name,
+        )
+        for name in cities
+    }
+
+
+def _evaluate_city(
+    settings: EvaluationConfig,
+    layout: RunLayout,
+    city_id: int,
+    *,
+    max_events: int,
+    output_dir: Path,
+) -> dict[str, Any]:
+    logger.info("evaluating city_id=%d output_dir=%s", city_id, output_dir)
+    tokenizer = layout.tokenizer
+    _extract_city_inputs(
+        city_id,
+        segments=layout.segments,
+        lookup=tokenizer.placekey_lookup,
+        grounding_index=tokenizer.grounding_index,
+        output_dir=output_dir,
+    )
+    bank = output_dir / "bank.pt"
+    row_counts = cast(
+        dict[str, int],
+        build_bank(
+            lookup_path=output_dir / LOOKUP_NAME,
+            segments_path=output_dir / SEGMENTS_NAME,
+            output_path=bank,
+            max_events=max_events,
+        )["row_counts"],
+    )
+    composition = settings.composition
+    prior = None
+    if composition.candidate_selection != "first":
+        prior = output_dir / "candidate_prior.json"
+        write_json(prior, _build_prior(bank))
+
+    num_samples = row_counts[settings.reference_split]
+    plans = output_dir / "plans.pt"
+    sampling = settings.sampling
+    sample_occurrence_planner(
+        checkpoint_path=layout.planner_dir / "best.pt",
+        output_path=plans,
+        num_samples=num_samples,
+        city_id=city_id,
+        batch_size=sampling.batch_size,
+        device=settings.device,
+        seed=settings.seed,
+        temperature=sampling.temperature,
+        route_temperature=sampling.route_temperature,
+        force=True,
+    )
+    output = output_dir / "composition.json"
+    report = evaluate_planner_realizer(
+        realizer_checkpoint=layout.realizer_dir / "best.pt",
+        planner_samples=plans,
+        bank=bank,
+        lookup=output_dir / LOOKUP_NAME,
+        grounding_index=output_dir / GROUNDING_NAME,
+        places=layout.preprocessing.places_index,
+        output=output,
+        max_samples=num_samples,
+        batch_size=composition.batch_size,
+        device=settings.device,
+        num_steps=composition.num_steps,
+        solver=composition.solver,
+        reference_split=settings.reference_split,
+        candidate_selection=composition.candidate_selection,
+        candidate_prior=prior,
+        catalog_temperature=composition.catalog_temperature,
+        catalog_noise_coupling=composition.catalog_noise_coupling,
+    )
+    return {"output": output, "samples": num_samples, **report["summary"]}
+
+
+def _extract_city_inputs(
+    city_id: int,
+    *,
+    segments: Path,
+    lookup: Path,
+    grounding_index: Path,
+    output_dir: Path,
+) -> None:
+    city_lookup = pl.read_parquet(lookup).filter(pl.col("city_id") == city_id)
+    city_segments = pl.read_parquet(segments).filter(
+        pl.col(SEGMENT_CITY_COLUMN) == city_id
+    )
+    joint = SemanticIDGroundingIndex.load(grounding_index)
+    city_grounding = SemanticIDGroundingIndex.from_frame(
+        joint.to_frame().filter(
+            pl.col("placekey_id").is_in(city_lookup["placekey_id"].implode())
+        ),
+        payload_columns=joint.payload_columns,
+    )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    city_segments.write_parquet(output_dir / SEGMENTS_NAME)
+    city_lookup.write_parquet(output_dir / LOOKUP_NAME)
+    city_grounding.save(output_dir / GROUNDING_NAME)
+
+
+def _build_prior(bank_path: Path) -> dict[str, Any]:
+    payload = load_bank_payload(bank_path)
+    frame = bank_segments(payload, "train", ["placekey_id"])
+    counter = Counter(int(value) for value in frame["placekey_id"].explode())
+    return {
+        "split": "train",
+        "bank": str(bank_path),
+        "rows": frame.height,
+        "events": sum(counter.values()),
+        "distinct_pois": len(counter),
+        "counts": {str(key): value for key, value in counter.items()},
+    }
+
+
 _NESTED_SUMMARY_KEYS = {
     "time_location_joint_jsd": (
         "temporal_spatial",
@@ -46,43 +197,6 @@ _NESTED_SUMMARY_KEYS = {
         "return_index_time_joint_jsd",
     ),
 }
-
-
-def load_realizer_checkpoint(
-    checkpoint_path: Path, device: torch.device
-) -> tuple[PrefixTimeSuffixLatentFlowRealizer, dict[str, Any]]:
-    checkpoint = torch.load(
-        checkpoint_path, map_location="cpu", weights_only=False
-    )
-    config = checkpoint["config"]
-    state = checkpoint["model_state_dict"]
-    codebooks = checkpoint["codebooks"].float().contiguous()
-    prefix_depth = int(checkpoint["prefix_depth"])
-    model = PrefixTimeSuffixLatentFlowRealizer(
-        max_seq_len=int(state["event_position_embedding.weight"].size(0)),
-        prefix_depth=prefix_depth,
-        num_codebooks=int(checkpoint["num_codebooks"]),
-        codebook_size=int(checkpoint["codebook_size"]),
-        time_vocab=int(checkpoint["time_vocab"]),
-        latent_dim=int(checkpoint["latent_dim"]),
-        model_dim=int(config["model_dim"]),
-        condition_depth=int(config["condition_depth"]),
-        depth=int(config["depth"]),
-        num_heads=int(config["num_heads"]),
-        mlp_ratio=float(config["mlp_ratio"]),
-        dropout=float(config["dropout"]),
-        prefix_plan_codebooks=codebooks[:prefix_depth],
-        city_vocab=int(config["city_vocab"]),
-    ).to(device)
-    model.load_state_dict(state)
-    model.eval()
-    return model, checkpoint
-
-
-def realizer_max_events(checkpoint: Path) -> int:
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    position = payload["model_state_dict"]["event_position_embedding.weight"]
-    return int(position.shape[0])
 
 
 def summary(metrics: Mapping[str, Any]) -> dict[str, object]:
@@ -328,7 +442,7 @@ def evaluate_planner_realizer(
             candidate_weights=weights,
             compute_device=resolved_device,
         )
-        LOGGER.info(
+        logger.info(
             "%s metrics on %d rows in %.1fs",
             arm.name,
             n_rows,
@@ -361,7 +475,7 @@ def evaluate_planner_realizer(
     }
     result = cast(dict[str, Any], normalize_value(result))
     write_json(output, result)
-    LOGGER.info(
+    logger.info(
         "composition complete  output=%s  elapsed=%.1fs",
         output,
         time.perf_counter() - started,
@@ -370,8 +484,6 @@ def evaluate_planner_realizer(
 
 
 __all__ = [
+    "evaluate_cities",
     "evaluate_planner_realizer",
-    "load_realizer_checkpoint",
-    "realizer_max_events",
-    "summary",
 ]

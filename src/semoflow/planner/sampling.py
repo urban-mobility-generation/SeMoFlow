@@ -7,12 +7,42 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from semoflow.planner.artifacts import (
-    load_occurrence_planner_checkpoint,
-    save_occurrence_planner_samples,
-)
 from semoflow.planner.layers import sample_categorical_logits
-from semoflow.planner.model import OccurrenceARPlanner
+from semoflow.planner.model import (
+    OccurrenceARPlanner,
+    load_occurrence_planner_checkpoint,
+)
+from semoflow.utils import save_torch_atomic
+
+SAMPLES_ARTIFACT_TYPE = "occurrence_planner_samples"
+
+
+def save_occurrence_planner_samples(
+    path: Path,
+    *,
+    prefix_codes: torch.Tensor,
+    gap_tokens: torch.Tensor,
+    event_time_minutes: torch.Tensor,
+    lengths: torch.Tensor,
+    city_ids: torch.Tensor,
+    seed: int,
+    temperature: float,
+    route_temperature: float,
+    force: bool = False,
+) -> None:
+    payload = {
+        "artifact_type": SAMPLES_ARTIFACT_TYPE,
+        "prefix_codes": prefix_codes.long(),
+        "gap_tokens": gap_tokens.long(),
+        "event_time_minutes": event_time_minutes.float(),
+        "lengths": lengths.long(),
+        "city_ids": city_ids.long(),
+        "seed": int(seed),
+        "temperature": float(temperature),
+        "route_temperature": float(route_temperature),
+    }
+    save_torch_atomic(path, payload, force=force)
+
 
 logger = logging.getLogger(__name__)
 
@@ -172,3 +202,8 @@ def sample_occurrence_planner(
         force=force,
     )
     return {"output_path": output_path, "num_samples": num_samples}
+
+
+__all__ = [
+    "sample_occurrence_planner",
+]

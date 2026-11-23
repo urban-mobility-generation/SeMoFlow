@@ -3,13 +3,15 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from semoflow.config import PlannerTrainingConfig
 from semoflow.planner.layers import (
     HierarchicalPrefixDecoder,
     LegalPrefixIndex,
@@ -25,6 +27,7 @@ from semoflow.planner.router import (
     prefix_target_log_probability,
     retrieval_target_log_probability,
 )
+from semoflow.utils import load_artifact, save_torch_atomic
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,9 +97,17 @@ class OccurrencePlannerLoss:
 
 
 _DAY_MINUTES = 1440.0
+
+
 _WEEK_MINUTES = 10080.0
+
+
 _DAILY_HARMONICS = 4
+
+
 _WEEKLY_HARMONICS = 2
+
+
 TIME_FEATURE_DIM = 2 * (_DAILY_HARMONICS + _WEEKLY_HARMONICS) + 2
 
 
@@ -580,9 +591,89 @@ def occurrence_planner_loss(
     )
 
 
+CHECKPOINT_ARTIFACT_TYPE = "occurrence_planner_checkpoint"
+
+
+def _cpu(
+    tensor: torch.Tensor | None, dtype: torch.dtype
+) -> torch.Tensor | None:
+    return None if tensor is None else tensor.detach().to("cpu", dtype).clone()
+
+
+def save_occurrence_planner_checkpoint(
+    path: Path,
+    *,
+    config: OccurrencePlannerConfig,
+    legal_prefixes: torch.Tensor,
+    catalog_city_ids: torch.Tensor,
+    city_legal_prefix_mask: torch.Tensor,
+    model_state: dict[str, Any],
+    epoch: int,
+    validation_metric: float,
+    seed: int,
+    options: PlannerTrainingConfig,
+    legal_prefix_centroids: torch.Tensor | None = None,
+    legal_prefix_centroid_available: torch.Tensor | None = None,
+    force: bool = False,
+) -> None:
+    payload = {
+        "artifact_type": CHECKPOINT_ARTIFACT_TYPE,
+        "config": asdict(config),
+        "legal_prefixes": _cpu(legal_prefixes, torch.long),
+        "catalog_city_ids": _cpu(catalog_city_ids, torch.long),
+        "city_legal_prefix_mask": _cpu(city_legal_prefix_mask, torch.bool),
+        "legal_prefix_centroids": _cpu(legal_prefix_centroids, torch.float32),
+        "legal_prefix_centroid_available": _cpu(
+            legal_prefix_centroid_available, torch.bool
+        ),
+        "model_state": model_state,
+        "epoch": int(epoch),
+        "validation_metric": float(validation_metric),
+        "seed": int(seed),
+        "options": asdict(options),
+    }
+    save_torch_atomic(path, payload, force=force)
+
+
+_RETIRED_CONFIG = {
+    "context_dim": 0,
+    "context_schema": (),
+    "prefix_decoder": "hierarchical",
+    "mobility_router": "explore_retrieve",
+    "use_tokenizer_latent": False,
+}
+
+
+def load_occurrence_planner_checkpoint(
+    path: Path,
+) -> tuple[OccurrenceARPlanner, dict[str, Any]]:
+    payload = load_artifact(path, CHECKPOINT_ARTIFACT_TYPE)
+    config = dict(payload["config"])
+    for key, supported in _RETIRED_CONFIG.items():
+        if key in config and config.pop(key) != supported:
+            raise ValueError(
+                f"unsupported planner checkpoint: {key} != {supported!r}"
+            )
+    model = OccurrenceARPlanner(
+        OccurrencePlannerConfig(**config),
+        payload["legal_prefixes"],
+        catalog_city_ids=payload["catalog_city_ids"],
+        city_legal_prefix_mask=payload["city_legal_prefix_mask"],
+        legal_prefix_centroids=payload["legal_prefix_centroids"],
+        legal_prefix_centroid_available=payload[
+            "legal_prefix_centroid_available"
+        ],
+    )
+    model.load_state_dict(payload["model_state"])
+    model.eval()
+    return model, payload
+
+
 __all__ = [
     "OccurrenceARPlanner",
     "OccurrenceBatch",
     "OccurrencePlannerConfig",
+    "load_occurrence_planner_checkpoint",
     "occurrence_planner_loss",
+    "save_occurrence_planner_checkpoint",
 ]

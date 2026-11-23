@@ -189,4 +189,7 @@ class CandidateTable:
         return index
 
 
-__all__ = ["CandidateTable", "SuffixCatalog"]
+__all__ = [
+    "CandidateTable",
+    "SuffixCatalog",
+]

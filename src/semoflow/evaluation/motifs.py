@@ -81,4 +81,6 @@ def mobility_motif_jsd(
     )
 
 
-__all__ = ["MotifSignature", "daily_mobility_motifs", "mobility_motif_jsd"]
+__all__ = [
+    "mobility_motif_jsd",
+]
