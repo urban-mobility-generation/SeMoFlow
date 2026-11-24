@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, Sampler
 
@@ -35,6 +34,7 @@ from semoflow.realizer.objective import (
 )
 from semoflow.utils import (
     EarlyStopper,
+    Rank,
     build_lr_scheduler,
     run_on_devices,
     set_seed_all,
@@ -142,24 +142,22 @@ def _loader(
     config: RealizerConfig,
     *,
     shuffle: bool,
-    device: torch.device,
-    rank: int,
-    world_size: int,
+    ctx: Rank,
 ) -> DataLoader:
     sampler = _LengthBuckets(
         split.valid.sum(dim=1),
         config.batch_size,
         shuffle=shuffle,
         seed=config.seed,
-        rank=rank,
-        world_size=world_size,
+        rank=ctx.rank,
+        world_size=ctx.world_size,
     )
     return DataLoader(
         split,
         batch_sampler=sampler,
         collate_fn=_identity,
         num_workers=config.num_workers,
-        pin_memory=device.type == "cuda",
+        pin_memory=ctx.device.type == "cuda",
         persistent_workers=config.num_workers > 0,
     )
 
@@ -169,13 +167,13 @@ def _run_epoch(
     loader: DataLoader,
     objective: Any,
     *,
-    device: torch.device,
+    ctx: Rank,
     bf16: bool,
-    distributed: bool,
     max_grad_norm: float,
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
 ) -> float:
+    device = ctx.device
     training = optimizer is not None
     model.train(training)
     totals = torch.zeros(2, dtype=torch.float64, device=device)
@@ -210,16 +208,14 @@ def _run_epoch(
             events = batch["valid_mask"].sum().to(torch.float64)
             totals[0] += loss.detach().to(torch.float64) * events
             totals[1] += events
-    if distributed:
-        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    ctx.all_reduce_sum(totals)
     return float((totals[0] / totals[1].clamp_min(1.0)).item())
 
 
 @dataclass
 class _Run:
     config: RealizerConfig
-    rank: int
-    world_size: int
+    ctx: Rank
     train: _BankSplit
     val: _BankSplit
     train_loader: DataLoader
@@ -231,27 +227,15 @@ class _Run:
     checkpoint_extra: dict[str, Any]
 
     @property
-    def is_main(self) -> bool:
-        return self.rank == 0
-
-    @property
     def raw_model(self) -> torch.nn.Module:
         return unwrap_ddp(self.model)
 
 
-def _setup(
-    config: RealizerConfig,
-    layout: RunLayout,
-    device: torch.device,
-    rank: int,
-    world_size: int,
-) -> _Run:
+def _setup(config: RealizerConfig, layout: RunLayout, ctx: Rank) -> _Run:
+    device = ctx.device
     set_seed_all(config.seed)
     torch.set_num_threads(_CPU_THREADS)
-    distributed = world_size > 1
     if device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
 
     tokenizer = layout.tokenizer
@@ -263,9 +247,7 @@ def _setup(
     )
     num_codebooks = int(train.codes.shape[-1])
     latent_dim = int(codebooks.shape[-1])
-    loader = functools.partial(
-        _loader, config=config, device=device, rank=rank, world_size=world_size
-    )
+    loader = functools.partial(_loader, config=config, ctx=ctx)
     train_loader = loader(train, shuffle=True)
     val_loader = loader(val, shuffle=False)
     tail_mean, tail_whitener = (
@@ -308,9 +290,9 @@ def _setup(
     ).to(device)
     if config.compile and device.type == "cuda":
         model = torch.compile(model, dynamic=True)
-    if distributed:
-        model = DDP(model, device_ids=[device.index], broadcast_buffers=False)
-        set_seed_all(config.seed + rank)
+    model = ctx.wrap(model, broadcast_buffers=False)
+    if ctx.distributed:
+        set_seed_all(config.seed + ctx.rank)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
@@ -326,13 +308,13 @@ def _setup(
         base_lr=config.learning_rate,
         min_lr=config.min_lr,
     )
-    if rank == 0:
+    if ctx.primary:
         logger.info(
             "runtime world_size=%d per_rank_batch=%d global_batch=%d "
             "bf16=%s compile=%s workers=%d total_updates=%d",
-            world_size,
+            ctx.world_size,
             config.batch_size,
-            config.batch_size * world_size,
+            config.batch_size * ctx.world_size,
             config.bf16,
             config.compile,
             config.num_workers,
@@ -340,8 +322,7 @@ def _setup(
         )
     return _Run(
         config=config,
-        rank=rank,
-        world_size=world_size,
+        ctx=ctx,
         train=train,
         val=val,
         train_loader=train_loader,
@@ -363,9 +344,8 @@ def _setup(
                 population_loss_weight=config.population_loss_weight,
                 catalog_prior_weight=config.catalog_prior_weight,
             ),
-            device=device,
+            ctx=ctx,
             bf16=config.bf16,
-            distributed=distributed,
             max_grad_norm=config.max_grad_norm,
         ),
         checkpoint_extra={
@@ -399,13 +379,9 @@ def _save_checkpoint(
 
 
 def _train_on_device(
-    device: torch.device,
-    rank: int,
-    world_size: int,
-    config: RealizerConfig,
-    layout: RunLayout,
-) -> dict[str, Any]:
-    run = _setup(config, layout, device, rank, world_size)
+    ctx: Rank, config: RealizerConfig, layout: RunLayout
+) -> None:
+    run = _setup(config, layout, ctx)
     output_dir = layout.realizer_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     model = run.model
@@ -432,7 +408,7 @@ def _train_on_device(
             }
         )
         improved = stopper.step(val_loss, epoch=epoch)
-        if run.is_main:
+        if ctx.primary:
             logger.info(
                 "latent suffix-flow epoch=%d train_loss=%.6f val_loss=%.6f "
                 "lr=%.6g stale_validations=%d",
@@ -445,7 +421,7 @@ def _train_on_device(
             _save_checkpoint(run, output_dir, epoch, val_loss, improved)
         if stopper.should_stop:
             stopped_early = True
-            if run.is_main:
+            if ctx.primary:
                 logger.info(
                     "latent suffix-flow early_stop epoch=%d best_epoch=%d "
                     "best_val_loss=%.6f",
@@ -455,39 +431,40 @@ def _train_on_device(
                 )
             break
 
-    if run.world_size > 1:
-        dist.barrier()
+    ctx.barrier()
+    if not ctx.primary:
+        return
     extra = run.checkpoint_extra
-    result: dict[str, Any] = {
-        "model_type": MODEL_TYPE,
-        "config": asdict(config),
-        "train_rows": len(run.train),
-        "val_rows": len(run.val),
-        "num_codebooks": extra["num_codebooks"],
-        "latent_dim": extra["latent_dim"],
-        "parameter_count": sum(p.numel() for p in run.raw_model.parameters()),
-        "world_size": run.world_size,
-        "global_batch_size": config.batch_size * run.world_size,
-        "stopped_early": stopped_early,
-        "epochs_completed": len(history),
-        "best_epoch": stopper.best_epoch,
-        "best_val_loss": stopper.best_value,
-        "history": history,
-        "bank_path": str(layout.bank),
-        "codebooks_path": str(layout.tokenizer.tokenizer_codebooks),
-        "catalog_path": str(layout.tokenizer.placekey_lookup),
-    }
-    if run.is_main:
-        write_json(output_dir / "metrics.json", result)
-    return result
+    write_json(
+        output_dir / "metrics.json",
+        {
+            "model_type": MODEL_TYPE,
+            "config": asdict(config),
+            "train_rows": len(run.train),
+            "val_rows": len(run.val),
+            "num_codebooks": extra["num_codebooks"],
+            "latent_dim": extra["latent_dim"],
+            "parameter_count": sum(
+                p.numel() for p in run.raw_model.parameters()
+            ),
+            "world_size": ctx.world_size,
+            "global_batch_size": config.batch_size * ctx.world_size,
+            "stopped_early": stopped_early,
+            "epochs_completed": len(history),
+            "best_epoch": stopper.best_epoch,
+            "best_val_loss": stopper.best_value,
+            "history": history,
+            "bank_path": str(layout.bank),
+            "codebooks_path": str(layout.tokenizer.tokenizer_codebooks),
+            "catalog_path": str(layout.tokenizer.placekey_lookup),
+        },
+    )
 
 
 def train_realizer(
     config: RealizerConfig, layout: RunLayout
 ) -> dict[str, Any]:
-    result = run_on_devices(_train_on_device, config.device, config, layout)
-    if result is not None:
-        return result
+    run_on_devices(_train_on_device, config.device, config, layout)
     return json.loads((layout.realizer_dir / "metrics.json").read_text())
 
 

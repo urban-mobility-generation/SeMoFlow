@@ -227,11 +227,15 @@ def realizer_data(
     )
 )
 def realizer(
-    config: Config, sets: Sets = None, log_level: LogLevel = "INFO"
+    config: Config,
+    sets: Sets = None,
+    force: Force = False,
+    log_level: LogLevel = "INFO",
 ) -> None:
     from semoflow.realizer.training import train_realizer
 
     cfg = _load(config, sets, log_level)
+    _refuse_overwrite(cfg.layout.realizer_dir / "best.pt", force)
     with _run(cfg, "realizer", cfg.layout.realizer_dir, log_level):
         result = train_realizer(cfg.realizer, cfg.layout)
     _echo(result)

@@ -10,8 +10,6 @@ from typing import Any
 
 import polars as pl
 import torch
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
 from semoflow.config import ExperimentConfig, GraphEncoderConfig
@@ -24,6 +22,7 @@ from semoflow.poi.graph import (
 )
 from semoflow.poi.text import build_text_embeddings, write_poi_embeddings
 from semoflow.utils import (
+    Rank,
     parse_device_spec,
     run_on_devices,
     set_seed_all,
@@ -78,14 +77,15 @@ def _batch_loss(
     return loss
 
 
-def _mean_over_ranks(
-    total: torch.Tensor, batches: int, world_size: int
-) -> float:
-    packed = torch.stack(
-        [total.double(), torch.tensor(batches, device=total.device).double()]
+def _mean_over_ranks(total: torch.Tensor, batches: int, ctx: Rank) -> float:
+    packed = ctx.all_reduce_sum(
+        torch.stack(
+            [
+                total.double(),
+                torch.tensor(batches, device=total.device).double(),
+            ]
+        )
     )
-    if world_size > 1:
-        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
     return float(packed[0] / packed[1].clamp(min=1))
 
 
@@ -193,10 +193,10 @@ def _epoch_loss(
     model: torch.nn.Module,
     batches: Any,
     graph_cfg: GraphEncoderConfig,
-    device: torch.device,
-    world_size: int,
+    ctx: Rank,
     optimizer: torch.optim.Optimizer | None = None,
 ) -> float:
+    device = ctx.device
     training = optimizer is not None
     model.train(training)
     total, count = torch.zeros((), device=device), 0
@@ -209,25 +209,23 @@ def _epoch_loss(
                 optimizer.step()
             total += loss.detach()
             count += 1
-    return _mean_over_ranks(total, count, world_size)
+    return _mean_over_ranks(total, count, ctx)
 
 
 def _train(
     cfg: ExperimentConfig,
     data: Any,
     val_edges: torch.Tensor,
-    device: torch.device,
-    rank: int,
-    world_size: int,
+    ctx: Rank,
 ) -> None:
-    is_main = rank == 0
+    device, is_main = ctx.device, ctx.primary
     graph_cfg = cfg.encoder.graph
     out_dir = cfg.layout.graph_dir
     best_path = out_dir / "checkpoints" / "best.pt"
     if is_main:
         best_path.parent.mkdir(parents=True, exist_ok=True)
 
-    torch.manual_seed(graph_cfg.seed + rank)
+    torch.manual_seed(graph_cfg.seed + ctx.rank)
     loader, val_loader = (
         link_loader(
             data,
@@ -237,27 +235,19 @@ def _train(
             num_workers=graph_cfg.num_workers,
             pin_memory=device.type == "cuda",
             seed=graph_cfg.seed,
-            rank=rank,
-            world_size=world_size,
+            rank=ctx.rank,
+            world_size=ctx.world_size,
         )
         for edges in (None, val_edges)
     )
     raw_model = _build_model(graph_cfg, data, device)
-    model: torch.nn.Module = (
-        DistributedDataParallel(
-            raw_model, device_ids=[device.index], find_unused_parameters=True
-        )
-        if world_size > 1
-        else raw_model
-    )
+    model = ctx.wrap(raw_model, find_unused_parameters=True)
     n_parameters = sum(p.numel() for p in raw_model.parameters())
     optimizer = torch.optim.Adam(raw_model.parameters(), lr=graph_cfg.lr)
     start_epoch, best_val_loss = _resume(
         best_path, raw_model, optimizer, device, is_main
     )
-    epoch_loss = partial(
-        _epoch_loss, graph_cfg=graph_cfg, device=device, world_size=world_size
-    )
+    epoch_loss = partial(_epoch_loss, graph_cfg=graph_cfg, ctx=ctx)
 
     epochs = graph_cfg.epochs
     history: list[dict[str, float]] = []
@@ -269,7 +259,7 @@ def _train(
             graph_cfg.lr,
             device,
             n_parameters,
-            world_size,
+            ctx.world_size,
         )
     for epoch in range(start_epoch, epochs):
         started = time.perf_counter()
@@ -328,7 +318,7 @@ def _train(
             "embedding_dim": int(embeddings.shape[1]),
             "best_val_loss": best_val_loss,
             "epochs": epochs,
-            "world_size": world_size,
+            "world_size": ctx.world_size,
             "history": history,
         },
     )
@@ -338,14 +328,10 @@ def _train(
 
 
 def _train_saved_graph(
-    device: torch.device,
-    rank: int,
-    world_size: int,
-    cfg: ExperimentConfig,
-    graph_data_path: str,
+    ctx: Rank, cfg: ExperimentConfig, graph_data_path: str
 ) -> None:
     data, val_edges = torch.load(graph_data_path, weights_only=False)
-    _train(cfg, data, val_edges, device, rank, world_size)
+    _train(cfg, data, val_edges, ctx)
 
 
 def _train_heterosage(cfg: ExperimentConfig) -> None:
@@ -354,7 +340,7 @@ def _train_heterosage(cfg: ExperimentConfig) -> None:
     device, device_ids = parse_device_spec(graph_cfg.device)
     data, val_edges = _build_graph_data(cfg)
     if len(device_ids) < 2:
-        _train(cfg, data, val_edges, device, 0, 1)
+        _train(cfg, data, val_edges, Rank(0, 1, device))
         return
     fd, graph_data_path = tempfile.mkstemp(suffix=".pt")
     os.close(fd)

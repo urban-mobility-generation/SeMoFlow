@@ -14,7 +14,6 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch import optim
-from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import (
     BatchSampler,
     DataLoader,
@@ -36,6 +35,7 @@ from semoflow.planner.model import (
 from semoflow.planner.prefix_decoder import LegalPrefixIndex
 from semoflow.utils import (
     EarlyStopper,
+    Rank,
     build_lr_scheduler,
     load_artifact,
     log_epoch_summary,
@@ -214,21 +214,6 @@ _METRIC_NAMES = (
 )
 
 
-@dataclass(frozen=True, slots=True)
-class _Rank:
-    rank: int
-    world_size: int
-    device: torch.device
-
-    @property
-    def primary(self) -> bool:
-        return self.rank == 0
-
-    @property
-    def distributed(self) -> bool:
-        return self.world_size > 1
-
-
 class _NLL:
     def __init__(self) -> None:
         self.sums = [0.0] * 6
@@ -242,13 +227,11 @@ class _NLL:
         ):
             self.sums[index] += float(term.detach()) * sequences
 
-    def all_reduce(self, rank: _Rank) -> None:
-        if rank.distributed:
-            totals = torch.tensor(
-                self.sums, dtype=torch.float64, device=rank.device
-            )
-            dist.all_reduce(totals, op=dist.ReduceOp.SUM)
-            self.sums = totals.tolist()
+    def all_reduce(self, rank: Rank) -> None:
+        totals = torch.tensor(
+            self.sums, dtype=torch.float64, device=rank.device
+        )
+        self.sums = rank.all_reduce_sum(totals).tolist()
 
     def metrics(self) -> dict[str, float]:
         sequences, events, total, length, gap, prefix = self.sums
@@ -269,7 +252,7 @@ def _prefixed(prefix: str, metrics: dict[str, float]) -> dict[str, float]:
 
 
 def _evaluate(
-    model: OccurrenceARPlanner, loader: DataLoader, rank: _Rank
+    model: OccurrenceARPlanner, loader: DataLoader, rank: Rank
 ) -> dict[str, float]:
     values = torch.zeros(
         len(_METRIC_NAMES), dtype=torch.float64, device=rank.device
@@ -337,7 +320,7 @@ def _synchronize(device: torch.device) -> None:
 
 @dataclass
 class _Run:
-    ctx: _Rank
+    ctx: Rank
     settings: PlannerConfig
     config: OccurrencePlannerConfig
     model: OccurrenceARPlanner
@@ -355,7 +338,7 @@ class _Run:
         return len(self.train_loader) * self.settings.epochs
 
 
-def _setup(settings: PlannerConfig, layout: RunLayout, ctx: _Rank) -> _Run:
+def _setup(settings: PlannerConfig, layout: RunLayout, ctx: Rank) -> _Run:
     seed = settings.seed
     device = ctx.device
     dataset = load_occurrence_planner_dataset(layout.planner_dataset)
@@ -377,14 +360,7 @@ def _setup(settings: PlannerConfig, layout: RunLayout, ctx: _Rank) -> _Run:
     model = OccurrenceARPlanner(config, **catalog).to(device)
     if settings.compile:
         model.compile(fullgraph=True)
-    train_model: nn.Module = model
-    if ctx.distributed:
-        train_model = DistributedDataParallel(
-            model,
-            device_ids=[device.index],
-            output_device=device.index,
-            broadcast_buffers=False,
-        )
+    train_model = ctx.wrap(model, broadcast_buffers=False)
     set_seed_all(seed + ctx.rank)
     optimizer = optim.AdamW(
         model.parameters(),
@@ -543,14 +519,10 @@ def _log_epoch(
 
 
 def _train_on_device(
-    device: torch.device,
-    rank: int,
-    world_size: int,
-    settings: PlannerConfig,
-    layout: RunLayout,
-) -> dict[str, Any]:
-    run = _setup(settings, layout, _Rank(rank, world_size, device))
-    ctx, device = run.ctx, run.ctx.device
+    ctx: Rank, settings: PlannerConfig, layout: RunLayout
+) -> None:
+    run = _setup(settings, layout, ctx)
+    device = ctx.device
     best_path, last_path, metrics_path = (
         layout.planner_dir / name for name in _OUTPUT_NAMES
     )
@@ -560,8 +532,8 @@ def _train_on_device(
     step = 0
     epoch = 0
     for epoch in range(1, run.settings.epochs + 1):
+        _synchronize(device)
         if device.type == "cuda":
-            torch.cuda.synchronize(device)
             torch.cuda.reset_peak_memory_stats(device)
         started = time.perf_counter()
         nll, step = _train_epoch(run, epoch, step)
@@ -605,7 +577,7 @@ def _train_on_device(
             break
 
     final_train = _evaluate(run.model, run.train_eval_loader, ctx)
-    summary: dict[str, Any] = {
+    summary = {
         "best_epoch": stopper.best_epoch,
         "best_validation_nll": stopper.best_value,
         **_prefixed("final_train", final_train),
@@ -628,19 +600,13 @@ def _train_on_device(
             final_train["nll"],
             layout.planner_dir,
         )
-    if ctx.distributed:
-        dist.barrier()
-    return summary
+    ctx.barrier()
 
 
 def train_planner(
     settings: PlannerConfig, layout: RunLayout
 ) -> dict[str, Any]:
-    result = run_on_devices(
-        _train_on_device, settings.device, settings, layout
-    )
-    if result is not None:
-        return result
+    run_on_devices(_train_on_device, settings.device, settings, layout)
     metrics = json.loads((layout.planner_dir / "metrics.json").read_text())
     metrics.pop("epochs")
     return metrics

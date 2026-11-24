@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import json
 import logging
@@ -8,7 +7,7 @@ import math
 import os
 import random
 import socket
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -211,26 +210,73 @@ def parse_device_spec(spec: str) -> tuple[torch.device, list[int]]:
     return torch.device(stripped), []
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class Rank:
+    rank: int
+    world_size: int
+    device: torch.device
+
+    @property
+    def primary(self) -> bool:
+        return self.rank == 0
+
+    @property
+    def distributed(self) -> bool:
+        return self.world_size > 1
+
+    def wrap(self, model: nn.Module, **ddp_options: Any) -> nn.Module:
+        if not self.distributed:
+            return model
+        return DistributedDataParallel(
+            model, device_ids=[self.device.index], **ddp_options
+        )
+
+    def all_reduce_sum(self, values: torch.Tensor) -> torch.Tensor:
+        if self.distributed:
+            dist.all_reduce(values, op=dist.ReduceOp.SUM)
+        return values
+
+    def barrier(self) -> None:
+        if self.distributed:
+            dist.barrier()
+
+
 def _spawned_worker(
     rank: int,
-    worker: Callable[..., object],
+    worker: Callable[..., None],
     device_ids: list[int],
     port: int,
     log_level: str,
     log_file: Path | None,
     args: tuple[Any, ...],
 ) -> None:
-    with ddp_worker(rank, device_ids, port, log_level, log_file) as device:
-        worker(device, rank, len(device_ids), *args)
+    if rank == 0:
+        configure_logging(level=log_level, log_file=log_file)
+    else:
+        logging.disable(logging.CRITICAL)
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    device = torch.device("cuda", device_ids[rank])
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="nccl", rank=rank, world_size=len(device_ids), device_id=device
+    )
+    try:
+        worker(Rank(rank, len(device_ids), device), *args)
+    finally:
+        dist.destroy_process_group()
 
 
-def run_on_devices[R](
-    worker: Callable[..., R], device_spec: str, *args: Any
-) -> R | None:
+def run_on_devices(
+    worker: Callable[..., None], device_spec: str, *args: Any
+) -> None:
     device, device_ids = parse_device_spec(device_spec)
     if len(device_ids) < 2:
-        return worker(device, 0, 1, *args)
-    port = find_free_port()
+        worker(Rank(0, 1, device), *args)
+        return
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        port = int(s.getsockname()[1])
     logging.getLogger(__name__).info(
         "DDP world_size=%d  devices=%s  port=%d",
         len(device_ids),
@@ -250,38 +296,6 @@ def run_on_devices[R](
         nprocs=len(device_ids),
         join=True,
     )
-    return None
-
-
-def find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return int(s.getsockname()[1])
-
-
-@contextlib.contextmanager
-def ddp_worker(
-    rank: int,
-    device_ids: list[int],
-    port: int,
-    log_level: str,
-    log_file: Path | None,
-) -> Generator[torch.device, None, None]:
-    if rank == 0:
-        configure_logging(level=log_level, log_file=log_file)
-    else:
-        logging.disable(logging.CRITICAL)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
-    device = torch.device("cuda", device_ids[rank])
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="nccl", rank=rank, world_size=len(device_ids), device_id=device
-    )
-    try:
-        yield device
-    finally:
-        dist.destroy_process_group()
 
 
 def unwrap_ddp(model: nn.Module) -> nn.Module:
@@ -362,6 +376,7 @@ def load_artifact(path: Path, artifact_type: str) -> dict[str, Any]:
 
 __all__ = [
     "EarlyStopper",
+    "Rank",
     "build_lr_scheduler",
     "configure_logging",
     "dump_json",
